@@ -428,8 +428,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   (default ON).
 - FetchContent pins: cpp-httplib `v0.46.1` (matches the Homebrew package in
   use; `FIND_PACKAGE_ARGS NAMES httplib` kept so the system copy is preferred),
-  ctpl commit `437e135dbd94eb65b45533d9ce8ee28b5bd37b6d` (no tags exist),
-  CLI11 `v2.7.2`, Catch2 `v3.16.0`.
+  ctpl commit `437e135dbd94eb65b45533d9ce8ee28b5bd37b6d`
+  (its two tags point at this commit), CLI11 `v2.7.2`, Catch2 `v3.16.0`.
 - libtiff via `find_package(TIFF REQUIRED)`; libgeotiff via `find_path` and
   `find_library` as today, now actually used.
 - Preview: glfw via pkg-config; on Apple link the OpenGL, Cocoa, IOKit and

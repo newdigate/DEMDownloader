@@ -98,13 +98,13 @@ option(DL_ELEVATION_PREVIEW "Build the OpenGL preview window" ${_dl_preview_defa
 option(DL_ELEVATION_TESTS "Build the Catch2 test suite" ON)
 
 include(FetchContent)
-# cpp-httplib is pinned to the Homebrew version in use so both dependency paths
-# compile identical code. FIND_PACKAGE_ARGS prefers the system package when present.
+# cpp-httplib is pinned to the Homebrew version in use so both dependency paths compile identical
+# code. FIND_PACKAGE_ARGS prefers the system package when it is 0.46.x, otherwise the pinned copy is downloaded.
 FetchContent_Declare(httplib
   GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
   GIT_TAG        v0.46.1
-  FIND_PACKAGE_ARGS NAMES httplib)
-# ctpl has no tags; this is its last commit (2015-06-12).
+  FIND_PACKAGE_ARGS 0.46.1 NAMES httplib)
+# ctpl's last commit (2015-06-12); its two upstream tags both point here, so pin the hash.
 FetchContent_Declare(ctpl
   GIT_REPOSITORY https://github.com/vit-vit/ctpl.git
   GIT_TAG        437e135dbd94eb65b45533d9ce8ee28b5bd37b6d)
@@ -114,6 +114,12 @@ FetchContent_Declare(CLI11
 FetchContent_Declare(Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
   GIT_TAG        v3.16.0)
+# For the downloaded cpp-httplib only: match the Homebrew package's feature set (OpenSSL and
+# zlib, no Brotli or zstd) and fail at configure time instead of silently losing HTTPS.
+set(HTTPLIB_REQUIRE_OPENSSL ON)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF)
+set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF)
+set(HTTPLIB_INSTALL OFF)
 FetchContent_MakeAvailable(httplib ctpl CLI11)
 if(DL_ELEVATION_TESTS)
   FetchContent_MakeAvailable(Catch2)
@@ -121,13 +127,13 @@ endif()
 
 # libtiff via CMake's bundled FindTIFF. libgeotiff ships no CMake package, so locate it directly.
 find_package(TIFF REQUIRED)
-find_path(GEOTIFF_INCLUDE_DIR geotiff.h REQUIRED)
+find_path(GEOTIFF_INCLUDE_DIR geotiff.h PATH_SUFFIXES geotiff libgeotiff REQUIRED)
 find_library(GEOTIFF_LIBRARY geotiff REQUIRED)
 
 add_library(demdl STATIC
   src/demdl/BoundingBox.cpp)
 target_include_directories(demdl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${GEOTIFF_INCLUDE_DIR})
-target_include_directories(demdl SYSTEM PUBLIC ${ctpl_SOURCE_DIR})
+target_include_directories(demdl SYSTEM PRIVATE ${ctpl_SOURCE_DIR})
 # httplib::httplib exists on both paths: the Homebrew package only exports the
 # namespaced name, and the FetchContent build adds it as an alias. The bare
 # "httplib" name is not a target when the system package is found, so linking it
@@ -137,7 +143,7 @@ target_compile_options(demdl PRIVATE -Wall -Wextra)
 target_compile_definitions(demdl PUBLIC DL_ELEVATION_VERSION="${PROJECT_VERSION}")
 
 if(DL_ELEVATION_TESTS)
-  include(CTest)
+  enable_testing()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
   include(Catch)
   add_executable(demdl_tests
@@ -153,7 +159,6 @@ endif()
 ```
 cmake-build-debug*
 build*/
-/output/new2.tif
 *.tif
 *.tif.tmp
 ```
@@ -164,6 +169,7 @@ build*/
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <limits>
 #include <utility>
 
 #include "demdl/BoundingBox.h"
@@ -214,6 +220,45 @@ TEST_CASE("approxEquals honours the tolerance", "[boundingbox]") {
   b.north += 1e-8;
   CHECK_FALSE(a.approxEquals(b, 1e-9));
 }
+
+TEST_CASE("non-finite values are rejected", "[boundingbox]") {
+  BoundingBox nanNorth = simonsTown();
+  nanNorth.north = std::numeric_limits<double>::quiet_NaN();
+  CHECK(nanNorth.validate() == "bounding box values must be finite numbers");
+  BoundingBox infEast = simonsTown();
+  infEast.east = std::numeric_limits<double>::infinity();
+  CHECK(infEast.validate() == "bounding box values must be finite numbers");
+}
+
+TEST_CASE("equal edges are rejected and range limits are inclusive", "[boundingbox]") {
+  const BoundingBox flatLat{1.0, 1.0, 2.0, 1.0};  // north == south
+  CHECK(flatLat.validate() == "north must be greater than south");
+  const BoundingBox flatLon{2.0, 1.0, 1.0, 1.0};  // east == west
+  CHECK(flatLon.validate() == "east must be greater than west");
+  const BoundingBox world{90.0, -90.0, 180.0, -180.0};
+  CHECK(world.validate().empty());
+  BoundingBox farSouth = simonsTown();
+  farSouth.south = -90.5;
+  CHECK(farSouth.validate() == "latitudes must be within [-90, 90]");
+  BoundingBox farEast = simonsTown();
+  farEast.east = 180.5;
+  CHECK(farEast.validate() == "longitudes must be within [-180, 180]");
+}
+
+TEST_CASE("approxEquals checks every edge", "[boundingbox]") {
+  // The comparison is inclusive, so zero tolerance still accepts an identical box.
+  CHECK(simonsTown().approxEquals(simonsTown(), 0.0));
+  const BoundingBox a = simonsTown();
+  const auto edges = {&BoundingBox::north, &BoundingBox::south, &BoundingBox::east,
+                      &BoundingBox::west};
+  for (double BoundingBox::*edge : edges) {
+    BoundingBox b = a;
+    b.*edge += 5e-10;
+    CHECK(a.approxEquals(b, 1e-9));
+    b.*edge += 1e-8;
+    CHECK_FALSE(a.approxEquals(b, 1e-9));
+  }
+}
 ```
 
 - [ ] **Step 4: Configure to verify it fails**
@@ -231,8 +276,8 @@ Expected: the dependencies download, then configure stops with `Cannot find sour
 namespace demdl {
 
 struct PixelScale {
-  double lonPerPixel;
-  double latPerPixel;
+  double lonPerPixel = 0.0;
+  double latPerPixel = 0.0;
 };
 
 // A WGS84 box in decimal degrees. north > south and east > west when valid.
@@ -243,8 +288,11 @@ struct BoundingBox {
   double west = 0.0;
 
   // Empty when valid, otherwise the first problem found, phrased for the user.
-  std::string validate() const;
+  [[nodiscard]] std::string validate() const;
+  // Degrees per pixel for a grid of the given size. width and height must be positive; callers
+  // validate them (Config::validate, DemRaster::create). Not checked here.
   PixelScale pixelScale(int width, int height) const;
+  // Absolute, inclusive, per-edge tolerance in degrees. A NaN edge never compares equal.
   bool approxEquals(const BoundingBox& other, double tolerance) const;
 };
 
@@ -279,9 +327,9 @@ PixelScale BoundingBox::pixelScale(int width, int height) const {
   return {(east - west) / width, (north - south) / height};
 }
 
-bool BoundingBox::approxEquals(const BoundingBox& o, double tolerance) const {
-  return std::fabs(north - o.north) <= tolerance && std::fabs(south - o.south) <= tolerance &&
-         std::fabs(east - o.east) <= tolerance && std::fabs(west - o.west) <= tolerance;
+bool BoundingBox::approxEquals(const BoundingBox& other, double tolerance) const {
+  return std::fabs(north - other.north) <= tolerance && std::fabs(south - other.south) <= tolerance &&
+         std::fabs(east - other.east) <= tolerance && std::fabs(west - other.west) <= tolerance;
 }
 
 }  // namespace demdl
@@ -290,10 +338,10 @@ bool BoundingBox::approxEquals(const BoundingBox& o, double tolerance) const {
 - [ ] **Step 7: Configure, build, run the test**
 
 Run: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B build && cmake --build build && ./build/demdl_tests "[boundingbox]"`
-Expected: build succeeds (Catch2 compiles on the first build), then `All tests passed (N assertions in 6 test cases)`.
+Expected: build succeeds (Catch2 compiles on the first build), then `All tests passed (N assertions in 9 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed, 0 tests failed out of 6`.
+Expected: `100% tests passed out of 9`.
 
 - [ ] **Step 8: Commit**
 

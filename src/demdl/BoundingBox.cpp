@@ -23,9 +23,9 @@ PixelScale BoundingBox::pixelScale(int width, int height) const {
   return {(east - west) / width, (north - south) / height};
 }
 
-bool BoundingBox::approxEquals(const BoundingBox& o, double tolerance) const {
-  return std::fabs(north - o.north) <= tolerance && std::fabs(south - o.south) <= tolerance &&
-         std::fabs(east - o.east) <= tolerance && std::fabs(west - o.west) <= tolerance;
+bool BoundingBox::approxEquals(const BoundingBox& other, double tolerance) const {
+  return std::fabs(north - other.north) <= tolerance && std::fabs(south - other.south) <= tolerance &&
+         std::fabs(east - other.east) <= tolerance && std::fabs(west - other.west) <= tolerance;
 }
 
 }  // namespace demdl
