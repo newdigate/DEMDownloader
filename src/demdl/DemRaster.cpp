@@ -155,7 +155,7 @@ void DemRaster::save(const std::filesystem::path& path) const {
   };
   {
     TiffHandle tif(XTIFFOpen(tmp.string().c_str(), "w"));
-    if (!tif) throw std::runtime_error("cannot create " + tmp.string());
+    if (!tif) fail("cannot create " + tmp.string());
     TIFF* t = tif.get();
     // Checked so that a tag libtiff does not know fails the save instead of being left out.
     const auto setField = [&](const char* name, uint32_t tag, auto... values) {

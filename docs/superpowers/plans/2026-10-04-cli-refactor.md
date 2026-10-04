@@ -1525,7 +1525,7 @@ using demdl::DemRaster;
 using demdl::RasterMetadata;
 ```
 
-Append these test cases, with the helper the last one uses, at the end of the file:
+Append these test cases, with the helpers the last two use, at the end of the file:
 
 ```cpp
 TEST_CASE("save and load round-trip values, NaN and NoData", "[demraster]") {
@@ -1703,6 +1703,25 @@ class FileSizeLimit {
   bool lowered_ = false;
 };
 
+struct LimitedSave {
+  bool limited = false;  // the limit was in force during the save
+  std::string error;     // empty when the save succeeded
+};
+
+// Saves r to file under a file-size limit. Nothing is reported while the limit is in force, so no
+// test output can be cut short by it.
+LimitedSave saveUnderLimit(const DemRaster& r, const std::filesystem::path& file, std::uintmax_t bytes) {
+  LimitedSave result;
+  const FileSizeLimit limit(bytes);
+  result.limited = limit.active();
+  try {
+    r.save(file);
+  } catch (const std::runtime_error& e) {
+    result.error = e.what();
+  }
+  return result;
+}
+
 }  // namespace
 
 TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "[demraster]") {
@@ -1720,20 +1739,26 @@ TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "
   r.save(probe);
   const std::uintmax_t complete = std::filesystem::file_size(probe);
 
-  // Nothing is reported while the limit is in force, so no test output can be cut short by it.
-  bool limited = false;
-  std::string error;
-  {
-    const FileSizeLimit limit(complete - 1);
-    limited = limit.active();
-    try {
-      r.save(file);
-    } catch (const std::runtime_error& e) {
-      error = e.what();
-    }
-  }
-  REQUIRE(limited);
-  CHECK_THAT(error, ContainsSubstring("cannot finish writing"));
+  const LimitedSave attempt = saveUnderLimit(r, file, complete - 1);
+  REQUIRE(attempt.limited);
+  CHECK_THAT(attempt.error, ContainsSubstring("cannot finish writing"));
+  CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
+  const auto back = DemRaster::load(file);
+  CHECK(back.at(1, 1) == 12.5f);
+}
+
+TEST_CASE("a checkpoint that cannot be created leaves no temp file behind", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "dem.tif";
+  auto r = DemRaster::create(4, 3, kBox, {"LayerA", "https://example.test/wms"});
+  r.set(1, 1, 12.5f);
+  r.save(file);
+
+  // With no room at all, libtiff creates and truncates the temp file, then fails to write its header.
+  r.set(1, 1, 99.0f);
+  const LimitedSave attempt = saveUnderLimit(r, file, 0);
+  REQUIRE(attempt.limited);
+  CHECK_THAT(attempt.error, ContainsSubstring("cannot create"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
@@ -1998,7 +2023,7 @@ void DemRaster::save(const std::filesystem::path& path) const {
   };
   {
     TiffHandle tif(XTIFFOpen(tmp.string().c_str(), "w"));
-    if (!tif) throw std::runtime_error("cannot create " + tmp.string());
+    if (!tif) fail("cannot create " + tmp.string());
     TIFF* t = tif.get();
     // Checked so that a tag libtiff does not know fails the save instead of being left out.
     const auto setField = [&](const char* name, uint32_t tag, auto... values) {
@@ -2136,7 +2161,7 @@ Notes for the engineer: `XTIFFOpen` registers the GeoTIFF tags with libtiff, whi
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[demraster]"`
-Expected: `All tests passed (N assertions in 12 test cases)`.
+Expected: `All tests passed (N assertions in 13 test cases)`.
 
 - [ ] **Step 7: Commit**
 

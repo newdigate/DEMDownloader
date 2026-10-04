@@ -296,10 +296,10 @@ emit onRunFinished(summary)
 ```
 
 `job(x, row)`: emit `InFlight`; `result = fetcher(workerId).fetch(x, row,
-stop)`; write `at(x, row)` as the value, `kNoData`, or leave NaN; update the
-consecutive-failure counter (reset on `Value` or `NoData`, increment on
-`Failed`; reaching the limit sets `stop` with reason `ConsecutiveFailures`);
-emit the final state.
+stop)`; call `set(x, row, ...)` with the value or `kNoData`, or leave NaN;
+update the consecutive-failure counter (reset on `Value` or `NoData`,
+increment on `Failed`; reaching the limit sets `stop` with reason
+`ConsecutiveFailures`); emit the final state.
 
 Each job writes a distinct cell and the save runs only after that row's
 futures have returned, so the raster needs no lock.
@@ -438,8 +438,9 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   west edge is rejected as an invalid bounding box; after `save` no `.tmp`
   file remains; a `save` whose directory write fails (a file-size limit one
   byte short of a complete file) throws, leaves no `.tmp` and keeps the
-  previous file loadable with its old values; `todoInRow` and
-  `rowsWithWork` on a half-filled raster.
+  previous file loadable with its old values, and so does a `save` whose
+  temporary file cannot be created (a file-size limit of zero); `todoInRow`
+  and `rowsWithWork` on a half-filled raster.
 - **Downloader**: with `FakeFetcher` (value is a function of x and y;
   configurable NoData and failure sets; optional latch to block mid-row) and
   `RecordingSink`: only NaN pixels are fetched; rows without work emit no
