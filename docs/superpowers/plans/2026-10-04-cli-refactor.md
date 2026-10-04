@@ -21,7 +21,7 @@
 5. The `stopping: ...` line is printed by `main`, which polls the token every 100 ms, because nothing may print from inside a signal handler.
 6. httplib timeouts use the `(seconds, microseconds)` overloads, which exist in every version in play.
 7. The value palette in the preview spans red to light blue rather than the full rainbow, so the minimum value is not pure blue (NoData) and the magenta end (Failed) is never used for a value.
-8. The spec's `Metadata{layer, wmsUrl}` is named `RasterMetadata`, and the spec's `float& at(x, y)` is split into `at() const` and `set()` so that every concurrent write goes through one function.
+8. The raster's metadata struct is `RasterMetadata`, and reads and writes go through `at() const` and `set()` rather than a `float&` accessor, so every concurrent write passes through one function.
 
 ## Working conventions
 
@@ -1502,6 +1502,9 @@ Replace the includes and using-declarations at the top of the file (everything a
 #include <tiffio.h>
 #include <xtiffio.h>
 
+#include <signal.h>
+#include <sys/resource.h>
+
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -1522,7 +1525,7 @@ using demdl::DemRaster;
 using demdl::RasterMetadata;
 ```
 
-Append these test cases at the end of the file:
+Append these test cases, with the helper the last one uses, at the end of the file:
 
 ```cpp
 TEST_CASE("save and load round-trip values, NaN and NoData", "[demraster]") {
@@ -1665,6 +1668,75 @@ TEST_CASE("a file with an unusable tiepoint is rejected", "[demraster]") {
 TEST_CASE("loading a missing file reports the path", "[demraster]") {
   TempDir dir;
   CHECK_THROWS_WITH(DemRaster::load(dir.path / "absent.tif"), ContainsSubstring("absent.tif"));
+}
+
+namespace {
+
+// Lowers this process's file-size limit, with SIGXFSZ ignored so that a write past the limit fails
+// with EFBIG instead of killing the process. Restores both on destruction, however the scope ends.
+class FileSizeLimit {
+ public:
+  explicit FileSizeLimit(std::uintmax_t bytes) {
+    struct sigaction ignoreAction {};
+    ignoreAction.sa_handler = SIG_IGN;
+    sigemptyset(&ignoreAction.sa_mask);
+    ignored_ = sigaction(SIGXFSZ, &ignoreAction, &previousAction_) == 0;
+    if (ignored_ && getrlimit(RLIMIT_FSIZE, &previousLimit_) == 0) {
+      rlimit lowered = previousLimit_;
+      lowered.rlim_cur = static_cast<rlim_t>(bytes);
+      lowered_ = setrlimit(RLIMIT_FSIZE, &lowered) == 0;
+    }
+  }
+  ~FileSizeLimit() {
+    if (lowered_) setrlimit(RLIMIT_FSIZE, &previousLimit_);
+    if (ignored_) sigaction(SIGXFSZ, &previousAction_, nullptr);
+  }
+  FileSizeLimit(const FileSizeLimit&) = delete;
+  FileSizeLimit& operator=(const FileSizeLimit&) = delete;
+
+  bool active() const { return lowered_; }
+
+ private:
+  struct sigaction previousAction_ {};
+  rlimit previousLimit_{};
+  bool ignored_ = false;
+  bool lowered_ = false;
+};
+
+}  // namespace
+
+TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "dem.tif";
+  auto r = DemRaster::create(4, 3, kBox, {"LayerA", "https://example.test/wms"});
+  r.set(1, 1, 12.5f);
+  r.save(file);
+
+  // libtiff writes the directory after all strip data, so a limit one byte short of the complete file
+  // admits the header and every strip but not the whole directory. The size is taken from a
+  // successful save of exactly the content the failing save writes.
+  r.set(1, 1, 99.0f);
+  const auto probe = dir.path / "probe.tif";
+  r.save(probe);
+  const std::uintmax_t complete = std::filesystem::file_size(probe);
+
+  // Nothing is reported while the limit is in force, so no test output can be cut short by it.
+  bool limited = false;
+  std::string error;
+  {
+    const FileSizeLimit limit(complete - 1);
+    limited = limit.active();
+    try {
+      r.save(file);
+    } catch (const std::runtime_error& e) {
+      error = e.what();
+    }
+  }
+  REQUIRE(limited);
+  CHECK_THAT(error, ContainsSubstring("cannot finish writing"));
+  CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
+  const auto back = DemRaster::load(file);
+  CHECK(back.at(1, 1) == 12.5f);
 }
 ```
 
@@ -1963,10 +2035,19 @@ void DemRaster::save(const std::filesystem::path& path) const {
         tif.reset();
         fail("cannot attach GeoTIFF keys to " + tmp.string());
       }
-      GTIFKeySet(gtif.get(), GTModelTypeGeoKey, TYPE_SHORT, 1, ModelTypeGeographic);
-      GTIFKeySet(gtif.get(), GTRasterTypeGeoKey, TYPE_SHORT, 1, RasterPixelIsArea);
-      GTIFKeySet(gtif.get(), GeographicTypeGeoKey, TYPE_SHORT, 1, GCS_WGS_84);
-      GTIFWriteKeys(gtif.get());
+      const auto setKey = [&](const char* name, geokey_t key, int value) {
+        if (GTIFKeySet(gtif.get(), key, TYPE_SHORT, 1, value) != 1) {
+          tif.reset();
+          fail(std::string("cannot set GeoTIFF key ") + name + " on " + tmp.string());
+        }
+      };
+      setKey("GTModelTypeGeoKey", GTModelTypeGeoKey, ModelTypeGeographic);
+      setKey("GTRasterTypeGeoKey", GTRasterTypeGeoKey, RasterPixelIsArea);
+      setKey("GeographicTypeGeoKey", GeographicTypeGeoKey, GCS_WGS_84);
+      if (GTIFWriteKeys(gtif.get()) != 1) {
+        tif.reset();
+        fail("cannot write the GeoTIFF keys to " + tmp.string());
+      }
     }
 
     std::vector<float> row(static_cast<std::size_t>(width_));
@@ -1977,7 +2058,13 @@ void DemRaster::save(const std::filesystem::path& path) const {
         fail("write failed on row " + std::to_string(y) + " of " + tmp.string());
       }
     }
-  }  // XTIFFClose writes the directory
+    // XTIFFClose swallows errors from writing the last strip and the directory. Flushing first
+    // surfaces them, so a failed write never reaches the rename and the previous checkpoint survives.
+    if (TIFFFlush(t) != 1) {
+      tif.reset();
+      fail("cannot finish writing " + tmp.string());
+    }
+  }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
   if (ec) fail("cannot rename " + tmp.string() + " to " + path.string() + ": " + ec.message());
@@ -2049,7 +2136,7 @@ Notes for the engineer: `XTIFFOpen` registers the GeoTIFF tags with libtiff, whi
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[demraster]"`
-Expected: `All tests passed (N assertions in 11 test cases)`.
+Expected: `All tests passed (N assertions in 12 test cases)`.
 
 - [ ] **Step 7: Commit**
 

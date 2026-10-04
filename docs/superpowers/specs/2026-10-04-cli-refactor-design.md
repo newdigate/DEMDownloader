@@ -434,7 +434,11 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   GeoTIFF keys and `GDAL_NODATA` read back; `matches` accepts the same Config
   and rejects a shifted box, a different size and a different layer with the
   expected text in `why`; a hand-written RGB16 TIFF is rejected with the
-  legacy message; after `save` no `.tmp` file remains; `todoInRow` and
+  legacy message; a hand-written float32 GeoTIFF whose tiepoint has a NaN
+  west edge is rejected as an invalid bounding box; after `save` no `.tmp`
+  file remains; a `save` whose directory write fails (a file-size limit one
+  byte short of a complete file) throws, leaves no `.tmp` and keeps the
+  previous file loadable with its old values; `todoInRow` and
   `rowsWithWork` on a half-filled raster.
 - **Downloader**: with `FakeFetcher` (value is a function of x and y;
   configurable NoData and failure sets; optional latch to block mid-row) and

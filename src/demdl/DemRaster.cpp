@@ -192,10 +192,19 @@ void DemRaster::save(const std::filesystem::path& path) const {
         tif.reset();
         fail("cannot attach GeoTIFF keys to " + tmp.string());
       }
-      GTIFKeySet(gtif.get(), GTModelTypeGeoKey, TYPE_SHORT, 1, ModelTypeGeographic);
-      GTIFKeySet(gtif.get(), GTRasterTypeGeoKey, TYPE_SHORT, 1, RasterPixelIsArea);
-      GTIFKeySet(gtif.get(), GeographicTypeGeoKey, TYPE_SHORT, 1, GCS_WGS_84);
-      GTIFWriteKeys(gtif.get());
+      const auto setKey = [&](const char* name, geokey_t key, int value) {
+        if (GTIFKeySet(gtif.get(), key, TYPE_SHORT, 1, value) != 1) {
+          tif.reset();
+          fail(std::string("cannot set GeoTIFF key ") + name + " on " + tmp.string());
+        }
+      };
+      setKey("GTModelTypeGeoKey", GTModelTypeGeoKey, ModelTypeGeographic);
+      setKey("GTRasterTypeGeoKey", GTRasterTypeGeoKey, RasterPixelIsArea);
+      setKey("GeographicTypeGeoKey", GeographicTypeGeoKey, GCS_WGS_84);
+      if (GTIFWriteKeys(gtif.get()) != 1) {
+        tif.reset();
+        fail("cannot write the GeoTIFF keys to " + tmp.string());
+      }
     }
 
     std::vector<float> row(static_cast<std::size_t>(width_));
@@ -206,7 +215,13 @@ void DemRaster::save(const std::filesystem::path& path) const {
         fail("write failed on row " + std::to_string(y) + " of " + tmp.string());
       }
     }
-  }  // XTIFFClose writes the directory
+    // XTIFFClose swallows errors from writing the last strip and the directory. Flushing first
+    // surfaces them, so a failed write never reaches the rename and the previous checkpoint survives.
+    if (TIFFFlush(t) != 1) {
+      tif.reset();
+      fail("cannot finish writing " + tmp.string());
+    }
+  }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
   if (ec) fail("cannot rename " + tmp.string() + " to " + path.string() + ": " + ec.message());
