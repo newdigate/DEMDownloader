@@ -1131,7 +1131,7 @@ struct RetryPolicy {
   double jitter = 0.2;
 
   // Delay before retry number `attempt` (0-based). unitRandom is in [0, 1]; passing it in keeps the schedule testable.
-  std::chrono::milliseconds delayFor(int attempt, double unitRandom) const;
+  [[nodiscard]] std::chrono::milliseconds delayFor(int attempt, double unitRandom) const;
 };
 
 }  // namespace demdl
