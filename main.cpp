@@ -43,10 +43,19 @@ in vec2 TexCoord;
 
 // texture sampler
 uniform sampler2D texture1;
+uniform int maxValue;
 
 void main()
 {
 	FragColor = texture(texture1, TexCoord);
+    if (FragColor.r == 0 && FragColor.g == 0 && FragColor.b == 0xFF)
+    {
+    } else
+    {
+        FragColor.r = 255 * FragColor.r / maxValue;
+        FragColor.g = 255 * FragColor.g / maxValue;
+        FragColor.b = 255 * FragColor.b / maxValue;
+    }
 }
 )glsl";
 
@@ -59,9 +68,11 @@ GLuint texture;
 unsigned int VBO, VAO, EBO;
 Shader *shader;
 uint16_t* raster;
+unsigned char maxDisplayValue = 1;
 unsigned char* displayTexture;
 
-int gridSizeWidth = 3000, gridSizeHeight = 3000 * 526/713, sampleperpixel = 3, bitspersample = 16;
+int sampleperpixel = 3, bitspersample = 16;
+int gridSizeWidth =	2048, gridSizeHeight = 1792;
 
 bool load_tiff(const char* filename, int &spp, int &width, int &height, int &bps, uint16_t* &r) {
     TIFF* tif = TIFFOpen(filename, "r") ;
@@ -132,6 +143,7 @@ void refresh() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, gridSizeWidth, gridSizeHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, displayTexture);
 
     shader->use();
+    shader->setInt("maxValue", maxDisplayValue);
 
     // render container
     glBindVertexArray(VAO);
@@ -230,15 +242,32 @@ bool initOpenGl() {
     return true;
 }
 
+void rainbow(double value, unsigned char &r, unsigned char &g, unsigned char &b) {
+    /*convert to long rainbow RGB*/
+    double a= (1.0f-value)/0.2;
+    unsigned char X= floor(a);
+    unsigned char Y= floor(255.0*(a-X));
+    switch(X)
+    {
+        case 0: r=255;g=Y;b=0;break;
+        case 1: r=255-Y;g=255;b=0;break;
+        case 2: r=0;g=255;b=Y;break;
+        case 3: r=0;g=255-Y;b=255;break;
+        case 4: r=Y;g=0;b=255;break;
+        case 5: r=255;g=0;b=255;break;
+    }
+}
+
 int main(int argc, char** argv)
 {
     signal(SIGPIPE, signalHandler);
     //double north = -34.070972, east=18.413194, south=-33.979583, west=18.303194;
-    double north = -34.0162500000124624 , east=18.5231944444707395, south=-33.8701388889013302, west=18.3251388889151592;
+    // table mountain: double north = -34.0162500000124624 , east=18.5231944444707395, south=-33.8701388889013302, west=18.3251388889151592;
+    double north =-34.2163446879999995, east=18.4625244140000007, south=-34.1845418309999971, west=18.4185791019999989;
 
     volatile bool finished = false;
     unsigned long startY = 0;
-    if (!load_tiff("../capetown.tif", sampleperpixel, gridSizeWidth, gridSizeHeight, bitspersample, raster )) {
+    if (!load_tiff("../simonstown.tif", sampleperpixel, gridSizeWidth, gridSizeHeight, bitspersample, raster )) {
         tmsize_t npixels = gridSizeWidth * gridSizeHeight;
         raster = (uint16_t*) _TIFFmalloc(npixels * sampleperpixel * bitspersample/8);
     } else
@@ -247,9 +276,13 @@ int main(int argc, char** argv)
         unsigned long index = 0;
         for (auto y=0; y<gridSizeHeight; y++) {
             for (auto x=0; x<gridSizeWidth; x++) {
-
-                if (raster[index*3] > 0) {
+                uint16_t rasterValue = raster[index*3];
+                if (rasterValue > 0) {
                     startY = y+1;
+                    unsigned char rasterDisplayValue = (rasterValue >> 8);
+                    if (rasterDisplayValue > maxDisplayValue ) {
+                        maxDisplayValue = rasterDisplayValue;
+                    }
                 }
                 index++;
             }
@@ -257,6 +290,7 @@ int main(int argc, char** argv)
     }
 
     std::cout << "starting at y: " << std::to_string(startY) << std::endl;
+    std::cout << "maxDisplayValue so far: " << std::to_string(maxDisplayValue) << std::endl;
 
     displayTexture = new unsigned char [gridSizeWidth * gridSizeHeight * 3];
     unsigned long index = 0;
@@ -267,9 +301,11 @@ int main(int argc, char** argv)
                 displayTexture[index++] = 0;
                 displayTexture[index++] = 0xFF;
             } else {
-                displayTexture[index++] = raster[index] >> 8;
-                displayTexture[index++] = raster[index] >> 8;
-                displayTexture[index++] = raster[index] >> 8;
+                unsigned char r, g, b;
+                rainbow(raster[index] / 65535.0, r, g, b);
+                displayTexture[index++] = r;
+                displayTexture[index++] = g;
+                displayTexture[index++] = b;
             }
         }
     }
@@ -284,8 +320,8 @@ int main(int argc, char** argv)
 
         for ( auto y=startY; y < gridSizeHeight; y++) {
 
-            std::vector<std::future<void>> results(gridSizeWidth);
-            std::vector<std::string*> urls(gridSizeWidth);
+            std::vector<std::future<void>> results;
+            std::vector<std::string*> urls;
 
             for ( auto x = 0; x < gridSizeWidth; x++) {
                 auto *url = new std::string("/erdas-iws/ogc/wms/GeoSpatial%20Datasets?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&BBOX=");
@@ -311,7 +347,7 @@ int main(int argc, char** argv)
                 displayTexture[index * 3 + 1] = 0;
                 displayTexture[index * 3 + 2] = 0;
 
-                results[x] = pool.push(
+                results.push_back( pool.push(
                         [ &g_i_mutex ] (int id, std::string *url, int x, int y) {
                             double currentValue = 0.0;
 
@@ -354,7 +390,9 @@ int main(int argc, char** argv)
                             if (currentValue < 0.0)
                                 currentValue = 0.0;
 
-                            uint16_t demValue = round(65535.0 * currentValue / 1100.0);
+                            //uint16_t demValue = round(65535.0 * currentValue / 1100.0);
+                            uint16_t demValue = round(65535.0 * currentValue / 700.0);
+
                             raster[index * 3] = demValue;
                             raster[index * 3 + 1] = demValue;
                             raster[index * 3 + 2] = demValue;
@@ -364,21 +402,30 @@ int main(int argc, char** argv)
                                 displayTexture[index * 3 + 1] = 0;
                                 displayTexture[index * 3 + 2] = 0xFF;
                             } else {
+                                unsigned char r, g, b;
+                                rainbow(currentValue / 700.0, r, g, b);
+                                displayTexture[index * 3] = r;
+                                displayTexture[index * 3 + 1] = g;
+                                displayTexture[index * 3 + 2] = b;
+
                                 unsigned char bit8value = round(255.0 * currentValue / 1100.0);
-                                displayTexture[index * 3] = 0;
-                                displayTexture[index * 3 + 1] = bit8value;
-                                displayTexture[index * 3 + 2] = 0;
+                                //displayTexture[index * 3] = 0;
+                                //displayTexture[index * 3 + 1] = bit8value;
+                                //displayTexture[index * 3 + 2] = 0;
+                                if (bit8value > maxDisplayValue) {
+                                    maxDisplayValue = bit8value;
+                                }
                             }
 
                             delete cli;
-                        }, url, x, y);
+                        }, url, x, y));
 
             }
 
             for ( auto &result : results)
                 result.get();
 
-            save_tiff("../capetown.tif", raster);
+            save_tiff("../simonstown.tif", raster);
 
             for ( auto url : urls)
                 delete url;
