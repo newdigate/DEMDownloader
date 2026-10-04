@@ -479,6 +479,12 @@ TEST_CASE("validation reports the first problem", "[config]") {
   retries.maxRetries = -1;
   CHECK(retries.validate() == "max-retries must be at least 0");
 
+  Config manyRetries = exampleConfig();
+  manyRetries.maxRetries = 101;
+  CHECK(manyRetries.validate() == "max-retries must be at most 100");
+  manyRetries.maxRetries = 100;
+  CHECK(manyRetries.validate().empty());
+
   Config failures = exampleConfig();
   failures.maxConsecutiveFailures = 0;
   CHECK(failures.validate() == "max-consecutive-failures must be at least 1");
@@ -572,7 +578,7 @@ struct Config {
   std::string wmsUrl = "https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets";
   std::string layer = "Elevation_CCT_GLM2019_5m_DEM";
   int threads = 8;     // capped at 64 to go easy on a public server
-  int maxRetries = 8;  // retries after the first attempt; 0 means a single attempt
+  int maxRetries = 8;  // retries after the first attempt, at most 100; 0 means a single attempt
   int maxConsecutiveFailures = 100;
   std::string caBundle;  // empty means the system trust store; no effect when insecure is set
   bool insecure = false;
@@ -688,6 +694,7 @@ std::string Config::validate() const {
   if (threads < 1) return "threads must be at least 1";
   if (threads > 64) return "threads must be at most 64";
   if (maxRetries < 0) return "max-retries must be at least 0";
+  if (maxRetries > 100) return "max-retries must be at most 100";
   if (maxConsecutiveFailures < 1) return "max-consecutive-failures must be at least 1";
   return {};
 }
@@ -1058,6 +1065,7 @@ Implements spec section 4.3 (RetryPolicy) and the schedule test in section 11.
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <limits>
 
 #include "demdl/RetryPolicy.h"
 
@@ -1088,6 +1096,18 @@ TEST_CASE("a custom policy is honoured", "[retrypolicy]") {
   CHECK(p.delayFor(1, 0.9) == 2ms);
   CHECK(p.delayFor(2, 0.9) == 3ms);
   CHECK(p.delayFor(40, 0.9) == 3ms);
+}
+
+TEST_CASE("jitter applies after the cap, so the longest sleep is maxDelay * (1 + jitter)", "[retrypolicy]") {
+  const RetryPolicy p;
+  CHECK(p.delayFor(7, 0.0) == 24000ms);
+  CHECK(p.delayFor(7, 1.0) == 36000ms);
+}
+
+TEST_CASE("an attempt beyond the range of double still yields the cap", "[retrypolicy]") {
+  const RetryPolicy p;
+  CHECK(p.delayFor(1024, 0.5) == 30000ms);
+  CHECK(p.delayFor(std::numeric_limits<int>::max(), 0.5) == 30000ms);
 }
 ```
 
@@ -1127,10 +1147,14 @@ namespace demdl {
 struct RetryPolicy {
   int maxRetries = 8;  // retries after the first attempt
   std::chrono::milliseconds baseDelay{500};
+  // The cap is applied before jitter, so the longest sleep is maxDelay * (1 + jitter).
   std::chrono::milliseconds maxDelay{30000};
   double jitter = 0.2;
 
-  // Delay before retry number `attempt` (0-based). unitRandom is in [0, 1]; passing it in keeps the schedule testable.
+  // Delay before retry number `attempt` (0-based). Requires attempt >= 0, baseDelay > 0 and
+  // 0 <= jitter <= 1; these are not checked. The caller supplies unitRandom in [0, 1], which keeps
+  // the schedule testable. The interval is closed on purpose: std::uniform_real_distribution can
+  // return exactly 1.0 on this standard library.
   [[nodiscard]] std::chrono::milliseconds delayFor(int attempt, double unitRandom) const;
 };
 
@@ -1160,7 +1184,7 @@ std::chrono::milliseconds RetryPolicy::delayFor(int attempt, double unitRandom) 
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[retrypolicy]"`
-Expected: `All tests passed (N assertions in 3 test cases)`.
+Expected: `All tests passed (N assertions in 5 test cases)`.
 
 - [ ] **Step 7: Commit**
 

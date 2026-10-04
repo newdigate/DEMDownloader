@@ -111,11 +111,11 @@ in which the variable named `north` holds the smaller latitude.
 
 **Config** is a struct mirroring the flags in section 5 plus `validate()`,
 which checks the box, positive grid size, `threads` between 1 and 64,
-`maxRetries >= 0`, `maxConsecutiveFailures >= 1`, that the output path names
-a file, and that the WMS URL parses as `scheme://host[:port]/path`. The scheme
-is `http` or `https`, the host is a hostname or a bracketed IPv6 literal, the
-port is 1 to 65535, and userinfo, queries, fragments and whitespace are
-refused. No parsing library appears in the library.
+`maxRetries` between 0 and 100, `maxConsecutiveFailures >= 1`, that the output
+path names a file, and that the WMS URL parses as `scheme://host[:port]/path`.
+The scheme is `http` or `https`, the host is a hostname or a bracketed IPv6
+literal, the port is 1 to 65535, and userinfo, queries, fragments and
+whitespace are refused. No parsing library appears in the library.
 
 **WmsQuery** has two free functions.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
@@ -136,8 +136,9 @@ report or an HTML page. Both are pure.
 
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
-max)` scaled by `1 + jitter * (2 * unitRandom - 1)`. Taking the random value as
-a parameter keeps the schedule testable.
+max)` scaled by `1 + jitter * (2 * unitRandom - 1)`. The cap applies before
+jitter, so the longest sleep is 36 s with the defaults. Taking the random value
+as a parameter keeps the schedule testable.
 
 **PixelFetcher** is the seam for tests:
 
@@ -197,8 +198,8 @@ CLI11; the version string is the CMake project version, starting at 0.2.0.
 | `--output PATH`, `-o` | yes | | GeoTIFF path, relative to the current directory |
 | `--wms-url URL` | no | `https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets` | scheme, host and path of the WMS endpoint |
 | `--layer NAME` | no | `Elevation_CCT_GLM2019_5m_DEM` | WMS layer, used for both `LAYERS` and `QUERY_LAYERS` |
-| `--threads N` | no | 8 | worker threads, one keep-alive connection each |
-| `--max-retries N` | no | 8 | retries per pixel after the first attempt |
+| `--threads N` | no | 8 | worker threads (1..64), one keep-alive connection each |
+| `--max-retries N` | no | 8 | retries per pixel after the first attempt (0..100) |
 | `--max-consecutive-failures N` | no | 100 | pixels failing in a row before the run stops |
 | `--ca-bundle PATH` | no | unset | PEM bundle for certificate verification |
 | `--insecure` | no | off | disable certificate verification |

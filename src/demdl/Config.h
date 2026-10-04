@@ -29,7 +29,7 @@ struct Config {
   std::string wmsUrl = "https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets";
   std::string layer = "Elevation_CCT_GLM2019_5m_DEM";
   int threads = 8;     // capped at 64 to go easy on a public server
-  int maxRetries = 8;  // retries after the first attempt; 0 means a single attempt
+  int maxRetries = 8;  // retries after the first attempt, at most 100; 0 means a single attempt
   int maxConsecutiveFailures = 100;
   std::string caBundle;  // empty means the system trust store; no effect when insecure is set
   bool insecure = false;

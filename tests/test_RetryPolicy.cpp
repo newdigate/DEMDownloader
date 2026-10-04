@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <limits>
 
 #include "demdl/RetryPolicy.h"
 
@@ -31,4 +32,16 @@ TEST_CASE("a custom policy is honoured", "[retrypolicy]") {
   CHECK(p.delayFor(1, 0.9) == 2ms);
   CHECK(p.delayFor(2, 0.9) == 3ms);
   CHECK(p.delayFor(40, 0.9) == 3ms);
+}
+
+TEST_CASE("jitter applies after the cap, so the longest sleep is maxDelay * (1 + jitter)", "[retrypolicy]") {
+  const RetryPolicy p;
+  CHECK(p.delayFor(7, 0.0) == 24000ms);
+  CHECK(p.delayFor(7, 1.0) == 36000ms);
+}
+
+TEST_CASE("an attempt beyond the range of double still yields the cap", "[retrypolicy]") {
+  const RetryPolicy p;
+  CHECK(p.delayFor(1024, 0.5) == 30000ms);
+  CHECK(p.delayFor(std::numeric_limits<int>::max(), 0.5) == 30000ms);
 }

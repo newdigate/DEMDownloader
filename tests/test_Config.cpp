@@ -87,6 +87,12 @@ TEST_CASE("validation reports the first problem", "[config]") {
   retries.maxRetries = -1;
   CHECK(retries.validate() == "max-retries must be at least 0");
 
+  Config manyRetries = exampleConfig();
+  manyRetries.maxRetries = 101;
+  CHECK(manyRetries.validate() == "max-retries must be at most 100");
+  manyRetries.maxRetries = 100;
+  CHECK(manyRetries.validate().empty());
+
   Config failures = exampleConfig();
   failures.maxConsecutiveFailures = 0;
   CHECK(failures.validate() == "max-consecutive-failures must be at least 1");

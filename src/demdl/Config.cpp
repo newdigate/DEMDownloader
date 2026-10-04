@@ -95,6 +95,7 @@ std::string Config::validate() const {
   if (threads < 1) return "threads must be at least 1";
   if (threads > 64) return "threads must be at most 64";
   if (maxRetries < 0) return "max-retries must be at least 0";
+  if (maxRetries > 100) return "max-retries must be at most 100";
   if (maxConsecutiveFailures < 1) return "max-consecutive-failures must be at least 1";
   return {};
 }
