@@ -1,2 +1,5 @@
 cmake-build-debug*
+build*/
 /output/new2.tif
+*.tif
+*.tif.tmp

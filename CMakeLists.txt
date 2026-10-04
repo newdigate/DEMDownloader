@@ -1,54 +1,70 @@
 cmake_minimum_required(VERSION 3.27)
-project(DownloadElevation)
+project(DownloadElevation VERSION 0.2.0 LANGUAGES CXX)
+
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-
-include(FetchContent)
-FetchContent_Declare(
-        httplib
-        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-        GIT_TAG        master
-        FIND_PACKAGE_ARGS NAMES httplib
-)
-FetchContent_Declare(
-        ctpl
-        GIT_REPOSITORY https://github.com/vit-vit/ctpl.git
-        GIT_TAG        master
-        FIND_PACKAGE_ARGS NAMES ctpl
-)
-
-# After the following call, the CMake targets defined by googletest and
-# Catch2 will be available to the rest of the build
-FetchContent_MakeAvailable(httplib)
-FetchContent_MakeAvailable(ctpl)
-include_directories(${ctpl_SOURCE_DIR})
 # macOS CMake searches frameworks before /usr/local by default and globs every
 # *.framework/Headers, so /Library/Frameworks/Mono.framework/Headers (libtiff 4.0.9)
 # would win over Homebrew's tiff.h. Search frameworks last.
 set(CMAKE_FIND_FRAMEWORK LAST)
 
+if(APPLE)
+  set(_dl_preview_default ON)
+else()
+  set(_dl_preview_default OFF)
+endif()
+option(DL_ELEVATION_PREVIEW "Build the OpenGL preview window" ${_dl_preview_default})
+option(DL_ELEVATION_TESTS "Build the Catch2 test suite" ON)
+
+include(FetchContent)
+# cpp-httplib is pinned to the Homebrew version in use so both dependency paths
+# compile identical code. FIND_PACKAGE_ARGS prefers the system package when present.
+FetchContent_Declare(httplib
+  GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+  GIT_TAG        v0.46.1
+  FIND_PACKAGE_ARGS NAMES httplib)
+# ctpl has no tags; this is its last commit (2015-06-12).
+FetchContent_Declare(ctpl
+  GIT_REPOSITORY https://github.com/vit-vit/ctpl.git
+  GIT_TAG        437e135dbd94eb65b45533d9ce8ee28b5bd37b6d)
+FetchContent_Declare(CLI11
+  GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+  GIT_TAG        v2.7.2)
+FetchContent_Declare(Catch2
+  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+  GIT_TAG        v3.16.0)
+FetchContent_MakeAvailable(httplib ctpl CLI11)
+if(DL_ELEVATION_TESTS)
+  FetchContent_MakeAvailable(Catch2)
+endif()
+
 # libtiff via CMake's bundled FindTIFF. libgeotiff ships no CMake package, so locate it directly.
 find_package(TIFF REQUIRED)
 find_path(GEOTIFF_INCLUDE_DIR geotiff.h REQUIRED)
 find_library(GEOTIFF_LIBRARY geotiff REQUIRED)
-include_directories(${GEOTIFF_INCLUDE_DIR})
-add_executable(dl_elevation main.cpp)
 
-
-include(opengl.cmake.in)
-target_link_libraries(dl_elevation ${LIBS})
-target_link_libraries(dl_elevation ${GEOTIFF_LIBRARY} TIFF::TIFF)
-# OpenSSL is not linked here: httplib::httplib carries OpenSSL::SSL and OpenSSL::Crypto on both paths.
+add_library(demdl STATIC
+  src/demdl/BoundingBox.cpp)
+target_include_directories(demdl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${GEOTIFF_INCLUDE_DIR})
+target_include_directories(demdl SYSTEM PUBLIC ${ctpl_SOURCE_DIR})
 # httplib::httplib exists on both paths: the Homebrew package only exports the
 # namespaced name, and the FetchContent build adds it as an alias. The bare
 # "httplib" name is not a target when the system package is found, so linking it
 # silently drops CPPHTTPLIB_OPENSSL_SUPPORT and SSLClient disappears.
-target_link_libraries(dl_elevation httplib::httplib)
+target_link_libraries(demdl PUBLIC httplib::httplib TIFF::TIFF ${GEOTIFF_LIBRARY})
+target_compile_options(demdl PRIVATE -Wall -Wextra)
+target_compile_definitions(demdl PUBLIC DL_ELEVATION_VERSION="${PROJECT_VERSION}")
 
-if  (APPLE)
-    target_link_libraries(dl_elevation
-            "-framework CoreServices"
-            "-framework CoreAudio"
-            "-framework Foundation"
-            "-framework AudioUnit")
+if(DL_ELEVATION_TESTS)
+  include(CTest)
+  list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
+  include(Catch)
+  add_executable(demdl_tests
+    tests/test_BoundingBox.cpp)
+  target_link_libraries(demdl_tests PRIVATE demdl Catch2::Catch2WithMain)
+  target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
+  catch_discover_tests(demdl_tests)
 endif()
