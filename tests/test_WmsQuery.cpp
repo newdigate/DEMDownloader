@@ -80,4 +80,7 @@ TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") 
 TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: abc").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0:").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: nan").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: inf").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: -inf").kind == ParseResult::Kind::ParseError);
 }

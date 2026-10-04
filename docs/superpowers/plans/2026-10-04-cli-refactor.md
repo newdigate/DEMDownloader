@@ -804,6 +804,9 @@ TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") 
 TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: abc").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0:").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: nan").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: inf").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: -inf").kind == ParseResult::Kind::ParseError);
 }
 ```
 
@@ -860,7 +863,8 @@ std::string featureInfoUrl(const Config& cfg, int x, int y);
 // "BAND 0: <number>" anywhere in the body is a value, whatever else the body says. Without the
 // marker, a body containing "ServiceException" (an XML exception report, which WMS servers send
 // with HTTP 200 for faults such as an unknown layer) is ParseError so that the caller retries it;
-// any other body is NoData. A marker without a parseable number is ParseError.
+// any other body is NoData. A marker without a parseable number is ParseError, and so is a
+// non-finite one such as "nan" or "inf".
 ParseResult parseElevation(std::string_view body);
 
 }  // namespace demdl
@@ -871,6 +875,7 @@ ParseResult parseElevation(std::string_view body);
 ```cpp
 #include "demdl/WmsQuery.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -942,7 +947,9 @@ ParseResult parseElevation(std::string_view body) {
   const char* begin = token.c_str();
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
-  if (end == begin) return {ParseResult::Kind::ParseError, 0.0};
+  // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
+  // unfetched pixel and be requested again on every run.
+  if (end == begin || !std::isfinite(value)) return {ParseResult::Kind::ParseError, 0.0};
   return {ParseResult::Kind::Value, value};
 }
 

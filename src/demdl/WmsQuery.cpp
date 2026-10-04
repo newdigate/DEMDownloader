@@ -1,5 +1,6 @@
 #include "demdl/WmsQuery.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -71,7 +72,9 @@ ParseResult parseElevation(std::string_view body) {
   const char* begin = token.c_str();
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
-  if (end == begin) return {ParseResult::Kind::ParseError, 0.0};
+  // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
+  // unfetched pixel and be requested again on every run.
+  if (end == begin || !std::isfinite(value)) return {ParseResult::Kind::ParseError, 0.0};
   return {ParseResult::Kind::Value, value};
 }
 

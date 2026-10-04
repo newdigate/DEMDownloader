@@ -43,7 +43,7 @@ Non-goals for this iteration:
 |---|---|
 | Output format | Single-band float32 GeoTIFF in metres. Old RGB16 files are not resumable and are left untouched. |
 | TLS | Verify certificates by default using the system trust store. `--ca-bundle` overrides, `--insecure` disables. |
-| Response parsing | Parse the whole number after `BAND 0:`. Missing band is NoData. Unparseable or transport failure is retried, then left for the next run. |
+| Response parsing | Parse the whole number after `BAND 0:`. Missing band is NoData unless the body is a `ServiceException`, which is retried. Unparseable or transport failure is retried, then left for the next run. |
 | Concurrency | `--threads` default 8 (was 50). Exponential backoff between retries. `--max-retries` default 8 (was 500). |
 | Shutdown | SIGINT/SIGTERM stop queueing, drain in-flight requests, save, exit. |
 | Preview | Off by default; `--preview` opens the window. |
@@ -121,12 +121,13 @@ refused. No parsing library appears in the library.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
-`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins: a number
-after it is a `Value`, anything else is a `ParseError`. Without the marker the
-body is `NoData` only when it does not contain `ServiceException`. WMS servers
-often report a fault, such as a wrong layer name, as HTTP 200 with an XML
-`ServiceExceptionReport`; that body is a `ParseError`, so it is retried and
-never recorded as a permanent NoData. Both are pure.
+`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins: a finite
+number after it is a `Value`, anything else (`nan` and `inf` included) is a
+`ParseError`. Without the marker the body is `NoData` only when it does not
+contain `ServiceException`. WMS servers often report a fault, such as a wrong
+layer name, as HTTP 200 with an XML `ServiceExceptionReport`; that body is a
+`ParseError`, so it is retried and never recorded as a permanent NoData.
+Both are pure.
 
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
@@ -400,9 +401,12 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 - **WmsQuery**: golden URL for the example Config at pixel (0, 0) equals
   `/erdas-iws/ogc/wms/GeoSpatial%20Datasets?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&BBOX=-34.216344700%2C18.418579100%2C-34.184541800%2C18.462524400&CRS=EPSG%3A4326&WIDTH=2048&HEIGHT=1792&LAYERS=Elevation_CCT_GLM2019_5m_DEM&STYLES=&FORMAT=image%2Fpng&QUERY_LAYERS=Elevation_CCT_GLM2019_5m_DEM&INFO_FORMAT=text%2Fplain&I=0&J=0`
   (coordinates fixed at nine decimals, order south, west, north, east as WMS
-  1.3.0 requires for EPSG:4326); a layer name with spaces is percent-encoded;
-  parsing of `BAND 0: 123.45`, `BAND 0: -1.5`, `BAND 0: 1086.25`, a body
-  without the marker (NoData), and `BAND 0: abc` (ParseError).
+  1.3.0 requires for EPSG:4326); a layer name with spaces is percent-encoded,
+  and so are non-ASCII bytes (`\xC3\xA9` gives `%C3%A9`); parsing of
+  `BAND 0: 123.45`, `BAND 0: -1.5`, `BAND 0: 1086.25`, a body without the
+  marker (NoData), `BAND 0: abc`, `BAND 0: nan`, `BAND 0: inf` and
+  `BAND 0: -inf` (all ParseError), and a `ServiceException` body (ParseError,
+  unless the band marker is also present, which wins).
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp
@@ -463,7 +467,8 @@ used.
 - Preview is off unless `--preview`.
 - 8 threads and 8 retries by default instead of 50 and 500; failures back off.
 - Certificates are verified.
-- A missing band is NoData, not 0 m; a failed pixel stays NaN for the next run.
+- A missing band is NoData, not 0 m, unless the body is a `ServiceException`,
+  which is retried; a failed pixel stays NaN for the next run.
 - Resume is per pixel, not "the row after the last non-zero sample".
 - Closing the window or pressing Ctrl-C saves and exits cleanly.
 - Each worker reuses one connection instead of a new TLS handshake per pixel.
