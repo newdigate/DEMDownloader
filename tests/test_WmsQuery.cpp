@@ -1,6 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <limits>
+#include <stdexcept>
+#include <string>
+
 #include "ExampleConfig.h"
 #include "demdl/WmsQuery.h"
 
@@ -34,10 +38,17 @@ TEST_CASE("the layer name is percent-encoded in both LAYERS and QUERY_LAYERS", "
   CHECK(url.find("&QUERY_LAYERS=My%20Layer%2F1&") != std::string::npos);
 }
 
-TEST_CASE("percentEncode keeps unreserved characters", "[wmsquery]") {
+TEST_CASE("featureInfoUrl throws when the WMS URL does not parse", "[wmsquery]") {
+  demdl::Config cfg = exampleConfig();
+  cfg.wmsUrl = "not a url";
+  CHECK_THROWS_AS(featureInfoUrl(cfg, 0, 0), std::invalid_argument);
+}
+
+TEST_CASE("percentEncode keeps unreserved characters and encodes everything else", "[wmsquery]") {
   CHECK(percentEncode("Abc-1.2_x~") == "Abc-1.2_x~");
   CHECK(percentEncode("a b:c/d") == "a%20b%3Ac%2Fd");
   CHECK(percentEncode("\xC3\xA9") == "%C3%A9");
+  CHECK(percentEncode("%") == "%25");
 }
 
 TEST_CASE("formatCoordinate uses nine fixed decimals", "[wmsquery]") {
@@ -59,9 +70,35 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
   CHECK_THAT(c.value, WithinAbs(1086.25, 1e-12));
 }
 
-TEST_CASE("a body without the band marker is NoData", "[wmsquery]") {
+TEST_CASE("the value is the numeric prefix of the marker's line", "[wmsquery]") {
+  // Text after the number is ignored.
+  const auto withUnit = parseElevation("BAND 0: 12.5 m");
+  REQUIRE(withUnit.kind == ParseResult::Kind::Value);
+  CHECK_THAT(withUnit.value, WithinAbs(12.5, 1e-12));
+
+  // The number must be on the marker's own line.
+  CHECK(parseElevation("BAND 0:\n5").kind == ParseResult::Kind::ParseError);
+}
+
+TEST_CASE("a plain body without the band marker is NoData", "[wmsquery]") {
   CHECK(parseElevation("GetFeatureInfo results:\n").kind == ParseResult::Kind::NoData);
-  CHECK(parseElevation("").kind == ParseResult::Kind::NoData);
+  CHECK(parseElevation("GetFeatureInfo results:\nno bands\n").kind == ParseResult::Kind::NoData);
+}
+
+TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsquery]") {
+  CHECK(parseElevation("").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("   \n").kind == ParseResult::Kind::ParseError);
+
+  const std::string html = "<html><body>Service temporarily unavailable</body></html>";
+  CHECK(parseElevation(html).kind == ParseResult::Kind::ParseError);
+
+  const std::string owsReport = "  <?xml version=\"1.0\"?><ows:ExceptionReport/>";
+  CHECK(parseElevation(owsReport).kind == ParseResult::Kind::ParseError);
+
+  // The band marker still wins over markup.
+  const auto wrapped = parseElevation("<pre>BAND 0: 42.5</pre>");
+  REQUIRE(wrapped.kind == ParseResult::Kind::Value);
+  CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
 }
 
 TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") {
@@ -77,12 +114,25 @@ TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") 
   CHECK_THAT(both.value, WithinAbs(42.5, 1e-12));
 }
 
-TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
+TEST_CASE("a band marker without a usable number is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: abc").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0:").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: nan").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: inf").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: -inf").kind == ParseResult::Kind::ParseError);
+}
+
+TEST_CASE("a band value outside float range is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: 1e300").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: -1e300").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: 3.5e38").kind == ParseResult::Kind::ParseError);
+
+  // FLT_MAX itself is still a value, and it survives the cast to float.
+  const auto limit = parseElevation("BAND 0: 3.4028234663852886e38");
+  REQUIRE(limit.kind == ParseResult::Kind::Value);
+  CHECK(static_cast<float>(limit.value) == std::numeric_limits<float>::max());
+}
+
+TEST_CASE("a default-constructed ParseResult is a parse error, never a 0 m value", "[wmsquery]") {
+  CHECK(ParseResult{}.kind == ParseResult::Kind::ParseError);
 }

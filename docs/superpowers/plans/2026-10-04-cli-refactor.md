@@ -725,6 +725,10 @@ Implements spec section 4.3 (WmsQuery) and the golden URL in section 11.
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <limits>
+#include <stdexcept>
+#include <string>
+
 #include "ExampleConfig.h"
 #include "demdl/WmsQuery.h"
 
@@ -758,10 +762,17 @@ TEST_CASE("the layer name is percent-encoded in both LAYERS and QUERY_LAYERS", "
   CHECK(url.find("&QUERY_LAYERS=My%20Layer%2F1&") != std::string::npos);
 }
 
-TEST_CASE("percentEncode keeps unreserved characters", "[wmsquery]") {
+TEST_CASE("featureInfoUrl throws when the WMS URL does not parse", "[wmsquery]") {
+  demdl::Config cfg = exampleConfig();
+  cfg.wmsUrl = "not a url";
+  CHECK_THROWS_AS(featureInfoUrl(cfg, 0, 0), std::invalid_argument);
+}
+
+TEST_CASE("percentEncode keeps unreserved characters and encodes everything else", "[wmsquery]") {
   CHECK(percentEncode("Abc-1.2_x~") == "Abc-1.2_x~");
   CHECK(percentEncode("a b:c/d") == "a%20b%3Ac%2Fd");
   CHECK(percentEncode("\xC3\xA9") == "%C3%A9");
+  CHECK(percentEncode("%") == "%25");
 }
 
 TEST_CASE("formatCoordinate uses nine fixed decimals", "[wmsquery]") {
@@ -783,9 +794,35 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
   CHECK_THAT(c.value, WithinAbs(1086.25, 1e-12));
 }
 
-TEST_CASE("a body without the band marker is NoData", "[wmsquery]") {
+TEST_CASE("the value is the numeric prefix of the marker's line", "[wmsquery]") {
+  // Text after the number is ignored.
+  const auto withUnit = parseElevation("BAND 0: 12.5 m");
+  REQUIRE(withUnit.kind == ParseResult::Kind::Value);
+  CHECK_THAT(withUnit.value, WithinAbs(12.5, 1e-12));
+
+  // The number must be on the marker's own line.
+  CHECK(parseElevation("BAND 0:\n5").kind == ParseResult::Kind::ParseError);
+}
+
+TEST_CASE("a plain body without the band marker is NoData", "[wmsquery]") {
   CHECK(parseElevation("GetFeatureInfo results:\n").kind == ParseResult::Kind::NoData);
-  CHECK(parseElevation("").kind == ParseResult::Kind::NoData);
+  CHECK(parseElevation("GetFeatureInfo results:\nno bands\n").kind == ParseResult::Kind::NoData);
+}
+
+TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsquery]") {
+  CHECK(parseElevation("").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("   \n").kind == ParseResult::Kind::ParseError);
+
+  const std::string html = "<html><body>Service temporarily unavailable</body></html>";
+  CHECK(parseElevation(html).kind == ParseResult::Kind::ParseError);
+
+  const std::string owsReport = "  <?xml version=\"1.0\"?><ows:ExceptionReport/>";
+  CHECK(parseElevation(owsReport).kind == ParseResult::Kind::ParseError);
+
+  // The band marker still wins over markup.
+  const auto wrapped = parseElevation("<pre>BAND 0: 42.5</pre>");
+  REQUIRE(wrapped.kind == ParseResult::Kind::Value);
+  CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
 }
 
 TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") {
@@ -801,14 +838,27 @@ TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") 
   CHECK_THAT(both.value, WithinAbs(42.5, 1e-12));
 }
 
-TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
+TEST_CASE("a band marker without a usable number is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: abc").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0:").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: nan").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: inf").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: -inf").kind == ParseResult::Kind::ParseError);
+}
+
+TEST_CASE("a band value outside float range is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: 1e300").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: -1e300").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: 3.5e38").kind == ParseResult::Kind::ParseError);
+
+  // FLT_MAX itself is still a value, and it survives the cast to float.
+  const auto limit = parseElevation("BAND 0: 3.4028234663852886e38");
+  REQUIRE(limit.kind == ParseResult::Kind::Value);
+  CHECK(static_cast<float>(limit.value) == std::numeric_limits<float>::max());
+}
+
+TEST_CASE("a default-constructed ParseResult is a parse error, never a 0 m value", "[wmsquery]") {
+  CHECK(ParseResult{}.kind == ParseResult::Kind::ParseError);
 }
 ```
 
@@ -847,27 +897,35 @@ namespace demdl {
 
 struct ParseResult {
   enum class Kind { Value, NoData, ParseError };
-  Kind kind;
-  double value = 0.0;  // valid when kind == Value
+  Kind kind = Kind::ParseError;  // so a value-initialised result is never a 0 m Value
+  double value = 0.0;            // valid when kind == Value
 };
 
 // RFC 3986 percent-encoding: unreserved characters pass through, everything else becomes %XX.
 std::string percentEncode(std::string_view s);
 
 // Degrees with nine fixed decimals (about 0.1 mm), used in URLs and user-facing reports alike.
+// Relies on the C locale for the decimal point; nothing in this program calls setlocale.
 std::string formatCoordinate(double degrees);
 
 // Request target (path plus query) of the WMS 1.3.0 GetFeatureInfo request for pixel column x, row y.
 // The box is sent as south,west,north,east, the axis order WMS 1.3.0 requires for EPSG:4326.
+// cfg.layer is taken unencoded and percent-encoded here, so a name that is already encoded would
+// be double-encoded. Requires 0 <= x < cfg.width and 0 <= y < cfg.height; this is not checked,
+// because the Downloader supplies raster indices and pool jobs must not throw.
 // Throws std::invalid_argument when cfg.wmsUrl does not parse.
 std::string featureInfoUrl(const Config& cfg, int x, int y);
 
-// "BAND 0: <number>" anywhere in the body is a value, whatever else the body says. Without the
-// marker, a body containing "ServiceException" (an XML exception report, which WMS servers send
-// with HTTP 200 for faults such as an unknown layer) is ParseError so that the caller retries it;
-// any other body is NoData. A marker without a parseable number is ParseError, and so is a
-// non-finite one such as "nan" or "inf" and one outside float range, because the raster stores
-// float32; a Value therefore always fits in a float.
+// Classifies the text/plain body of a GetFeatureInfo response.
+// "BAND 0:" anywhere in the body is a band, whatever else the body says. The numeric prefix of the
+// rest of that line is the value: trailing text such as " m" is ignored, and the number must be on
+// the marker's own line. It is a Value only when finite and within float range (the raster stores
+// float32, so a Value always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
+// Without the marker the body is NoData only when it is not blank (empty or only whitespace), does
+// not contain "ServiceException" and does not start with markup ('<' as the first non-whitespace
+// character). NoData is stored as -32768 and never re-requested, so any other body, such as an
+// HTML error page or an OWS exception report, is ParseError and the caller retries it instead.
+// Relies on the C locale for the decimal point; nothing in this program calls setlocale.
 ParseResult parseElevation(std::string_view body);
 
 }  // namespace demdl
@@ -914,6 +972,8 @@ std::string percentEncode(std::string_view s) {
 }
 
 std::string formatCoordinate(double degrees) {
+  // snprintf, because std::to_chars for double is unavailable on this libc++ at the default
+  // deployment target.
   char buf[64];
   std::snprintf(buf, sizeof buf, "%.9f", degrees);
   return buf;
@@ -937,9 +997,13 @@ ParseResult parseElevation(std::string_view body) {
   static constexpr std::string_view marker = "BAND 0:";
   const auto pos = body.find(marker);
   if (pos == std::string_view::npos) {
-    // WMS servers often report a fault, such as an unknown layer, as HTTP 200 with an XML
-    // exception report. That is an error to retry, not a permanent "no elevation here".
-    if (body.find("ServiceException") != std::string_view::npos) {
+    // NoData is stored as -32768 and never re-requested, so a body that is not plainly "no band
+    // here" must be retried instead: an empty or blank one, markup (an HTML error page or an OWS
+    // exception report; text/plain was requested, so markup is never a valid answer) and anything
+    // that mentions a ServiceException (WMS servers report faults such as an unknown layer so).
+    const auto first = body.find_first_not_of(" \t\n\v\f\r");
+    if (first == std::string_view::npos || body[first] == '<' ||
+        body.find("ServiceException") != std::string_view::npos) {
       return {ParseResult::Kind::ParseError, 0.0};
     }
     return {ParseResult::Kind::NoData, 0.0};
@@ -952,8 +1016,9 @@ ParseResult parseElevation(std::string_view body) {
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
-  // unfetched pixel and be requested again on every run. The raster stores float32, so a value
-  // outside float range is refused too: cast to float it would become infinity.
+  // unfetched pixel and be requested again on every run. The raster stores float32, so values
+  // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does
+  // not matter, because no elevation is anywhere near 1e38.
   if (end == begin || !std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
     return {ParseResult::Kind::ParseError, 0.0};
   }
@@ -966,7 +1031,7 @@ ParseResult parseElevation(std::string_view body) {
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[wmsquery]"`
-Expected: `All tests passed (N assertions in 9 test cases)`.
+Expected: `All tests passed (N assertions in 14 test cases)`.
 
 - [ ] **Step 7: Commit**
 

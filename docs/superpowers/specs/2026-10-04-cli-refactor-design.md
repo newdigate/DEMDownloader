@@ -43,7 +43,7 @@ Non-goals for this iteration:
 |---|---|
 | Output format | Single-band float32 GeoTIFF in metres. Old RGB16 files are not resumable and are left untouched. |
 | TLS | Verify certificates by default using the system trust store. `--ca-bundle` overrides, `--insecure` disables. |
-| Response parsing | Parse the whole number after `BAND 0:`. Missing band is NoData unless the body is a `ServiceException`, which is retried. Unparseable or transport failure is retried, then left for the next run. |
+| Response parsing | Parse the whole number after `BAND 0:`. A 200 body is NoData only when it lacks the marker and is plain (not blank, no `ServiceException`, not markup); anything else without a finite in-range number is a parse error. Parse errors and transport failures are retried, then left for the next run. |
 | Concurrency | `--threads` default 8 (was 50). Exponential backoff between retries. `--max-retries` default 8 (was 500). |
 | Shutdown | SIGINT/SIGTERM stop queueing, drain in-flight requests, save, exit. |
 | Preview | Off by default; `--preview` opens the window. |
@@ -121,14 +121,18 @@ refused. No parsing library appears in the library.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
-`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins: a number
-after it is a `Value` only when it is finite and within float range, because
-the raster stores float32; anything else (no number, `nan`, `inf`, `1e300`) is
-a `ParseError`. Without the marker the body is `NoData` only when it does not
-contain `ServiceException`. WMS servers often report a fault, such as a wrong
-layer name, as HTTP 200 with an XML `ServiceExceptionReport`; that body is a
-`ParseError`, so it is retried and never recorded as a permanent NoData.
-Both are pure.
+`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins over
+everything else in the body. The numeric prefix of the marker's line is parsed
+and trailing text is ignored, so `BAND 0: 12.5 m` is 12.5; a number on the next
+line does not count. The result is a `Value` only when the number is finite and
+within float range, because the raster stores float32; anything else (no
+number, `nan`, `inf`, `1e300`) is a `ParseError`. Without the marker the body
+is `NoData` only when it is not blank (empty or only whitespace), does not
+contain `ServiceException` and does not start with markup (`<` as the first
+non-whitespace character). Anything else is a `ParseError` and is retried,
+because NoData is stored as -32768 and never re-requested; WMS servers often
+report a fault, such as a wrong layer name, as HTTP 200 with an XML exception
+report or an HTML page. Both are pure.
 
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
@@ -154,13 +158,14 @@ struct PixelFetcher {
 constructed from the WMS origin, with keep-alive on, connection timeout 10 s,
 read timeout 30 s, write timeout 10 s, certificate verification enabled unless
 `insecure`, and `set_ca_cert_path` when `caBundle` is set. One instance per
-worker thread. `fetch` loops over attempts: HTTP 200 with a band is `Value`;
-HTTP 200 without the band is `NoData`, unless the body contains
-`ServiceException`, which is a `ParseError`; any other status, a transport
-error, or `ParseError` is a failure that sleeps `RetryPolicy::delayFor` in
-100 ms slices while checking `stop`, then retries. Exhausting retries returns
-`Failed`. The first `ParseError` body of the run is logged once to stderr,
-guarded by a `std::once_flag` shared by all workers.
+worker thread. `fetch` loops over attempts: HTTP 200 with a finite in-range
+band value is `Value`; HTTP 200 without the band marker is `NoData` only when
+the body is not blank, does not contain `ServiceException` and does not start
+with markup; any other status, a transport error, or `ParseError` (every other
+200 body) is a failure that sleeps `RetryPolicy::delayFor` in 100 ms slices
+while checking `stop`, then retries. Exhausting retries returns `Failed`. The
+first `ParseError` body of the run is logged once to stderr, guarded by a
+`std::once_flag` shared by all workers.
 
 **DemRaster** holds `width`, `height`, `BoundingBox`, `Metadata{layer,
 wmsUrl}` and `std::vector<float>` in row-major order, row 0 at the north edge.
@@ -236,7 +241,7 @@ Pixel semantics:
 | Value | Meaning | On resume |
 |---|---|---|
 | finite float | elevation in metres as the server returned it, negatives kept | kept |
-| `-32768` | server answered 200 with no `BAND 0:` and no `ServiceException` (no elevation here); a `ServiceException` body is a parse error and is retried | kept, never re-requested |
+| `-32768` | server answered 200 with no `BAND 0:` and a plain body (not blank, no `ServiceException`, not markup): no elevation here; any other body without a finite in-range value is a parse error, retried | kept, never re-requested |
 | NaN | never fetched, or failed after all retries | requested |
 
 Row 0 is the north edge and corresponds to `J = 0` in the WMS request; column
@@ -403,12 +408,20 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `/erdas-iws/ogc/wms/GeoSpatial%20Datasets?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&BBOX=-34.216344700%2C18.418579100%2C-34.184541800%2C18.462524400&CRS=EPSG%3A4326&WIDTH=2048&HEIGHT=1792&LAYERS=Elevation_CCT_GLM2019_5m_DEM&STYLES=&FORMAT=image%2Fpng&QUERY_LAYERS=Elevation_CCT_GLM2019_5m_DEM&INFO_FORMAT=text%2Fplain&I=0&J=0`
   (coordinates fixed at nine decimals, order south, west, north, east as WMS
   1.3.0 requires for EPSG:4326); a layer name with spaces is percent-encoded,
-  and so are non-ASCII bytes (`\xC3\xA9` gives `%C3%A9`); parsing of
-  `BAND 0: 123.45`, `BAND 0: -1.5`, `BAND 0: 1086.25`, a body without the
-  marker (NoData), `BAND 0: abc`, `BAND 0: nan`, `BAND 0: inf`,
-  `BAND 0: -inf`, `BAND 0: 1e300` and `BAND 0: -1e300` (all ParseError; the
-  last two are outside float range), and a `ServiceException` body
-  (ParseError, unless the band marker is also present, which wins).
+  and so are non-ASCII bytes (`\xC3\xA9` gives `%C3%A9`) and `%` itself
+  (`%25`); `featureInfoUrl` throws `std::invalid_argument` when the WMS URL
+  does not parse; parsing of `BAND 0: 123.45`, `BAND 0: -1.5`,
+  `BAND 0: 1086.25` and `BAND 0: 12.5 m` (12.5, trailing text is ignored);
+  `BAND 0: abc`, `BAND 0:`, `BAND 0:` followed by a newline and a number,
+  `BAND 0: nan`, `BAND 0: inf`, `BAND 0: -inf`, `BAND 0: 1e300`,
+  `BAND 0: -1e300` and `BAND 0: 3.5e38` (all ParseError), while
+  `BAND 0: 3.4028234663852886e38`, exactly `FLT_MAX`, is a Value; a body
+  without the marker is NoData when it is plain, such as
+  `GetFeatureInfo results:` or `GetFeatureInfo results:\nno bands\n`, but an
+  empty body, a whitespace-only body, an HTML page, an XML
+  `ows:ExceptionReport` after leading spaces and a `ServiceException` body are
+  ParseError, and the band marker wins over all of them when it is present; a
+  default-constructed `ParseResult` is a ParseError.
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp
@@ -469,8 +482,10 @@ used.
 - Preview is off unless `--preview`.
 - 8 threads and 8 retries by default instead of 50 and 500; failures back off.
 - Certificates are verified.
-- A missing band is NoData, not 0 m, unless the body is a `ServiceException`,
-  which is retried; a failed pixel stays NaN for the next run.
+- A missing band is NoData, not 0 m, but only for a body that is not blank,
+  has no `ServiceException` and does not start with markup; anything else
+  without a finite in-range band value is retried, and a failed pixel stays
+  NaN for the next run.
 - Resume is per pixel, not "the row after the last non-zero sample".
 - Closing the window or pressing Ctrl-C saves and exits cleanly.
 - Each worker reuses one connection instead of a new TLS handshake per pixel.

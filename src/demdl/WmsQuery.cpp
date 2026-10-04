@@ -36,6 +36,8 @@ std::string percentEncode(std::string_view s) {
 }
 
 std::string formatCoordinate(double degrees) {
+  // snprintf, because std::to_chars for double is unavailable on this libc++ at the default
+  // deployment target.
   char buf[64];
   std::snprintf(buf, sizeof buf, "%.9f", degrees);
   return buf;
@@ -59,9 +61,13 @@ ParseResult parseElevation(std::string_view body) {
   static constexpr std::string_view marker = "BAND 0:";
   const auto pos = body.find(marker);
   if (pos == std::string_view::npos) {
-    // WMS servers often report a fault, such as an unknown layer, as HTTP 200 with an XML
-    // exception report. That is an error to retry, not a permanent "no elevation here".
-    if (body.find("ServiceException") != std::string_view::npos) {
+    // NoData is stored as -32768 and never re-requested, so a body that is not plainly "no band
+    // here" must be retried instead: an empty or blank one, markup (an HTML error page or an OWS
+    // exception report; text/plain was requested, so markup is never a valid answer) and anything
+    // that mentions a ServiceException (WMS servers report faults such as an unknown layer so).
+    const auto first = body.find_first_not_of(" \t\n\v\f\r");
+    if (first == std::string_view::npos || body[first] == '<' ||
+        body.find("ServiceException") != std::string_view::npos) {
       return {ParseResult::Kind::ParseError, 0.0};
     }
     return {ParseResult::Kind::NoData, 0.0};
@@ -74,8 +80,9 @@ ParseResult parseElevation(std::string_view body) {
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
-  // unfetched pixel and be requested again on every run. The raster stores float32, so a value
-  // outside float range is refused too: cast to float it would become infinity.
+  // unfetched pixel and be requested again on every run. The raster stores float32, so values
+  // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does
+  // not matter, because no elevation is anywhere near 1e38.
   if (end == begin || !std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
     return {ParseResult::Kind::ParseError, 0.0};
   }
