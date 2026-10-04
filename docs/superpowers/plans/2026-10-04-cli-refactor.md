@@ -761,6 +761,7 @@ TEST_CASE("the layer name is percent-encoded in both LAYERS and QUERY_LAYERS", "
 TEST_CASE("percentEncode keeps unreserved characters", "[wmsquery]") {
   CHECK(percentEncode("Abc-1.2_x~") == "Abc-1.2_x~");
   CHECK(percentEncode("a b:c/d") == "a%20b%3Ac%2Fd");
+  CHECK(percentEncode("\xC3\xA9") == "%C3%A9");
 }
 
 TEST_CASE("formatCoordinate uses nine fixed decimals", "[wmsquery]") {
@@ -785,6 +786,19 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
 TEST_CASE("a body without the band marker is NoData", "[wmsquery]") {
   CHECK(parseElevation("GetFeatureInfo results:\n").kind == ParseResult::Kind::NoData);
   CHECK(parseElevation("").kind == ParseResult::Kind::NoData);
+}
+
+TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") {
+  const std::string report =
+      R"(<?xml version="1.0"?><ServiceExceptionReport>)"
+      R"(<ServiceException code="LayerNotDefined">no such layer</ServiceException>)"
+      R"(</ServiceExceptionReport>)";
+  CHECK(parseElevation(report).kind == ParseResult::Kind::ParseError);
+
+  // The band marker wins when it is present, even if the body also mentions ServiceException.
+  const auto both = parseElevation("ServiceException\nBAND 0: 42.5\n");
+  REQUIRE(both.kind == ParseResult::Kind::Value);
+  CHECK_THAT(both.value, WithinAbs(42.5, 1e-12));
 }
 
 TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
@@ -843,8 +857,10 @@ std::string formatCoordinate(double degrees);
 // Throws std::invalid_argument when cfg.wmsUrl does not parse.
 std::string featureInfoUrl(const Config& cfg, int x, int y);
 
-// "BAND 0: <number>" anywhere in the body is a value; no marker is NoData; a marker without
-// a parseable number is ParseError.
+// "BAND 0: <number>" anywhere in the body is a value, whatever else the body says. Without the
+// marker, a body containing "ServiceException" (an XML exception report, which WMS servers send
+// with HTTP 200 for faults such as an unknown layer) is ParseError so that the caller retries it;
+// any other body is NoData. A marker without a parseable number is ParseError.
 ParseResult parseElevation(std::string_view body);
 
 }  // namespace demdl
@@ -855,7 +871,6 @@ ParseResult parseElevation(std::string_view body);
 ```cpp
 #include "demdl/WmsQuery.h"
 
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -864,8 +879,11 @@ namespace demdl {
 
 namespace {
 
+// The character tests are ASCII only, so the result does not depend on the locale: bytes at or
+// above 0x80 are never unreserved and are always percent-encoded.
 bool isUnreserved(unsigned char c) {
-  return std::isalnum(c) != 0 || c == '-' || c == '.' || c == '_' || c == '~';
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+         c == '.' || c == '_' || c == '~';
 }
 
 }  // namespace
@@ -909,7 +927,14 @@ std::string featureInfoUrl(const Config& cfg, int x, int y) {
 ParseResult parseElevation(std::string_view body) {
   static constexpr std::string_view marker = "BAND 0:";
   const auto pos = body.find(marker);
-  if (pos == std::string_view::npos) return {ParseResult::Kind::NoData, 0.0};
+  if (pos == std::string_view::npos) {
+    // WMS servers often report a fault, such as an unknown layer, as HTTP 200 with an XML
+    // exception report. That is an error to retry, not a permanent "no elevation here".
+    if (body.find("ServiceException") != std::string_view::npos) {
+      return {ParseResult::Kind::ParseError, 0.0};
+    }
+    return {ParseResult::Kind::NoData, 0.0};
+  }
   const std::string_view rest = body.substr(pos + marker.size());
   const auto lineEnd = rest.find_first_of("\r\n");
   // strtod needs a null-terminated string; libc++ on AppleClang 15 has no floating-point from_chars.

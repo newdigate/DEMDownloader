@@ -121,7 +121,12 @@ refused. No parsing library appears in the library.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
-`Value(double)`, `NoData`, or `ParseError`. Both are pure.
+`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins: a number
+after it is a `Value`, anything else is a `ParseError`. Without the marker the
+body is `NoData` only when it does not contain `ServiceException`. WMS servers
+often report a fault, such as a wrong layer name, as HTTP 200 with an XML
+`ServiceExceptionReport`; that body is a `ParseError`, so it is retried and
+never recorded as a permanent NoData. Both are pure.
 
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
@@ -148,11 +153,12 @@ constructed from the WMS origin, with keep-alive on, connection timeout 10 s,
 read timeout 30 s, write timeout 10 s, certificate verification enabled unless
 `insecure`, and `set_ca_cert_path` when `caBundle` is set. One instance per
 worker thread. `fetch` loops over attempts: HTTP 200 with a band is `Value`;
-HTTP 200 without the band is `NoData`; any other status, a transport error, or
-`ParseError` is a failure that sleeps `RetryPolicy::delayFor` in 100 ms slices
-while checking `stop`, then retries. Exhausting retries returns `Failed`. The
-first `ParseError` body of the run is logged once to stderr, guarded by a
-`std::once_flag` shared by all workers.
+HTTP 200 without the band is `NoData`, unless the body contains
+`ServiceException`, which is a `ParseError`; any other status, a transport
+error, or `ParseError` is a failure that sleeps `RetryPolicy::delayFor` in
+100 ms slices while checking `stop`, then retries. Exhausting retries returns
+`Failed`. The first `ParseError` body of the run is logged once to stderr,
+guarded by a `std::once_flag` shared by all workers.
 
 **DemRaster** holds `width`, `height`, `BoundingBox`, `Metadata{layer,
 wmsUrl}` and `std::vector<float>` in row-major order, row 0 at the north edge.
@@ -228,7 +234,7 @@ Pixel semantics:
 | Value | Meaning | On resume |
 |---|---|---|
 | finite float | elevation in metres as the server returned it, negatives kept | kept |
-| `-32768` | server answered 200 with no `BAND 0:` (no elevation here) | kept, never re-requested |
+| `-32768` | server answered 200 with no `BAND 0:` and no `ServiceException` (no elevation here); a `ServiceException` body is a parse error and is retried | kept, never re-requested |
 | NaN | never fetched, or failed after all retries | requested |
 
 Row 0 is the north edge and corresponds to `J = 0` in the WMS request; column
