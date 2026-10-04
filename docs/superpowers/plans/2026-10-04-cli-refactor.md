@@ -4696,14 +4696,30 @@ Expected: the scratch build directories are gone; `build/` stays.
 
 Summarise for the owner: commit list since `refactor/cli` branched, test case count from `ctest`, the three configurations verified, and that no live request was made unless Task 13 Step 7 was explicitly approved and run.
 
+
 ---
 
-## Execution log (controller notes; newest last)
+## Execution log (controller notes)
 
-Executed with superpowers:subagent-driven-development on branch `refactor/cli`. Each task: implementer, spec-compliance review, code-quality review, fixes mirrored into this plan's code blocks and the spec.
+Executed with superpowers:subagent-driven-development on branch `refactor/cli`. Each task: implementer, spec-compliance review, code-quality review; every accepted fix is mirrored into this plan's code blocks and into the spec, so the plan blocks stay byte-identical to the files.
 
-- **Task 1 complete and approved**: `fdf24b4`, `13e69a2`, `3fd84d0`. Review fixes applied: libgeotiff `PATH_SUFFIXES`, httplib version enforced in `FIND_PACKAGE_ARGS`, downloaded httplib requires OpenSSL and matches Homebrew's feature set, ctpl include `SYSTEM PRIVATE`, `enable_testing()`, header contracts, extra BoundingBox tests (9 cases).
-- **Task 2 complete and approved**: `2b83855`, `31db417`, `b49b7e5`. Review fixes applied: strict WMS URL grammar (host or bracketed IPv6, port 1..65535, no userinfo, query, fragment, whitespace or control bytes), `output must name a file`, `threads must be at most 64`, extra validate tests (7 cases).
-- **Task 3 implemented, spec review passed, quality review returned "with fixes"**: `207ee12`, `2b5a53d`, `c2a2284`. Done so far: ServiceException bodies are ParseError, non-finite and out-of-float-range band values are ParseError, ASCII-range percent-encoding. **Open before Task 4**: (1) decide whether a 200 body without the marker whose first non-whitespace character is `<` (HTML or OWS exception markup) is ParseError rather than NoData, and whether an empty body stays NoData; (2) minor items: float-guard comment and exact FLT_MAX threshold with boundary tests, `CHECK_THROWS_AS` for the invalid-URL throw, `Kind kind = Kind::ParseError;` default, C-locale comments on `formatCoordinate` and `parseElevation`, leniency tests (`BAND 0: 12.5 m` is 12.5, `BAND 0:\n5` is ParseError), state that `--layer` is taken unencoded, document the x/y precondition, rename two stale test names; (3) with the owner's approval, capture one land and one sea response body from the real server before the first long run and add them as recorded fixtures.
+| Task | Status | Commits |
+|---|---|---|
+| 1 CMake skeleton, BoundingBox | complete, approved | `fdf24b4`, `13e69a2`, `3fd84d0` |
+| 2 Config, WMS URL parsing | complete, approved | `2b83855`, `31db417`, `b49b7e5`, plus `179fb60` (retries cap) |
+| 3 WmsQuery | complete, approved | `207ee12`, `2b5a53d`, `c2a2284`, `acd3ab3` |
+| 4 RetryPolicy | complete, approved | `d856fc0`, `179fb60` |
+| 5 DemRaster in memory | complete, approved | `fa5b5ad` |
+| 6 DemRaster GeoTIFF I/O | implemented, reviews in progress | `6aa85d5`, `99318f4`, `b671d28` |
 
-**Deferred to later tasks** (from reviews): Task 6: `DemRaster::load` must reject a box that fails `validate()` (NaN tiepoints would pass the tolerance compare). Task 9: after constructing `httplib::Client`, throw `std::invalid_argument` unless `is_valid()`; add a canned 200 ServiceExceptionReport response and assert Failed with "unparseable body"; never assert the raw on-the-wire URL (httplib re-encodes the query). Task 11: `->check(CLI::ExistingFile)` on `--ca-bundle`, make `--insecure` and `--ca-bundle` mutually exclusive, mention the 1..64 thread range and that `--layer` is taken unencoded in help text. Task 12: construct one fetcher inside `main`'s guarded block before starting the run so constructor errors do not escape through `result.get()`. Task 14: loop the BoundingBox finite-value test over all four edges; `.`/`..` output names should fail `output must name a file`; clearer wms-url error message; spec section 5 rows for `--threads`, `--output`, `--wms-url` to mention the new limits; spec 4.3 to mention the inclusive tolerance and `pixelScale` preconditions.
+Decisions taken during execution (all reflected in the spec): WMS URL grammar restricted to `http(s)://host[:port][/path]` with a hostname or bracketed IPv6 literal, port 1..65535, no userinfo, query, fragment, whitespace or control bytes; `--threads` 1..64; `--max-retries` 0..100; `--output` must name a file; a 200 body without the band marker is NoData only when it is non-empty, contains no `ServiceException` and does not start with markup, otherwise it is a parse error and retried; band values must be finite and within float range; the float-range guard stays at `> FLT_MAX`; `GDAL_NODATA` is registered with libtiff by the program; `save` fails (and keeps the previous checkpoint) when any tag write, key write, flush or temp-file creation fails; `load` rejects a reconstructed box that fails validation.
+
+**Open items by task**
+
+- **Task 7**: none known.
+- **Task 8**: none known beyond the plan.
+- **Task 9**: after constructing `httplib::Client`, throw `std::invalid_argument` unless `is_valid()`; add a canned 200 ServiceExceptionReport response to the test server and assert Failed with "unparseable body" after retries; rename the planned test "a 200 without a band is NoData" to "a plain 200 ..."; `logUnparseableBodyOnce` should print the byte count when the body is empty or blank; never assert the raw on-the-wire URL (httplib re-encodes the query).
+- **Task 11**: `->check(CLI::ExistingFile)` on `--ca-bundle`; make `--insecure` and `--ca-bundle` mutually exclusive; help text to state the 1..64 thread range, the 0..100 retry range, and that `--layer` is taken unencoded; `Config::validate` should refuse `;` in the layer name (the description format cannot carry it); note that CLI11 parses integers with base 0, so `--width 0100` is 64.
+- **Task 12**: construct one fetcher inside `main`'s guarded block before starting the run so constructor errors do not escape through `result.get()`.
+- **Task 13, before Step 7 or any live request** (needs the owner's approval, two requests): capture one land and one sea GetFeatureInfo body from the real server, for example the golden URL with `I=2040&J=8` and `I=1024&J=1500`, add them as recorded fixtures to `test_WmsQuery.cpp`, and settle the residual parse edges against them: a UTF-8 BOM before markup is currently NoData, a plain-text error line such as `Error: layer not found` is NoData, and `BAND 0: 12,5` parses as 12. The old `simonstown.tif` has 21.8 percent zero pixels in coherent sea regions, so sea responses must be known before the first long run.
+- **Task 14**: loop the BoundingBox finite-value test over all four edges; `.` and `..` output names should fail `output must name a file`; clearer `wms-url` error message naming what is refused; spec section 5 rows for `--output` and `--wms-url` to mention the new limits; spec 4.3 to mention the inclusive tolerance and `pixelScale` preconditions; the `BoundingBox.h` header comment could name libc++ and LWG 2524 for the closed `unitRandom` interval; consider a sanity cap on width x height in `Config::validate` (classic TIFF tops out near 4 GiB).
