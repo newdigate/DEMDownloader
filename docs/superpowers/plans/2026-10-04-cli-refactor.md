@@ -257,6 +257,11 @@ TEST_CASE("approxEquals checks every edge", "[boundingbox]") {
     CHECK(a.approxEquals(b, 1e-9));
     b.*edge += 1e-8;
     CHECK_FALSE(a.approxEquals(b, 1e-9));
+    // A NaN edge never matches, even at a huge tolerance and in either argument order.
+    BoundingBox withNan = a;
+    withNan.*edge = std::numeric_limits<double>::quiet_NaN();
+    CHECK_FALSE(a.approxEquals(withNan, 1.0));
+    CHECK_FALSE(withNan.approxEquals(a, 1.0));
   }
 }
 ```

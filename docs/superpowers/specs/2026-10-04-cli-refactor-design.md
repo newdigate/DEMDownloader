@@ -103,7 +103,8 @@ and is no longer referenced by default.
 
 **BoundingBox** holds `north`, `south`, `east`, `west` in decimal degrees.
 `validate()` requires north > south, east > west, latitudes in [-90, 90],
-longitudes in [-180, 180]. `pixelScale(width, height)` returns
+longitudes in [-180, 180]. All four values must also be finite, and that check
+is reported first. `pixelScale(width, height)` returns
 `((east - west) / width, (north - south) / height)`. `approxEquals(other, tol)`
 compares each edge with an absolute tolerance. This replaces the current code,
 in which the variable named `north` holds the smaller latitude.
@@ -427,7 +428,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 - Options `DL_ELEVATION_PREVIEW` (default `APPLE`) and `DL_ELEVATION_TESTS`
   (default ON).
 - FetchContent pins: cpp-httplib `v0.46.1` (matches the Homebrew package in
-  use; `FIND_PACKAGE_ARGS NAMES httplib` kept so the system copy is preferred),
+  use; `FIND_PACKAGE_ARGS 0.46.1 NAMES httplib` so a system copy is preferred
+  only when it is 0.46.x, otherwise the pinned copy is downloaded),
   ctpl commit `437e135dbd94eb65b45533d9ce8ee28b5bd37b6d`
   (its two tags point at this commit), CLI11 `v2.7.2`, Catch2 `v3.16.0`.
 - libtiff via `find_package(TIFF REQUIRED)`; libgeotiff via `find_path` and
