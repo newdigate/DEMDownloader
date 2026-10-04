@@ -77,7 +77,8 @@ if(DL_ELEVATION_TESTS)
     tests/test_Config.cpp
     tests/test_WmsQuery.cpp
     tests/test_RetryPolicy.cpp
-    tests/test_DemRaster.cpp)
+    tests/test_DemRaster.cpp
+    tests/test_StopToken.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
   catch_discover_tests(demdl_tests)

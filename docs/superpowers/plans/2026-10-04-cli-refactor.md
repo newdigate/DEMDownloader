@@ -2483,7 +2483,7 @@ struct FetchResult {
 class PixelFetcher {
  public:
   virtual ~PixelFetcher() = default;
-  virtual FetchResult fetch(int x, int y, const std::atomic<bool>& stop) = 0;
+  [[nodiscard]] virtual FetchResult fetch(int x, int y, const std::atomic<bool>& stop) = 0;
 };
 
 }  // namespace demdl
@@ -2504,7 +2504,7 @@ enum class PixelState { Queued, InFlight, Value, NoData, Failed };
 
 enum class StopReason { None, Signal, WindowClosed, ConsecutiveFailures, WriteError };
 
-inline const char* describe(StopReason reason) {
+[[nodiscard]] inline const char* describe(StopReason reason) {
   switch (reason) {
     case StopReason::None: return "finished";
     case StopReason::Signal: return "interrupted";
@@ -2578,8 +2578,9 @@ class ProgressSink {
 
 namespace demdl {
 
-// Shared "please stop" flag plus the first reason given. request() touches only lock-free
-// atomics, so a signal handler may call it.
+// Shared "please stop" flag plus the first reason given. request() always raises the flag but
+// keeps the first reason: later reasons are ignored. Both members are lock-free atomics and
+// request() touches nothing else, so a signal handler may call it.
 class StopToken {
  public:
   std::atomic<bool> stop{false};
@@ -2589,7 +2590,7 @@ class StopToken {
     reason_.compare_exchange_strong(expected, reason);
     stop.store(true);
   }
-  StopReason reason() const noexcept { return reason_.load(); }
+  [[nodiscard]] StopReason reason() const noexcept { return reason_.load(); }
 
  private:
   std::atomic<StopReason> reason_{StopReason::None};
@@ -2646,7 +2647,7 @@ struct FakeFetcher : demdl::PixelFetcher {
   }
 };
 
-inline demdl::FetchResult valueResult(float value) {
+[[nodiscard]] inline demdl::FetchResult valueResult(float value) {
   demdl::FetchResult r;
   r.kind = demdl::FetchResult::Kind::Value;
   r.value = value;
@@ -2654,14 +2655,14 @@ inline demdl::FetchResult valueResult(float value) {
   return r;
 }
 
-inline demdl::FetchResult noDataResult() {
+[[nodiscard]] inline demdl::FetchResult noDataResult() {
   demdl::FetchResult r;
   r.kind = demdl::FetchResult::Kind::NoData;
   r.attempts = 1;
   return r;
 }
 
-inline demdl::FetchResult failedResult(std::string error) {
+[[nodiscard]] inline demdl::FetchResult failedResult(std::string error) {
   demdl::FetchResult r;
   r.kind = demdl::FetchResult::Kind::Failed;
   r.attempts = 3;
@@ -2707,7 +2708,7 @@ struct RecordingSink : demdl::ProgressSink {
     summary = s;
   }
 
-  int count(demdl::PixelState state) {
+  [[nodiscard]] int count(demdl::PixelState state) {
     std::lock_guard<std::mutex> lock(m);
     return static_cast<int>(std::count_if(pixels.begin(), pixels.end(),
                                           [state](const demdl::PixelEvent& e) { return e.state == state; }));
