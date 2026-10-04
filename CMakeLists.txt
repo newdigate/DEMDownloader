@@ -22,16 +22,23 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(httplib)
 FetchContent_MakeAvailable(ctpl)
 include_directories(${ctpl_SOURCE_DIR})
-include_directories(/usr/local/Cellar/libgeotiff/1.7.1_3/include)
-include_directories(/usr/local/Cellar/libtiff/4.6.0/include/)
+# macOS CMake searches frameworks before /usr/local by default and globs every
+# *.framework/Headers, so /Library/Frameworks/Mono.framework/Headers (libtiff 4.0.9)
+# would win over Homebrew's tiff.h. Search frameworks last.
+set(CMAKE_FIND_FRAMEWORK LAST)
+
+# libtiff via CMake's bundled FindTIFF. libgeotiff ships no CMake package, so locate it directly.
+find_package(TIFF REQUIRED)
+find_path(GEOTIFF_INCLUDE_DIR geotiff.h REQUIRED)
+find_library(GEOTIFF_LIBRARY geotiff REQUIRED)
+include_directories(${GEOTIFF_INCLUDE_DIR})
 add_executable(dl_elevation main.cpp)
 
 
 include(opengl.cmake.in)
 target_link_libraries(dl_elevation ${LIBS})
-target_link_libraries(dl_elevation -L/usr/local/Cellar/libgeotiff/1.7.1_3/lib -lgeotiff)
-target_link_libraries(dl_elevation -L/usr/local/Cellar/libtiff/4.6.0/lib -ltiff)
-target_link_libraries(dl_elevation -L/usr/local/opt/openssl/lib -lssl -lcrypto)
+target_link_libraries(dl_elevation ${GEOTIFF_LIBRARY} TIFF::TIFF)
+# OpenSSL is not linked here: httplib::httplib carries OpenSSL::SSL and OpenSSL::Crypto on both paths.
 # httplib::httplib exists on both paths: the Homebrew package only exports the
 # namespaced name, and the FetchContent build adds it as an alias. The bare
 # "httplib" name is not a target when the system package is found, so linking it

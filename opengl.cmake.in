@@ -11,7 +11,6 @@ pkg_search_module(glew REQUIRED glew)
 include_directories(${glew_INCLUDE_DIRS})
 
 find_package(assimp REQUIRED)
-include_directories(/usr/local/Cellar/assimp/5.3.1/include/)
 
 # GLM is header-only. Homebrew's glmConfig.cmake declares cmake_minimum_required 3.2,
 # which CMake 4.x rejects outright, so locate the headers directly instead of find_package.

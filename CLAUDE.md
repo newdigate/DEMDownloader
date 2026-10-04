@@ -28,12 +28,13 @@ Running the binary immediately opens 50 concurrent HTTPS connections to `cityimg
 
 Homebrew packages needed: `pkg-config glfw glew glm assimp libtiff libgeotiff openssl@3`. `ctpl` is always fetched by `FetchContent`; `cpp-httplib` is taken from Homebrew's `cpp-httplib` package when installed and fetched otherwise, so the first configure needs network. assimp, GLEW and libgeotiff are demanded by the CMake files but referenced by no code; in particular the output is a plain RGB TIFF with no georeferencing tags.
 
-`CMakeLists.txt` and `opengl.cmake.in` hardcode versioned Cellar paths (`libtiff/4.6.0`, `assimp/5.3.1`, and so on). Several are already stale after brew upgrades; the build survives because Apple clang and ld search `/usr/local/include` and `/usr/local/lib` by default, where Homebrew symlinks every formula. If a header or library stops resolving, fix the path rather than adding another one. Note that clang puts `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from an imported or FetchContent target. On a machine with the Homebrew `cpp-httplib` package, that package's `httplib.h` is what gets compiled even when FetchContent downloaded a copy.
+No paths are hardcoded: libtiff comes from CMake's bundled `FindTIFF`, assimp from its own config, glfw and GLEW from pkg-config, OpenSSL transitively through `httplib::httplib`, and GLM and libgeotiff from `find_path`/`find_library`. Do not reintroduce `/usr/local/Cellar/<formula>/<version>` paths; they go stale on the next `brew upgrade`. Note that Apple clang puts `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from an imported or FetchContent target. On a machine with the Homebrew `cpp-httplib` package, that package's `httplib.h` is what gets compiled even when FetchContent downloaded a copy.
 
-Two things in the CMake files look odd but are deliberate:
+Three things in the CMake files look odd but are deliberate:
 
 - `dl_elevation` links `httplib::httplib`, not `httplib`. Only the namespaced name exists when the Homebrew package is found; the bare name silently degrades to `-lhttplib`, loses `CPPHTTPLIB_OPENSSL_SUPPORT`, and the compile fails with "no type named 'SSLClient'".
 - GLM is located with `find_path`, not `find_package`. Homebrew GLM's config file declares a CMake minimum of 3.2, which CMake 4.x refuses to load.
+- `CMAKE_FIND_FRAMEWORK` is set to `LAST`. With the macOS default of `FIRST`, CMake globs every `*.framework/Headers` before looking in `/usr/local`, and `/Library/Frameworks/Mono.framework/Headers` ships a libtiff 4.0.9 `tiff.h` that would otherwise be chosen over Homebrew's 4.7.1 headers.
 
 ## How main.cpp works
 
