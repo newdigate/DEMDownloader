@@ -24,7 +24,6 @@ FetchContent_MakeAvailable(ctpl)
 include_directories(${ctpl_SOURCE_DIR})
 include_directories(/usr/local/Cellar/libgeotiff/1.7.1_3/include)
 include_directories(/usr/local/Cellar/libtiff/4.6.0/include/)
-include_directories(/usr/local/include/)
 add_executable(dl_elevation main.cpp)
 
 

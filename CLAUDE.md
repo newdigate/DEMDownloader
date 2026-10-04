@@ -28,7 +28,7 @@ Running the binary immediately opens 50 concurrent HTTPS connections to `cityimg
 
 Homebrew packages needed: `pkg-config glfw glew glm assimp libtiff libgeotiff openssl@3`. `ctpl` is always fetched by `FetchContent`; `cpp-httplib` is taken from Homebrew's `cpp-httplib` package when installed and fetched otherwise, so the first configure needs network. assimp, GLEW and libgeotiff are demanded by the CMake files but referenced by no code; in particular the output is a plain RGB TIFF with no georeferencing tags.
 
-`CMakeLists.txt` and `opengl.cmake.in` hardcode versioned Cellar paths (`libtiff/4.6.0`, `assimp/5.3.1`, and so on). Several are already stale after brew upgrades; the build survives because `/usr/local/include` and `/usr/local/lib` are also searched. If a header or library stops resolving, fix the path rather than adding another one.
+`CMakeLists.txt` and `opengl.cmake.in` hardcode versioned Cellar paths (`libtiff/4.6.0`, `assimp/5.3.1`, and so on). Several are already stale after brew upgrades; the build survives because Apple clang and ld search `/usr/local/include` and `/usr/local/lib` by default, where Homebrew symlinks every formula. If a header or library stops resolving, fix the path rather than adding another one. Note that clang puts `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from an imported or FetchContent target. On a machine with the Homebrew `cpp-httplib` package, that package's `httplib.h` is what gets compiled even when FetchContent downloaded a copy.
 
 Two things in the CMake files look odd but are deliberate:
 
