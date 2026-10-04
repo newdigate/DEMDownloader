@@ -21,13 +21,10 @@ FetchContent_Declare(
 # Catch2 will be available to the rest of the build
 FetchContent_MakeAvailable(httplib)
 FetchContent_MakeAvailable(ctpl)
-find_package(httplib)
-find_package(ctpl)
 include_directories(${ctpl_SOURCE_DIR})
 include_directories(/usr/local/Cellar/libgeotiff/1.7.1_3/include)
 include_directories(/usr/local/Cellar/libtiff/4.6.0/include/)
 include_directories(/usr/local/include/)
-include_directories(${HTTPLIB_HEADER_PATH})
 add_executable(dl_elevation main.cpp)
 
 
@@ -36,7 +33,11 @@ target_link_libraries(dl_elevation ${LIBS})
 target_link_libraries(dl_elevation -L/usr/local/Cellar/libgeotiff/1.7.1_3/lib -lgeotiff)
 target_link_libraries(dl_elevation -L/usr/local/Cellar/libtiff/4.6.0/lib -ltiff)
 target_link_libraries(dl_elevation -L/usr/local/opt/openssl/lib -lssl -lcrypto)
-target_link_libraries(dl_elevation httplib)
+# httplib::httplib exists on both paths: the Homebrew package only exports the
+# namespaced name, and the FetchContent build adds it as an alias. The bare
+# "httplib" name is not a target when the system package is found, so linking it
+# silently drops CPPHTTPLIB_OPENSSL_SUPPORT and SSLClient disappears.
+target_link_libraries(dl_elevation httplib::httplib)
 
 if  (APPLE)
     target_link_libraries(dl_elevation
