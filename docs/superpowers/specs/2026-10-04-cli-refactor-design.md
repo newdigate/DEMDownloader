@@ -168,12 +168,14 @@ while checking `stop`, then retries. Exhausting retries returns `Failed`. The
 first `ParseError` body of the run is logged once to stderr, guarded by a
 `std::once_flag` shared by all workers.
 
-**DemRaster** holds `width`, `height`, `BoundingBox`, `Metadata{layer,
+**DemRaster** holds `width`, `height`, `BoundingBox`, `RasterMetadata{layer,
 wmsUrl}` and `std::vector<float>` in row-major order, row 0 at the north edge.
 API: `create(width, height, box, metadata)` filled with NaN; `load(path)`
-(throws on missing, unreadable or non-matching format);
-`save(path)` atomic; `float& at(x, y)`; `std::vector<int> todoInRow(row)`
-listing NaN columns; `rowsWithWork()`; `countNaN()`;
+(throws on missing, unreadable or non-matching format, and rejects a file
+whose box, reconstructed from the tiepoint and pixel scale, fails
+validation); `save(path)` atomic; `float at(x, y) const`;
+`void set(x, y, float)`; `std::vector<int> todoInRow(row)` listing NaN
+columns; `rowsWithWork()`; `countNaN()`;
 `bool matches(const Config&, std::string& why)`; constant `kNoData =
 -32768.0f`.
 
@@ -235,7 +237,9 @@ GeoTIFF keys: `GTModelTypeGeoKey = ModelTypeGeographic`,
 Other tags: `GDAL_NODATA = "-32768"`,
 `IMAGEDESCRIPTION = "dl_elevation;layer=<layer>;wms=<url>"` (fields separated
 by `;`; `wms` is always last and extends to the end of the string so a URL
-may contain any character), `SOFTWARE = "dl_elevation <version>"`.
+may contain any character), `SOFTWARE = "dl_elevation <version>"`. The
+program registers the `GDAL_NODATA` tag (42113) with libtiff itself, because
+libtiff does not know it by default.
 
 Pixel semantics:
 
