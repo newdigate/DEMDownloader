@@ -30,6 +30,11 @@ TEST_CASE("unsupported or malformed URLs are rejected", "[config]") {
   CHECK_FALSE(parseWmsUrl("ftp://host.test/wms").has_value());
   CHECK_FALSE(parseWmsUrl("https:///wms").has_value());
   CHECK_FALSE(parseWmsUrl("host.test/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://:8080/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test:/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host test/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test?x=1").has_value());
+  CHECK_FALSE(parseWmsUrl("HTTPS://host.test/wms").has_value());
 }
 
 TEST_CASE("the example configuration is valid", "[config]") {

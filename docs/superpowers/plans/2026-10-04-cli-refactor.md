@@ -422,6 +422,11 @@ TEST_CASE("unsupported or malformed URLs are rejected", "[config]") {
   CHECK_FALSE(parseWmsUrl("ftp://host.test/wms").has_value());
   CHECK_FALSE(parseWmsUrl("https:///wms").has_value());
   CHECK_FALSE(parseWmsUrl("host.test/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://:8080/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test:/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host test/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test?x=1").has_value());
+  CHECK_FALSE(parseWmsUrl("HTTPS://host.test/wms").has_value());
 }
 
 TEST_CASE("the example configuration is valid", "[config]") {
@@ -516,7 +521,7 @@ struct Config {
   bool verbose = false;
 
   // Empty when valid, otherwise the first problem found, phrased for the user.
-  std::string validate() const;
+  [[nodiscard]] std::string validate() const;
 };
 
 }  // namespace demdl
@@ -537,7 +542,12 @@ std::optional<WmsEndpoint> parseWmsUrl(const std::string& url) {
   const std::string rest = url.substr(schemeEnd + 3);
   const auto slash = rest.find('/');
   const std::string hostPort = rest.substr(0, slash);
-  if (hostPort.empty()) return std::nullopt;
+  // The authority must be a non-empty host with an optional port. A query or fragment without a
+  // path is refused rather than swallowed into the origin.
+  if (hostPort.empty() || hostPort.front() == ':' || hostPort.back() == ':' ||
+      hostPort.find_first_of(" \t?#") != std::string::npos) {
+    return std::nullopt;
+  }
   WmsEndpoint ep;
   ep.origin = scheme + "://" + hostPort;
   ep.path = slash == std::string::npos ? std::string("/") : rest.substr(slash);

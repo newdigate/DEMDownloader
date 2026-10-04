@@ -10,7 +10,12 @@ std::optional<WmsEndpoint> parseWmsUrl(const std::string& url) {
   const std::string rest = url.substr(schemeEnd + 3);
   const auto slash = rest.find('/');
   const std::string hostPort = rest.substr(0, slash);
-  if (hostPort.empty()) return std::nullopt;
+  // The authority must be a non-empty host with an optional port. A query or fragment without a
+  // path is refused rather than swallowed into the origin.
+  if (hostPort.empty() || hostPort.front() == ':' || hostPort.back() == ':' ||
+      hostPort.find_first_of(" \t?#") != std::string::npos) {
+    return std::nullopt;
+  }
   WmsEndpoint ep;
   ep.origin = scheme + "://" + hostPort;
   ep.path = slash == std::string::npos ? std::string("/") : rest.substr(slash);

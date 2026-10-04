@@ -35,7 +35,7 @@ struct Config {
   bool verbose = false;
 
   // Empty when valid, otherwise the first problem found, phrased for the user.
-  std::string validate() const;
+  [[nodiscard]] std::string validate() const;
 };
 
 }  // namespace demdl
