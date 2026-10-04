@@ -112,10 +112,12 @@ in which the variable named `north` holds the smaller latitude.
 **Config** is a struct mirroring the flags in section 5 plus `validate()`,
 which checks the box, positive grid size, `threads` between 1 and 64,
 `maxRetries` between 0 and 100, `maxConsecutiveFailures >= 1`, that the output
-path names a file, and that the WMS URL parses as `scheme://host[:port]/path`.
-The scheme is `http` or `https`, the host is a hostname or a bracketed IPv6
-literal, the port is 1 to 65535, and userinfo, queries, fragments and
-whitespace are refused. No parsing library appears in the library.
+path names a file, that the layer is not empty and contains no `;` (the field
+separator of the output's `IMAGEDESCRIPTION`), and that the WMS URL parses as
+`scheme://host[:port]/path`. The scheme is `http` or `https`, the host is a
+hostname or a bracketed IPv6 literal, the port is 1 to 65535, and userinfo,
+queries, fragments and whitespace are refused. No parsing library appears in
+the library.
 
 **WmsQuery** has two free functions.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
@@ -241,6 +243,11 @@ may contain any character), `SOFTWARE = "dl_elevation <version>"`. The
 program registers the `GDAL_NODATA` tag (42113) with libtiff itself, because
 libtiff does not know it by default.
 
+`save` writes `<output>.tmp`, flushes and syncs it to disk, and only then
+renames it over the output. libtiff's diagnostics are not printed: the
+program installs a libtiff error handler that collects them, and they are
+appended to the message of the `load` or `save` error they explain.
+
 Pixel semantics:
 
 | Value | Meaning | On resume |
@@ -262,7 +269,10 @@ On start, when the output exists and `--overwrite` is not given:
 
 1. `DemRaster::load` reads it. A file that is not single-band float32 fails
    with "not a dl_elevation float32 GeoTIFF; files from the previous RGB16
-   format cannot be resumed".
+   format cannot be resumed". A file whose `IMAGEDESCRIPTION` does not start
+   with `dl_elevation;` was not written by this tool and is refused, before
+   anything is allocated, with "was not written by dl_elevation; choose
+   another --output or use --overwrite".
 2. `matches(config)` compares width, height, each box edge within 1e-9
    degrees, and the layer from `IMAGEDESCRIPTION`. Any mismatch is an error
    that lists every differing field and suggests `--overwrite` or a different
@@ -304,11 +314,11 @@ increment on `Failed`; reaching the limit sets `stop` with reason
 Each job writes a distinct cell and the save runs only after that row's
 futures have returned, so the raster needs no lock.
 
-Atomic save: write to `<output>.tmp` in the same directory, close, then
-`std::filesystem::rename` over the output. `DemRaster::save` throws on
-failure; `Downloader::run` catches it, records reason `WriteError` with the
-message, stops, and returns the summary normally. The previous checkpoint is
-intact.
+Atomic save: write to `<output>.tmp` in the same directory, flush and sync
+it, close, then `std::filesystem::rename` over the output. `DemRaster::save`
+throws on failure; `Downloader::run` catches it, records reason `WriteError`
+with the message, stops, and returns the summary normally. The previous
+checkpoint is intact.
 
 `RunSummary` carries `pixelsFetched`, `noData`, `failed`, `rowsSaved`,
 `remainingNaN`, `elapsed` and `stopReason` in
@@ -430,17 +440,22 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp
-  directory, load, compare dimensions, box, values and NaN positions; the
-  GeoTIFF keys and `GDAL_NODATA` read back; `matches` accepts the same Config
-  and rejects a shifted box, a different size and a different layer with the
-  expected text in `why`; a hand-written RGB16 TIFF is rejected with the
-  legacy message; a hand-written float32 GeoTIFF whose tiepoint has a NaN
-  west edge is rejected as an invalid bounding box; after `save` no `.tmp`
-  file remains; a `save` whose directory write fails (a file-size limit one
-  byte short of a complete file) throws, leaves no `.tmp` and keeps the
-  previous file loadable with its old values, and so does a `save` whose
-  temporary file cannot be created (a file-size limit of zero); `todoInRow`
-  and `rowsWithWork` on a half-filled raster.
+  directory, load, compare dimensions, box, values and NaN positions; a
+  2048 x 8 raster spanning several strips round-trips every pixel and still
+  matches its Config; the GeoTIFF keys, `GDAL_NODATA` and `SOFTWARE` read
+  back; `matches` accepts the same Config and rejects a shifted box, a
+  different size and a different layer with the expected text in `why`,
+  reports a NaN edge as a mismatch and shows an empty file layer as
+  `(none)`; a hand-written RGB16 TIFF is rejected with the legacy message; a
+  hand-written float32 GeoTIFF whose tiepoint has a NaN west edge is rejected
+  as an invalid bounding box, and one without the dl_elevation description
+  as not written by dl_elevation; a missing file's error carries libtiff's
+  reason; after `save` no `.tmp` file remains; a `save` whose directory write
+  fails (a file-size limit one byte short of a complete file) throws, leaves
+  no `.tmp` and keeps the previous file loadable with its old values, and so
+  does a `save` whose strip write fails part way (a limit of half the file)
+  or whose temporary file cannot be created (a file-size limit of zero);
+  `todoInRow` and `rowsWithWork` on a half-filled raster.
 - **Downloader**: with `FakeFetcher` (value is a function of x and y;
   configurable NoData and failure sets; optional latch to block mid-row) and
   `RecordingSink`: only NaN pixels are fetched; rows without work emit no

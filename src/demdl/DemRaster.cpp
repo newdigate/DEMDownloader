@@ -3,9 +3,13 @@
 #include <geotiff.h>
 #include <geovalues.h>
 #include <tiffio.h>
+#include <unistd.h>
 #include <xtiffio.h>
 
+#include <cerrno>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -34,10 +38,58 @@ struct GtifCloser {
 };
 using GtifHandle = std::unique_ptr<GTIF, GtifCloser>;
 
+// Removes a temporary file when it goes out of scope, unless it was marked complete.
+class TempFileGuard {
+ public:
+  explicit TempFileGuard(std::filesystem::path path) : path_(std::move(path)) {}
+  ~TempFileGuard() {
+    if (complete_) return;
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+  }
+  TempFileGuard(const TempFileGuard&) = delete;
+  TempFileGuard& operator=(const TempFileGuard&) = delete;
+
+  void markComplete() { complete_ = true; }
+
+ private:
+  std::filesystem::path path_;
+  bool complete_ = false;
+};
+
+// The libtiff errors raised on this thread since takeTiffError() last ran, joined by "; ".
+thread_local std::string lastTiffError;
+
+// Installed in place of libtiff's default handler, which prints to stderr, so that the text reaches
+// the user in an exception message instead of interrupting the progress output.
+void captureTiffError(const char* module, const char* fmt, va_list ap) {
+  char text[1024];
+  std::vsnprintf(text, sizeof text, fmt, ap);
+  try {
+    if (!lastTiffError.empty()) lastTiffError += "; ";
+    if (module != nullptr) lastTiffError += std::string(module) + ": ";
+    lastTiffError += text;
+  } catch (...) {
+    // Out of memory: the text is lost, but the caller still reports the failure itself.
+  }
+}
+
+// Returns the libtiff errors collected on this thread and forgets them.
+std::string takeTiffError() {
+  std::string text;
+  text.swap(lastTiffError);
+  return text;
+}
+
+// Throws what, followed by ": <libtiff text>" when libtiff reported errors since the last take.
+[[noreturn]] void fail(const std::string& what) {
+  const std::string text = takeTiffError();
+  throw std::runtime_error(text.empty() ? what : what + ": " + text);
+}
+
 // libtiff does not know the GDAL_NODATA tag: TIFFSetField refuses it and a reader sees an anonymous
-// field. This tag extender registers it on every TIFF handle opened after ensureTagsRegistered().
-// It chains to the extender installed before it, because libgeotiff installs one for the GeoTIFF
-// tags on its first XTIFFOpen and that one chains in turn, so both run in either install order.
+// field. This tag extender registers it on every TIFF handle opened after ensureTagsRegistered(),
+// then calls the extender installed before it, libgeotiff's, which registers the GeoTIFF tags.
 TIFFExtendProc g_parentExtender = nullptr;
 
 void registerGdalTags(TIFF* tif) {
@@ -50,7 +102,13 @@ void registerGdalTags(TIFF* tif) {
 
 void ensureTagsRegistered() {
   static std::once_flag once;
-  std::call_once(once, [] { g_parentExtender = TIFFSetTagExtender(registerGdalTags); });
+  std::call_once(once, [] {
+    // libgeotiff's first-time setup is not thread-safe, so it is forced to run here, once. The
+    // extender order is therefore fixed: ours runs first, then libgeotiff's.
+    XTIFFInitialize();
+    g_parentExtender = TIFFSetTagExtender(registerGdalTags);
+    TIFFSetErrorHandler(captureTiffError);
+  });
 }
 
 }  // namespace
@@ -89,8 +147,9 @@ DemRaster DemRaster::create(int width, int height, const BoundingBox& box, Raste
 
 DemRaster DemRaster::load(const std::filesystem::path& path) {
   ensureTagsRegistered();
+  takeTiffError();  // forget whatever earlier calls on this thread left behind
   TiffHandle tif(XTIFFOpen(path.string().c_str(), "r"));
-  if (!tif) throw std::runtime_error("cannot open " + path.string());
+  if (!tif) fail("cannot open " + path.string());
   TIFF* t = tif.get();
 
   uint32_t width = 0;
@@ -104,22 +163,35 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
   TIFFGetFieldDefaulted(t, TIFFTAG_BITSPERSAMPLE, &bitsPerSample);
   TIFFGetFieldDefaulted(t, TIFFTAG_SAMPLEFORMAT, &sampleFormat);
   if (samplesPerPixel != 1 || bitsPerSample != 32 || sampleFormat != SAMPLEFORMAT_IEEEFP) {
-    throw std::runtime_error(path.string() +
-                             " is not a dl_elevation float32 GeoTIFF; files from the previous RGB16 "
-                             "format cannot be resumed");
+    fail(path.string() +
+         " is not a dl_elevation float32 GeoTIFF; files from the previous RGB16 "
+         "format cannot be resumed");
   }
-  if (width == 0 || height == 0) throw std::runtime_error(path.string() + " has an empty image");
+  // Checked before anything is allocated, so that another program's file is never resumed.
+  char* description = nullptr;
+  if (!TIFFGetField(t, TIFFTAG_IMAGEDESCRIPTION, &description) || description == nullptr ||
+      !std::string_view(description).starts_with("dl_elevation;")) {
+    fail(path.string() + " was not written by dl_elevation; choose another --output or use "
+                         "--overwrite");
+  }
+  RasterMetadata meta = parseImageDescription(description);
+  constexpr auto kMaxSide = static_cast<uint32_t>(std::numeric_limits<int>::max());
+  if (width > kMaxSide || height > kMaxSide) {
+    fail(path.string() + " is too large: " + std::to_string(width) + " x " + std::to_string(height) +
+         " pixels");
+  }
+  if (width == 0 || height == 0) fail(path.string() + " has an empty image");
 
   uint16_t tieCount = 0;
   double* tiepoints = nullptr;
   if (!TIFFGetField(t, TIFFTAG_GEOTIEPOINTS, &tieCount, &tiepoints) || tieCount < 6 || tiepoints[0] != 0.0 ||
       tiepoints[1] != 0.0) {
-    throw std::runtime_error(path.string() + " has no usable GeoTIFF tiepoint");
+    fail(path.string() + " has no usable GeoTIFF tiepoint");
   }
   uint16_t scaleCount = 0;
   double* scale = nullptr;
   if (!TIFFGetField(t, TIFFTAG_GEOPIXELSCALE, &scaleCount, &scale) || scaleCount < 2) {
-    throw std::runtime_error(path.string() + " has no GeoTIFF pixel scale");
+    fail(path.string() + " has no GeoTIFF pixel scale");
   }
   BoundingBox box;
   box.west = tiepoints[3];
@@ -127,19 +199,13 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
   box.east = box.west + scale[0] * width;
   box.south = box.north - scale[1] * height;
   if (const std::string problem = box.validate(); !problem.empty()) {
-    throw std::runtime_error(path.string() + " has an invalid bounding box: " + problem);
-  }
-
-  RasterMetadata meta;
-  char* description = nullptr;
-  if (TIFFGetField(t, TIFFTAG_IMAGEDESCRIPTION, &description) && description != nullptr) {
-    meta = parseImageDescription(description);
+    fail(path.string() + " has an invalid bounding box: " + problem);
   }
 
   DemRaster r = create(static_cast<int>(width), static_cast<int>(height), box, std::move(meta));
   for (uint32_t y = 0; y < height; ++y) {
     if (TIFFReadScanline(t, &r.data_[r.index(0, static_cast<int>(y))], y, 0) < 0) {
-      throw std::runtime_error("read failed on row " + std::to_string(y) + " of " + path.string());
+      fail("read failed on row " + std::to_string(y) + " of " + path.string());
     }
   }
   return r;
@@ -147,12 +213,10 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
 
 void DemRaster::save(const std::filesystem::path& path) const {
   ensureTagsRegistered();
+  takeTiffError();  // forget whatever earlier calls on this thread left behind
   const std::filesystem::path tmp = path.string() + ".tmp";
-  const auto fail = [&tmp](const std::string& what) {
-    std::error_code ignored;
-    std::filesystem::remove(tmp, ignored);
-    throw std::runtime_error(what);
-  };
+  // Declared before the TIFF handle, so that on failure the file is removed after the handle closes.
+  TempFileGuard tmpGuard(tmp);
   {
     TiffHandle tif(XTIFFOpen(tmp.string().c_str(), "w"));
     if (!tif) fail("cannot create " + tmp.string());
@@ -160,7 +224,6 @@ void DemRaster::save(const std::filesystem::path& path) const {
     // Checked so that a tag libtiff does not know fails the save instead of being left out.
     const auto setField = [&](const char* name, uint32_t tag, auto... values) {
       if (TIFFSetField(t, tag, values...) != 1) {
-        tif.reset();
         fail(std::string("cannot set tag ") + name + " on " + tmp.string());
       }
     };
@@ -180,6 +243,7 @@ void DemRaster::save(const std::filesystem::path& path) const {
     const double pixelScale[3] = {scale.lonPerPixel, scale.latPerPixel, 0.0};
     setField("GEOTIEPOINTS", TIFFTAG_GEOTIEPOINTS, 6, tiepoints);
     setField("GEOPIXELSCALE", TIFFTAG_GEOPIXELSCALE, 3, pixelScale);
+    static_assert(DemRaster::kNoData == -32768.0f);  // the GDAL_NODATA text below spells out kNoData
     setField("GDAL_NODATA", TIFFTAG_GDAL_NODATA, "-32768");
     const std::string description = formatImageDescription(meta_);
     setField("IMAGEDESCRIPTION", TIFFTAG_IMAGEDESCRIPTION, description.c_str());
@@ -188,43 +252,41 @@ void DemRaster::save(const std::filesystem::path& path) const {
 
     {
       GtifHandle gtif(GTIFNew(t));
-      if (!gtif) {
-        tif.reset();
-        fail("cannot attach GeoTIFF keys to " + tmp.string());
-      }
+      if (!gtif) fail("cannot attach GeoTIFF keys to " + tmp.string());
       const auto setKey = [&](const char* name, geokey_t key, int value) {
         if (GTIFKeySet(gtif.get(), key, TYPE_SHORT, 1, value) != 1) {
-          tif.reset();
           fail(std::string("cannot set GeoTIFF key ") + name + " on " + tmp.string());
         }
       };
       setKey("GTModelTypeGeoKey", GTModelTypeGeoKey, ModelTypeGeographic);
       setKey("GTRasterTypeGeoKey", GTRasterTypeGeoKey, RasterPixelIsArea);
       setKey("GeographicTypeGeoKey", GeographicTypeGeoKey, GCS_WGS_84);
-      if (GTIFWriteKeys(gtif.get()) != 1) {
-        tif.reset();
-        fail("cannot write the GeoTIFF keys to " + tmp.string());
-      }
+      if (GTIFWriteKeys(gtif.get()) != 1) fail("cannot write the GeoTIFF keys to " + tmp.string());
     }
 
     std::vector<float> row(static_cast<std::size_t>(width_));
     for (int y = 0; y < height_; ++y) {
       std::memcpy(row.data(), &data_[index(0, y)], row.size() * sizeof(float));
       if (TIFFWriteScanline(t, row.data(), static_cast<uint32_t>(y), 0) < 0) {
-        tif.reset();
         fail("write failed on row " + std::to_string(y) + " of " + tmp.string());
       }
     }
     // XTIFFClose swallows errors from writing the last strip and the directory. Flushing first
     // surfaces them, so a failed write never reaches the rename and the previous checkpoint survives.
-    if (TIFFFlush(t) != 1) {
-      tif.reset();
-      fail("cannot finish writing " + tmp.string());
+    if (TIFFFlush(t) != 1) fail("cannot finish writing " + tmp.string());
+    // The data must be on disk before the rename makes it the checkpoint.
+    if (fsync(TIFFFileno(t)) != 0) {
+      const std::string reason = std::generic_category().message(errno);
+      fail("cannot finish writing " + tmp.string() + ": " + reason);
     }
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
-  if (ec) fail("cannot rename " + tmp.string() + " to " + path.string() + ": " + ec.message());
+  if (ec) {
+    throw std::runtime_error("cannot rename " + tmp.string() + " to " + path.string() + ": " +
+                             ec.message());
+  }
+  tmpGuard.markComplete();
 }
 
 bool DemRaster::matches(const Config& cfg, std::string& why) const {
@@ -236,7 +298,8 @@ bool DemRaster::matches(const Config& cfg, std::string& why) const {
     why += "  height: file " + std::to_string(height_) + ", requested " + std::to_string(cfg.height) + "\n";
   }
   const auto edge = [&why](const char* name, double file, double requested) {
-    if (std::fabs(file - requested) > kBoxTolerance) {
+    // Negated so that a NaN edge, for which every comparison is false, is reported as a mismatch.
+    if (!(std::fabs(file - requested) <= kBoxTolerance)) {
       why += std::string("  ") + name + ": file " + formatCoordinate(file) + ", requested " +
              formatCoordinate(requested) + "\n";
     }
@@ -246,7 +309,8 @@ bool DemRaster::matches(const Config& cfg, std::string& why) const {
   edge("east", box_.east, cfg.box.east);
   edge("west", box_.west, cfg.box.west);
   if (meta_.layer != cfg.layer) {
-    why += "  layer: file " + meta_.layer + ", requested " + cfg.layer + "\n";
+    const std::string fileLayer = meta_.layer.empty() ? "(none)" : meta_.layer;
+    why += "  layer: file " + fileLayer + ", requested " + cfg.layer + "\n";
   }
   return why.empty();
 }

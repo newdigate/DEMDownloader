@@ -92,6 +92,7 @@ std::string Config::validate() const {
     return "wms-url must look like scheme://host[:port]/path with scheme http or https";
   }
   if (layer.empty()) return "layer must not be empty";
+  if (layer.find(';') != std::string::npos) return "layer must not contain ';'";
   if (threads < 1) return "threads must be at least 1";
   if (threads > 64) return "threads must be at most 64";
   if (maxRetries < 0) return "max-retries must be at least 0";

@@ -27,7 +27,7 @@ struct Config {
   int height = 0;
   std::filesystem::path output;  // relative to the current directory; must name a file
   std::string wmsUrl = "https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets";
-  std::string layer = "Elevation_CCT_GLM2019_5m_DEM";
+  std::string layer = "Elevation_CCT_GLM2019_5m_DEM";  // no ';': it separates the GeoTIFF description
   int threads = 8;     // capped at 64 to go easy on a public server
   int maxRetries = 8;  // retries after the first attempt, at most 100; 0 means a single attempt
   int maxConsecutiveFailures = 100;

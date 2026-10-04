@@ -108,6 +108,8 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config layer = exampleConfig();
   layer.layer.clear();
   CHECK(layer.validate() == "layer must not be empty");
+  layer.layer = "ws:dem;v2";
+  CHECK(layer.validate() == "layer must not contain ';'");
 
   Config height = exampleConfig();
   height.height = -1;

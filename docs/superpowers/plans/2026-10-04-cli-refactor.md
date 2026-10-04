@@ -501,6 +501,8 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config layer = exampleConfig();
   layer.layer.clear();
   CHECK(layer.validate() == "layer must not be empty");
+  layer.layer = "ws:dem;v2";
+  CHECK(layer.validate() == "layer must not contain ';'");
 
   Config height = exampleConfig();
   height.height = -1;
@@ -577,7 +579,7 @@ struct Config {
   int height = 0;
   std::filesystem::path output;  // relative to the current directory; must name a file
   std::string wmsUrl = "https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets";
-  std::string layer = "Elevation_CCT_GLM2019_5m_DEM";
+  std::string layer = "Elevation_CCT_GLM2019_5m_DEM";  // no ';': it separates the GeoTIFF description
   int threads = 8;     // capped at 64 to go easy on a public server
   int maxRetries = 8;  // retries after the first attempt, at most 100; 0 means a single attempt
   int maxConsecutiveFailures = 100;
@@ -692,6 +694,7 @@ std::string Config::validate() const {
     return "wms-url must look like scheme://host[:port]/path with scheme http or https";
   }
   if (layer.empty()) return "layer must not be empty";
+  if (layer.find(';') != std::string::npos) return "layer must not contain ';'";
   if (threads < 1) return "threads must be at least 1";
   if (threads > 64) return "threads must be at most 64";
   if (maxRetries < 0) return "max-retries must be at least 0";
@@ -1525,152 +1528,33 @@ using demdl::DemRaster;
 using demdl::RasterMetadata;
 ```
 
-Append these test cases, with the helpers the last two use, at the end of the file:
+Append these helpers and test cases at the end of the file:
 
 ```cpp
-TEST_CASE("save and load round-trip values, NaN and NoData", "[demraster]") {
-  TempDir dir;
-  const auto file = dir.path / "dem.tif";
-  auto r = DemRaster::create(4, 3, kBox, {"LayerA", "https://example.test/wms"});
-  r.set(1, 1, 12.5f);
-  r.set(2, 0, DemRaster::kNoData);
-  r.set(0, 2, -3.25f);
+namespace {
 
-  r.save(file);
-
-  CHECK(std::filesystem::exists(file));
-  CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
-  const auto back = DemRaster::load(file);
-  CHECK(back.width() == 4);
-  CHECK(back.height() == 3);
-  CHECK(back.box().approxEquals(kBox, 1e-9));
-  CHECK(back.at(1, 1) == 12.5f);
-  CHECK(back.at(2, 0) == DemRaster::kNoData);
-  CHECK(back.at(0, 2) == -3.25f);
-  CHECK(std::isnan(back.at(0, 0)));
-  CHECK(back.countNaN() == 9);
-  CHECK(back.metadata().layer == "LayerA");
-  CHECK(back.metadata().wmsUrl == "https://example.test/wms");
-}
-
-TEST_CASE("the file carries GeoTIFF keys, the tiepoint and the NoData tag", "[demraster]") {
-  TempDir dir;
-  const auto file = dir.path / "dem.tif";
-  DemRaster::create(4, 3, kBox, {}).save(file);
-
-  TIFF* tif = XTIFFOpen(file.string().c_str(), "r");
+// Writes a 4x2 single-band float32 GeoTIFF straight through libtiff, as another program might, with
+// the given west edge and north -34. description may be null, which leaves the tag out.
+void writeFloatGeoTiff(const std::filesystem::path& file, double west, const char* description) {
+  TIFF* tif = XTIFFOpen(file.string().c_str(), "w");
   REQUIRE(tif != nullptr);
-  GTIF* gtif = GTIFNew(tif);
-  REQUIRE(gtif != nullptr);
-
-  unsigned short v = 0;
-  CHECK(GTIFKeyGetSHORT(gtif, GTModelTypeGeoKey, &v, 0, 1) == 1);
-  CHECK(v == ModelTypeGeographic);
-  CHECK(GTIFKeyGetSHORT(gtif, GTRasterTypeGeoKey, &v, 0, 1) == 1);
-  CHECK(v == RasterPixelIsArea);
-  CHECK(GTIFKeyGetSHORT(gtif, GeographicTypeGeoKey, &v, 0, 1) == 1);
-  CHECK(v == 4326);
-
-  uint16_t count = 0;
-  double* tie = nullptr;
-  REQUIRE(TIFFGetField(tif, TIFFTAG_GEOTIEPOINTS, &count, &tie) == 1);
-  CHECK(count == 6);
-  CHECK(tie[3] == 18.1);
-  CHECK(tie[4] == -34.0);
-  double* scale = nullptr;
-  REQUIRE(TIFFGetField(tif, TIFFTAG_GEOPIXELSCALE, &count, &scale) == 1);
-  CHECK(count == 3);
-  CHECK(scale[0] == (18.5 - 18.1) / 4.0);
-  CHECK(scale[1] == (-34.0 - -34.3) / 3.0);
-
-  char* nodata = nullptr;
-  REQUIRE(TIFFGetField(tif, TIFFTAG_GDAL_NODATA, &nodata) == 1);
-  CHECK(std::string(nodata) == "-32768");
-  uint16_t sampleFormat = 0;
-  REQUIRE(TIFFGetField(tif, TIFFTAG_SAMPLEFORMAT, &sampleFormat) == 1);
-  CHECK(sampleFormat == SAMPLEFORMAT_IEEEFP);
-
-  GTIFFree(gtif);
+  TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 4u);
+  TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 2u);
+  TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+  TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 32);
+  TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+  TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+  TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+  TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 2u);
+  if (description != nullptr) TIFFSetField(tif, TIFFTAG_IMAGEDESCRIPTION, description);
+  const double tiepoints[6] = {0.0, 0.0, 0.0, west, -34.0, 0.0};
+  const double scale[3] = {0.1, 0.1, 0.0};
+  REQUIRE(TIFFSetField(tif, TIFFTAG_GEOTIEPOINTS, 6, tiepoints) == 1);
+  REQUIRE(TIFFSetField(tif, TIFFTAG_GEOPIXELSCALE, 3, scale) == 1);
+  std::vector<float> row(4, 0.0f);
+  for (uint32_t y = 0; y < 2; ++y) REQUIRE(TIFFWriteScanline(tif, row.data(), y, 0) >= 0);
   XTIFFClose(tif);
 }
-
-TEST_CASE("matches accepts the same configuration and explains mismatches", "[demraster]") {
-  const Config cfg = exampleConfig();
-  const auto r = DemRaster::create(cfg.width, cfg.height, cfg.box, {cfg.layer, cfg.wmsUrl});
-  std::string why;
-  CHECK(r.matches(cfg, why));
-  CHECK(why.empty());
-
-  Config shifted = cfg;
-  shifted.box.north += 0.01;
-  CHECK_FALSE(r.matches(shifted, why));
-  CHECK_THAT(why, ContainsSubstring("north: file -34.184541800, requested -34.174541800"));
-
-  Config other = cfg;
-  other.width = 100;
-  other.layer = "Other";
-  CHECK_FALSE(r.matches(other, why));
-  CHECK_THAT(why, ContainsSubstring("width: file 2048, requested 100"));
-  CHECK_THAT(why, ContainsSubstring("layer: file Elevation_CCT_GLM2019_5m_DEM, requested Other"));
-
-  Config mirror = cfg;
-  mirror.wmsUrl = "https://mirror.test/wms";
-  CHECK(r.matches(mirror, why));
-  CHECK_FALSE(r.wmsUrlWarning(mirror).empty());
-  CHECK(r.wmsUrlWarning(cfg).empty());
-}
-
-TEST_CASE("legacy RGB16 files are rejected with a clear message", "[demraster]") {
-  TempDir dir;
-  const auto file = dir.path / "legacy.tif";
-  {
-    TIFF* tif = TIFFOpen(file.string().c_str(), "w");
-    REQUIRE(tif != nullptr);
-    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 4u);
-    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 2u);
-    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 3);
-    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 16);
-    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
-    TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 2u);
-    std::vector<uint16_t> row(4 * 3, 0);
-    for (uint32_t y = 0; y < 2; ++y) REQUIRE(TIFFWriteScanline(tif, row.data(), y, 0) >= 0);
-    TIFFClose(tif);
-  }
-  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("RGB16"));
-}
-
-TEST_CASE("a file with an unusable tiepoint is rejected", "[demraster]") {
-  TempDir dir;
-  const auto file = dir.path / "nan-tiepoint.tif";
-  {
-    TIFF* tif = XTIFFOpen(file.string().c_str(), "w");
-    REQUIRE(tif != nullptr);
-    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 4u);
-    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 2u);
-    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
-    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 32);
-    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
-    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 2u);
-    const double tiepoints[6] = {0.0, 0.0, 0.0, std::numeric_limits<double>::quiet_NaN(), -34.0, 0.0};
-    const double scale[3] = {0.1, 0.1, 0.0};
-    REQUIRE(TIFFSetField(tif, TIFFTAG_GEOTIEPOINTS, 6, tiepoints) == 1);
-    REQUIRE(TIFFSetField(tif, TIFFTAG_GEOPIXELSCALE, 3, scale) == 1);
-    std::vector<float> row(4, 0.0f);
-    for (uint32_t y = 0; y < 2; ++y) REQUIRE(TIFFWriteScanline(tif, row.data(), y, 0) >= 0);
-    XTIFFClose(tif);
-  }
-  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("invalid bounding box"));
-}
-
-TEST_CASE("loading a missing file reports the path", "[demraster]") {
-  TempDir dir;
-  CHECK_THROWS_WITH(DemRaster::load(dir.path / "absent.tif"), ContainsSubstring("absent.tif"));
-}
-
-namespace {
 
 // Lowers this process's file-size limit, with SIGXFSZ ignored so that a write past the limit fails
 // with EFBIG instead of killing the process. Restores both on destruction, however the scope ends.
@@ -1724,6 +1608,191 @@ LimitedSave saveUnderLimit(const DemRaster& r, const std::filesystem::path& file
 
 }  // namespace
 
+TEST_CASE("save and load round-trip values, NaN and NoData", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "dem.tif";
+  auto r = DemRaster::create(4, 3, kBox, {"LayerA", "https://example.test/wms"});
+  r.set(1, 1, 12.5f);
+  r.set(2, 0, DemRaster::kNoData);
+  r.set(0, 2, -3.25f);
+
+  r.save(file);
+
+  CHECK(std::filesystem::exists(file));
+  CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
+  const auto back = DemRaster::load(file);
+  CHECK(back.width() == 4);
+  CHECK(back.height() == 3);
+  CHECK(back.box().approxEquals(kBox, 1e-9));
+  CHECK(back.at(1, 1) == 12.5f);
+  CHECK(back.at(2, 0) == DemRaster::kNoData);
+  CHECK(back.at(0, 2) == -3.25f);
+  CHECK(std::isnan(back.at(0, 0)));
+  CHECK(back.countNaN() == 9);
+  CHECK(back.metadata().layer == "LayerA");
+  CHECK(back.metadata().wmsUrl == "https://example.test/wms");
+}
+
+TEST_CASE("a multi-strip raster round-trips every pixel", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "dem.tif";
+  Config cfg = exampleConfig();
+  cfg.height = 8;
+  auto r = DemRaster::create(cfg.width, cfg.height, cfg.box, {cfg.layer, cfg.wmsUrl});
+  for (int y = 0; y < cfg.height; ++y) {
+    for (int x = 0; x < cfg.width; ++x) {
+      if ((x + y) % 2 == 0) r.set(x, y, x * 0.5f + y);
+    }
+  }
+  r.set(1, 0, DemRaster::kNoData);
+  r.set(1000, 3, DemRaster::kNoData);
+  r.set(2047, 7, DemRaster::kNoData);
+  r.save(file);
+
+  TIFF* tif = XTIFFOpen(file.string().c_str(), "r");
+  REQUIRE(tif != nullptr);
+  CHECK(TIFFNumberOfStrips(tif) > 1);
+  XTIFFClose(tif);
+
+  const auto back = DemRaster::load(file);
+  REQUIRE(back.width() == cfg.width);
+  REQUIRE(back.height() == cfg.height);
+  int mismatches = 0;
+  for (int y = 0; y < cfg.height; ++y) {
+    for (int x = 0; x < cfg.width; ++x) {
+      const float want = r.at(x, y);
+      const float got = back.at(x, y);
+      if (std::isnan(want) ? !std::isnan(got) : got != want) ++mismatches;
+    }
+  }
+  CHECK(mismatches == 0);
+  CHECK(back.countNaN() == r.countNaN());
+  std::string why;
+  CHECK(back.matches(cfg, why));
+  CHECK(why.empty());
+}
+
+TEST_CASE("the file carries GeoTIFF keys, the tiepoint and the NoData tag", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "dem.tif";
+  DemRaster::create(4, 3, kBox, {}).save(file);
+
+  TIFF* tif = XTIFFOpen(file.string().c_str(), "r");
+  REQUIRE(tif != nullptr);
+  GTIF* gtif = GTIFNew(tif);
+  REQUIRE(gtif != nullptr);
+
+  unsigned short v = 0;
+  CHECK(GTIFKeyGetSHORT(gtif, GTModelTypeGeoKey, &v, 0, 1) == 1);
+  CHECK(v == ModelTypeGeographic);
+  CHECK(GTIFKeyGetSHORT(gtif, GTRasterTypeGeoKey, &v, 0, 1) == 1);
+  CHECK(v == RasterPixelIsArea);
+  CHECK(GTIFKeyGetSHORT(gtif, GeographicTypeGeoKey, &v, 0, 1) == 1);
+  CHECK(v == 4326);
+
+  uint16_t count = 0;
+  double* tie = nullptr;
+  REQUIRE(TIFFGetField(tif, TIFFTAG_GEOTIEPOINTS, &count, &tie) == 1);
+  CHECK(count == 6);
+  CHECK(tie[3] == 18.1);
+  CHECK(tie[4] == -34.0);
+  double* scale = nullptr;
+  REQUIRE(TIFFGetField(tif, TIFFTAG_GEOPIXELSCALE, &count, &scale) == 1);
+  CHECK(count == 3);
+  CHECK(scale[0] == (18.5 - 18.1) / 4.0);
+  CHECK(scale[1] == (-34.0 - -34.3) / 3.0);
+
+  char* nodata = nullptr;
+  REQUIRE(TIFFGetField(tif, TIFFTAG_GDAL_NODATA, &nodata) == 1);
+  CHECK(std::string(nodata) == "-32768");
+  uint16_t sampleFormat = 0;
+  REQUIRE(TIFFGetField(tif, TIFFTAG_SAMPLEFORMAT, &sampleFormat) == 1);
+  CHECK(sampleFormat == SAMPLEFORMAT_IEEEFP);
+  char* software = nullptr;
+  REQUIRE(TIFFGetField(tif, TIFFTAG_SOFTWARE, &software) == 1);
+  CHECK(std::string(software) == std::string("dl_elevation ") + DL_ELEVATION_VERSION);
+
+  GTIFFree(gtif);
+  XTIFFClose(tif);
+}
+
+TEST_CASE("matches accepts the same configuration and explains mismatches", "[demraster]") {
+  const Config cfg = exampleConfig();
+  const auto r = DemRaster::create(cfg.width, cfg.height, cfg.box, {cfg.layer, cfg.wmsUrl});
+  std::string why;
+  CHECK(r.matches(cfg, why));
+  CHECK(why.empty());
+
+  Config shifted = cfg;
+  shifted.box.north += 0.01;
+  CHECK_FALSE(r.matches(shifted, why));
+  CHECK_THAT(why, ContainsSubstring("north: file -34.184541800, requested -34.174541800"));
+
+  Config other = cfg;
+  other.width = 100;
+  other.layer = "Other";
+  CHECK_FALSE(r.matches(other, why));
+  CHECK_THAT(why, ContainsSubstring("width: file 2048, requested 100"));
+  CHECK_THAT(why, ContainsSubstring("layer: file Elevation_CCT_GLM2019_5m_DEM, requested Other"));
+
+  Config mirror = cfg;
+  mirror.wmsUrl = "https://mirror.test/wms";
+  CHECK(r.matches(mirror, why));
+  CHECK_FALSE(r.wmsUrlWarning(mirror).empty());
+  CHECK(r.wmsUrlWarning(cfg).empty());
+
+  BoundingBox nanBox = cfg.box;
+  nanBox.west = std::numeric_limits<double>::quiet_NaN();
+  const auto nanEdge = DemRaster::create(cfg.width, cfg.height, nanBox, {cfg.layer, cfg.wmsUrl});
+  CHECK_FALSE(nanEdge.matches(cfg, why));
+  CHECK_THAT(why, ContainsSubstring("west: file nan"));
+
+  const auto noLayer = DemRaster::create(cfg.width, cfg.height, cfg.box, {"", cfg.wmsUrl});
+  CHECK_FALSE(noLayer.matches(cfg, why));
+  CHECK_THAT(why, ContainsSubstring("layer: file (none), requested Elevation_CCT_GLM2019_5m_DEM"));
+}
+
+TEST_CASE("legacy RGB16 files are rejected with a clear message", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "legacy.tif";
+  {
+    TIFF* tif = TIFFOpen(file.string().c_str(), "w");
+    REQUIRE(tif != nullptr);
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 4u);
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 2u);
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 3);
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 16);
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
+    TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 2u);
+    std::vector<uint16_t> row(4 * 3, 0);
+    for (uint32_t y = 0; y < 2; ++y) REQUIRE(TIFFWriteScanline(tif, row.data(), y, 0) >= 0);
+    TIFFClose(tif);
+  }
+  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("RGB16"));
+}
+
+TEST_CASE("a file with an unusable tiepoint is rejected", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "nan-tiepoint.tif";
+  writeFloatGeoTiff(file, std::numeric_limits<double>::quiet_NaN(), "dl_elevation;layer=;wms=");
+  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("invalid bounding box"));
+}
+
+TEST_CASE("a GeoTIFF that dl_elevation did not write is rejected", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "foreign.tif";
+  writeFloatGeoTiff(file, 18.1, nullptr);
+  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("not written by dl_elevation"));
+}
+
+TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {
+  TempDir dir;
+  const auto absent = dir.path / "absent.tif";
+  CHECK_THROWS_WITH(DemRaster::load(absent), ContainsSubstring("absent.tif"));
+  CHECK_THROWS_WITH(DemRaster::load(absent), ContainsSubstring("No such file or directory"));
+}
+
 TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "[demraster]") {
   TempDir dir;
   const auto file = dir.path / "dem.tif";
@@ -1745,6 +1814,24 @@ TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
+}
+
+TEST_CASE("a failed strip write throws and keeps the previous checkpoint", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "dem.tif";
+  auto r = DemRaster::create(2048, 8, kBox, {"LayerA", "https://example.test/wms"});
+  r.set(5, 5, 12.5f);
+  r.save(file);
+  const std::uintmax_t complete = std::filesystem::file_size(file);
+
+  // Half the file ends inside the strip data, so a row write fails before the directory is reached.
+  r.set(5, 5, 99.0f);
+  const LimitedSave attempt = saveUnderLimit(r, file, complete / 2);
+  REQUIRE(attempt.limited);
+  CHECK_THAT(attempt.error, ContainsSubstring("write failed on row"));
+  CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
+  const auto back = DemRaster::load(file);
+  CHECK(back.at(5, 5) == 12.5f);
 }
 
 TEST_CASE("a checkpoint that cannot be created leaves no temp file behind", "[demraster]") {
@@ -1806,6 +1893,9 @@ struct RasterMetadata {
 // A float32 elevation grid in metres. Row 0 is the north edge, column 0 the west edge.
 // NaN means "no value yet"; kNoData means the server has no elevation there.
 // Threading: set may run concurrently on distinct cells, and nothing else may overlap a set.
+// The first load or save sets libtiff up for the whole process: it registers the GDAL_NODATA tag and
+// installs an error handler that collects libtiff's errors for the exception messages instead of
+// printing them.
 class DemRaster {
  public:
   static constexpr float kNoData = -32768.0f;
@@ -1816,11 +1906,15 @@ class DemRaster {
 
   // Reads a file written by save(). Throws std::runtime_error with a user-facing message when the
   // file cannot be opened, is not a single-band float32 GeoTIFF (including the previous RGB16
-  // format), lacks the georeferencing tags, or describes a box that fails BoundingBox::validate().
+  // format), was not written by dl_elevation, is too large for int indices, lacks the georeferencing
+  // tags, or describes a box that fails BoundingBox::validate(). libtiff's explanation, when it gave
+  // one, is appended.
   [[nodiscard]] static DemRaster load(const std::filesystem::path& path);
 
-  // Writes <path>.tmp beside the output, then renames it over <path>, so a crash mid-write leaves
-  // the previous file intact. Throws std::runtime_error on any failure.
+  // Writes <path>.tmp beside the output, syncs it to disk, then renames it over <path>, so a crash
+  // mid-write leaves the previous file intact. The rename replaces a symlink at <path> with a regular
+  // file, and a single file bind-mounted at <path> cannot be replaced. Throws std::runtime_error on
+  // any failure, with libtiff's explanation appended when it gave one.
   void save(const std::filesystem::path& path) const;
 
   // True when this raster can be resumed for cfg. Otherwise `why` lists every differing field,
@@ -1871,9 +1965,13 @@ class DemRaster {
 #include <geotiff.h>
 #include <geovalues.h>
 #include <tiffio.h>
+#include <unistd.h>
 #include <xtiffio.h>
 
+#include <cerrno>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1902,10 +2000,58 @@ struct GtifCloser {
 };
 using GtifHandle = std::unique_ptr<GTIF, GtifCloser>;
 
+// Removes a temporary file when it goes out of scope, unless it was marked complete.
+class TempFileGuard {
+ public:
+  explicit TempFileGuard(std::filesystem::path path) : path_(std::move(path)) {}
+  ~TempFileGuard() {
+    if (complete_) return;
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+  }
+  TempFileGuard(const TempFileGuard&) = delete;
+  TempFileGuard& operator=(const TempFileGuard&) = delete;
+
+  void markComplete() { complete_ = true; }
+
+ private:
+  std::filesystem::path path_;
+  bool complete_ = false;
+};
+
+// The libtiff errors raised on this thread since takeTiffError() last ran, joined by "; ".
+thread_local std::string lastTiffError;
+
+// Installed in place of libtiff's default handler, which prints to stderr, so that the text reaches
+// the user in an exception message instead of interrupting the progress output.
+void captureTiffError(const char* module, const char* fmt, va_list ap) {
+  char text[1024];
+  std::vsnprintf(text, sizeof text, fmt, ap);
+  try {
+    if (!lastTiffError.empty()) lastTiffError += "; ";
+    if (module != nullptr) lastTiffError += std::string(module) + ": ";
+    lastTiffError += text;
+  } catch (...) {
+    // Out of memory: the text is lost, but the caller still reports the failure itself.
+  }
+}
+
+// Returns the libtiff errors collected on this thread and forgets them.
+std::string takeTiffError() {
+  std::string text;
+  text.swap(lastTiffError);
+  return text;
+}
+
+// Throws what, followed by ": <libtiff text>" when libtiff reported errors since the last take.
+[[noreturn]] void fail(const std::string& what) {
+  const std::string text = takeTiffError();
+  throw std::runtime_error(text.empty() ? what : what + ": " + text);
+}
+
 // libtiff does not know the GDAL_NODATA tag: TIFFSetField refuses it and a reader sees an anonymous
-// field. This tag extender registers it on every TIFF handle opened after ensureTagsRegistered().
-// It chains to the extender installed before it, because libgeotiff installs one for the GeoTIFF
-// tags on its first XTIFFOpen and that one chains in turn, so both run in either install order.
+// field. This tag extender registers it on every TIFF handle opened after ensureTagsRegistered(),
+// then calls the extender installed before it, libgeotiff's, which registers the GeoTIFF tags.
 TIFFExtendProc g_parentExtender = nullptr;
 
 void registerGdalTags(TIFF* tif) {
@@ -1918,7 +2064,13 @@ void registerGdalTags(TIFF* tif) {
 
 void ensureTagsRegistered() {
   static std::once_flag once;
-  std::call_once(once, [] { g_parentExtender = TIFFSetTagExtender(registerGdalTags); });
+  std::call_once(once, [] {
+    // libgeotiff's first-time setup is not thread-safe, so it is forced to run here, once. The
+    // extender order is therefore fixed: ours runs first, then libgeotiff's.
+    XTIFFInitialize();
+    g_parentExtender = TIFFSetTagExtender(registerGdalTags);
+    TIFFSetErrorHandler(captureTiffError);
+  });
 }
 
 }  // namespace
@@ -1957,8 +2109,9 @@ DemRaster DemRaster::create(int width, int height, const BoundingBox& box, Raste
 
 DemRaster DemRaster::load(const std::filesystem::path& path) {
   ensureTagsRegistered();
+  takeTiffError();  // forget whatever earlier calls on this thread left behind
   TiffHandle tif(XTIFFOpen(path.string().c_str(), "r"));
-  if (!tif) throw std::runtime_error("cannot open " + path.string());
+  if (!tif) fail("cannot open " + path.string());
   TIFF* t = tif.get();
 
   uint32_t width = 0;
@@ -1972,22 +2125,35 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
   TIFFGetFieldDefaulted(t, TIFFTAG_BITSPERSAMPLE, &bitsPerSample);
   TIFFGetFieldDefaulted(t, TIFFTAG_SAMPLEFORMAT, &sampleFormat);
   if (samplesPerPixel != 1 || bitsPerSample != 32 || sampleFormat != SAMPLEFORMAT_IEEEFP) {
-    throw std::runtime_error(path.string() +
-                             " is not a dl_elevation float32 GeoTIFF; files from the previous RGB16 "
-                             "format cannot be resumed");
+    fail(path.string() +
+         " is not a dl_elevation float32 GeoTIFF; files from the previous RGB16 "
+         "format cannot be resumed");
   }
-  if (width == 0 || height == 0) throw std::runtime_error(path.string() + " has an empty image");
+  // Checked before anything is allocated, so that another program's file is never resumed.
+  char* description = nullptr;
+  if (!TIFFGetField(t, TIFFTAG_IMAGEDESCRIPTION, &description) || description == nullptr ||
+      !std::string_view(description).starts_with("dl_elevation;")) {
+    fail(path.string() + " was not written by dl_elevation; choose another --output or use "
+                         "--overwrite");
+  }
+  RasterMetadata meta = parseImageDescription(description);
+  constexpr auto kMaxSide = static_cast<uint32_t>(std::numeric_limits<int>::max());
+  if (width > kMaxSide || height > kMaxSide) {
+    fail(path.string() + " is too large: " + std::to_string(width) + " x " + std::to_string(height) +
+         " pixels");
+  }
+  if (width == 0 || height == 0) fail(path.string() + " has an empty image");
 
   uint16_t tieCount = 0;
   double* tiepoints = nullptr;
   if (!TIFFGetField(t, TIFFTAG_GEOTIEPOINTS, &tieCount, &tiepoints) || tieCount < 6 || tiepoints[0] != 0.0 ||
       tiepoints[1] != 0.0) {
-    throw std::runtime_error(path.string() + " has no usable GeoTIFF tiepoint");
+    fail(path.string() + " has no usable GeoTIFF tiepoint");
   }
   uint16_t scaleCount = 0;
   double* scale = nullptr;
   if (!TIFFGetField(t, TIFFTAG_GEOPIXELSCALE, &scaleCount, &scale) || scaleCount < 2) {
-    throw std::runtime_error(path.string() + " has no GeoTIFF pixel scale");
+    fail(path.string() + " has no GeoTIFF pixel scale");
   }
   BoundingBox box;
   box.west = tiepoints[3];
@@ -1995,19 +2161,13 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
   box.east = box.west + scale[0] * width;
   box.south = box.north - scale[1] * height;
   if (const std::string problem = box.validate(); !problem.empty()) {
-    throw std::runtime_error(path.string() + " has an invalid bounding box: " + problem);
-  }
-
-  RasterMetadata meta;
-  char* description = nullptr;
-  if (TIFFGetField(t, TIFFTAG_IMAGEDESCRIPTION, &description) && description != nullptr) {
-    meta = parseImageDescription(description);
+    fail(path.string() + " has an invalid bounding box: " + problem);
   }
 
   DemRaster r = create(static_cast<int>(width), static_cast<int>(height), box, std::move(meta));
   for (uint32_t y = 0; y < height; ++y) {
     if (TIFFReadScanline(t, &r.data_[r.index(0, static_cast<int>(y))], y, 0) < 0) {
-      throw std::runtime_error("read failed on row " + std::to_string(y) + " of " + path.string());
+      fail("read failed on row " + std::to_string(y) + " of " + path.string());
     }
   }
   return r;
@@ -2015,12 +2175,10 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
 
 void DemRaster::save(const std::filesystem::path& path) const {
   ensureTagsRegistered();
+  takeTiffError();  // forget whatever earlier calls on this thread left behind
   const std::filesystem::path tmp = path.string() + ".tmp";
-  const auto fail = [&tmp](const std::string& what) {
-    std::error_code ignored;
-    std::filesystem::remove(tmp, ignored);
-    throw std::runtime_error(what);
-  };
+  // Declared before the TIFF handle, so that on failure the file is removed after the handle closes.
+  TempFileGuard tmpGuard(tmp);
   {
     TiffHandle tif(XTIFFOpen(tmp.string().c_str(), "w"));
     if (!tif) fail("cannot create " + tmp.string());
@@ -2028,7 +2186,6 @@ void DemRaster::save(const std::filesystem::path& path) const {
     // Checked so that a tag libtiff does not know fails the save instead of being left out.
     const auto setField = [&](const char* name, uint32_t tag, auto... values) {
       if (TIFFSetField(t, tag, values...) != 1) {
-        tif.reset();
         fail(std::string("cannot set tag ") + name + " on " + tmp.string());
       }
     };
@@ -2048,6 +2205,7 @@ void DemRaster::save(const std::filesystem::path& path) const {
     const double pixelScale[3] = {scale.lonPerPixel, scale.latPerPixel, 0.0};
     setField("GEOTIEPOINTS", TIFFTAG_GEOTIEPOINTS, 6, tiepoints);
     setField("GEOPIXELSCALE", TIFFTAG_GEOPIXELSCALE, 3, pixelScale);
+    static_assert(DemRaster::kNoData == -32768.0f);  // the GDAL_NODATA text below spells out kNoData
     setField("GDAL_NODATA", TIFFTAG_GDAL_NODATA, "-32768");
     const std::string description = formatImageDescription(meta_);
     setField("IMAGEDESCRIPTION", TIFFTAG_IMAGEDESCRIPTION, description.c_str());
@@ -2056,43 +2214,41 @@ void DemRaster::save(const std::filesystem::path& path) const {
 
     {
       GtifHandle gtif(GTIFNew(t));
-      if (!gtif) {
-        tif.reset();
-        fail("cannot attach GeoTIFF keys to " + tmp.string());
-      }
+      if (!gtif) fail("cannot attach GeoTIFF keys to " + tmp.string());
       const auto setKey = [&](const char* name, geokey_t key, int value) {
         if (GTIFKeySet(gtif.get(), key, TYPE_SHORT, 1, value) != 1) {
-          tif.reset();
           fail(std::string("cannot set GeoTIFF key ") + name + " on " + tmp.string());
         }
       };
       setKey("GTModelTypeGeoKey", GTModelTypeGeoKey, ModelTypeGeographic);
       setKey("GTRasterTypeGeoKey", GTRasterTypeGeoKey, RasterPixelIsArea);
       setKey("GeographicTypeGeoKey", GeographicTypeGeoKey, GCS_WGS_84);
-      if (GTIFWriteKeys(gtif.get()) != 1) {
-        tif.reset();
-        fail("cannot write the GeoTIFF keys to " + tmp.string());
-      }
+      if (GTIFWriteKeys(gtif.get()) != 1) fail("cannot write the GeoTIFF keys to " + tmp.string());
     }
 
     std::vector<float> row(static_cast<std::size_t>(width_));
     for (int y = 0; y < height_; ++y) {
       std::memcpy(row.data(), &data_[index(0, y)], row.size() * sizeof(float));
       if (TIFFWriteScanline(t, row.data(), static_cast<uint32_t>(y), 0) < 0) {
-        tif.reset();
         fail("write failed on row " + std::to_string(y) + " of " + tmp.string());
       }
     }
     // XTIFFClose swallows errors from writing the last strip and the directory. Flushing first
     // surfaces them, so a failed write never reaches the rename and the previous checkpoint survives.
-    if (TIFFFlush(t) != 1) {
-      tif.reset();
-      fail("cannot finish writing " + tmp.string());
+    if (TIFFFlush(t) != 1) fail("cannot finish writing " + tmp.string());
+    // The data must be on disk before the rename makes it the checkpoint.
+    if (fsync(TIFFFileno(t)) != 0) {
+      const std::string reason = std::generic_category().message(errno);
+      fail("cannot finish writing " + tmp.string() + ": " + reason);
     }
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
-  if (ec) fail("cannot rename " + tmp.string() + " to " + path.string() + ": " + ec.message());
+  if (ec) {
+    throw std::runtime_error("cannot rename " + tmp.string() + " to " + path.string() + ": " +
+                             ec.message());
+  }
+  tmpGuard.markComplete();
 }
 
 bool DemRaster::matches(const Config& cfg, std::string& why) const {
@@ -2104,7 +2260,8 @@ bool DemRaster::matches(const Config& cfg, std::string& why) const {
     why += "  height: file " + std::to_string(height_) + ", requested " + std::to_string(cfg.height) + "\n";
   }
   const auto edge = [&why](const char* name, double file, double requested) {
-    if (std::fabs(file - requested) > kBoxTolerance) {
+    // Negated so that a NaN edge, for which every comparison is false, is reported as a mismatch.
+    if (!(std::fabs(file - requested) <= kBoxTolerance)) {
       why += std::string("  ") + name + ": file " + formatCoordinate(file) + ", requested " +
              formatCoordinate(requested) + "\n";
     }
@@ -2114,7 +2271,8 @@ bool DemRaster::matches(const Config& cfg, std::string& why) const {
   edge("east", box_.east, cfg.box.east);
   edge("west", box_.west, cfg.box.west);
   if (meta_.layer != cfg.layer) {
-    why += "  layer: file " + meta_.layer + ", requested " + cfg.layer + "\n";
+    const std::string fileLayer = meta_.layer.empty() ? "(none)" : meta_.layer;
+    why += "  layer: file " + fileLayer + ", requested " + cfg.layer + "\n";
   }
   return why.empty();
 }
@@ -2161,7 +2319,7 @@ Notes for the engineer: `XTIFFOpen` registers the GeoTIFF tags with libtiff, whi
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[demraster]"`
-Expected: `All tests passed (N assertions in 13 test cases)`.
+Expected: `All tests passed (N assertions in 16 test cases)`.
 
 - [ ] **Step 7: Commit**
 

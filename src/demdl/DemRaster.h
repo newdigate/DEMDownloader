@@ -31,6 +31,9 @@ struct RasterMetadata {
 // A float32 elevation grid in metres. Row 0 is the north edge, column 0 the west edge.
 // NaN means "no value yet"; kNoData means the server has no elevation there.
 // Threading: set may run concurrently on distinct cells, and nothing else may overlap a set.
+// The first load or save sets libtiff up for the whole process: it registers the GDAL_NODATA tag and
+// installs an error handler that collects libtiff's errors for the exception messages instead of
+// printing them.
 class DemRaster {
  public:
   static constexpr float kNoData = -32768.0f;
@@ -41,11 +44,15 @@ class DemRaster {
 
   // Reads a file written by save(). Throws std::runtime_error with a user-facing message when the
   // file cannot be opened, is not a single-band float32 GeoTIFF (including the previous RGB16
-  // format), lacks the georeferencing tags, or describes a box that fails BoundingBox::validate().
+  // format), was not written by dl_elevation, is too large for int indices, lacks the georeferencing
+  // tags, or describes a box that fails BoundingBox::validate(). libtiff's explanation, when it gave
+  // one, is appended.
   [[nodiscard]] static DemRaster load(const std::filesystem::path& path);
 
-  // Writes <path>.tmp beside the output, then renames it over <path>, so a crash mid-write leaves
-  // the previous file intact. Throws std::runtime_error on any failure.
+  // Writes <path>.tmp beside the output, syncs it to disk, then renames it over <path>, so a crash
+  // mid-write leaves the previous file intact. The rename replaces a symlink at <path> with a regular
+  // file, and a single file bind-mounted at <path> cannot be replaced. Throws std::runtime_error on
+  // any failure, with libtiff's explanation appended when it gave one.
   void save(const std::filesystem::path& path) const;
 
   // True when this raster can be resumed for cfg. Otherwise `why` lists every differing field,
