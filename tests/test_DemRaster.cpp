@@ -334,6 +334,29 @@ TEST_CASE("a GeoTIFF that dl_elevation did not write is rejected", "[demraster]"
   CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("not written by dl_elevation"));
 }
 
+TEST_CASE("oversized dimensions are rejected before allocation", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "oversized.tif";
+  {
+    // libtiff will not read back a directory without strip offsets, so one four-byte placeholder
+    // strip stands in for the 8 GiB that a single row of this width would take.
+    TIFF* tif = XTIFFOpen(file.string().c_str(), "w");
+    REQUIRE(tif != nullptr);
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 2147483649u);
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 1u);
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 32);
+    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 1u);
+    TIFFSetField(tif, TIFFTAG_IMAGEDESCRIPTION, "dl_elevation;layer=;wms=");
+    float placeholder = 0.0f;
+    REQUIRE(TIFFWriteRawStrip(tif, 0, &placeholder, 4) == 4);
+    XTIFFClose(tif);
+  }
+  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("is too large"));
+}
+
 TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {
   TempDir dir;
   const auto absent = dir.path / "absent.tif";
@@ -359,6 +382,7 @@ TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "
   const LimitedSave attempt = saveUnderLimit(r, file, complete - 1);
   REQUIRE(attempt.limited);
   CHECK_THAT(attempt.error, ContainsSubstring("cannot finish writing"));
+  CHECK_THAT(attempt.error, ContainsSubstring("(File too large)"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
@@ -377,6 +401,7 @@ TEST_CASE("a failed strip write throws and keeps the previous checkpoint", "[dem
   const LimitedSave attempt = saveUnderLimit(r, file, complete / 2);
   REQUIRE(attempt.limited);
   CHECK_THAT(attempt.error, ContainsSubstring("write failed on row"));
+  CHECK_THAT(attempt.error, ContainsSubstring("(File too large)"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(5, 5) == 12.5f);
@@ -394,6 +419,7 @@ TEST_CASE("a checkpoint that cannot be created leaves no temp file behind", "[de
   const LimitedSave attempt = saveUnderLimit(r, file, 0);
   REQUIRE(attempt.limited);
   CHECK_THAT(attempt.error, ContainsSubstring("cannot create"));
+  CHECK_THAT(attempt.error, ContainsSubstring("(File too large)"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);

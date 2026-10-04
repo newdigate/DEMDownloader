@@ -31,9 +31,9 @@ struct RasterMetadata {
 // A float32 elevation grid in metres. Row 0 is the north edge, column 0 the west edge.
 // NaN means "no value yet"; kNoData means the server has no elevation there.
 // Threading: set may run concurrently on distinct cells, and nothing else may overlap a set.
-// The first load or save sets libtiff up for the whole process: it registers the GDAL_NODATA tag and
+// The first load or save sets libtiff up for the whole process: it registers the GDAL_NODATA tag,
 // installs an error handler that collects libtiff's errors for the exception messages instead of
-// printing them.
+// printing them, and silences libtiff's warnings.
 class DemRaster {
  public:
   static constexpr float kNoData = -32768.0f;
@@ -52,7 +52,8 @@ class DemRaster {
   // Writes <path>.tmp beside the output, syncs it to disk, then renames it over <path>, so a crash
   // mid-write leaves the previous file intact. The rename replaces a symlink at <path> with a regular
   // file, and a single file bind-mounted at <path> cannot be replaced. Throws std::runtime_error on
-  // any failure, with libtiff's explanation appended when it gave one.
+  // any failure, with libtiff's explanation and, for a failed write, the operating system's reason
+  // appended.
   void save(const std::filesystem::path& path) const;
 
   // True when this raster can be resumed for cfg. Otherwise `why` lists every differing field,

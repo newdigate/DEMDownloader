@@ -61,8 +61,10 @@ class TempFileGuard {
 thread_local std::string lastTiffError;
 
 // Installed in place of libtiff's default handler, which prints to stderr, so that the text reaches
-// the user in an exception message instead of interrupting the progress output.
+// the user in an exception message instead of interrupting the progress output. errno is preserved
+// for the caller, which reports the operating system's reason for a failed write.
 void captureTiffError(const char* module, const char* fmt, va_list ap) {
+  const int savedErrno = errno;
   char text[1024];
   std::vsnprintf(text, sizeof text, fmt, ap);
   try {
@@ -72,6 +74,7 @@ void captureTiffError(const char* module, const char* fmt, va_list ap) {
   } catch (...) {
     // Out of memory: the text is lost, but the caller still reports the failure itself.
   }
+  errno = savedErrno;
 }
 
 // Returns the libtiff errors collected on this thread and forgets them.
@@ -81,10 +84,13 @@ std::string takeTiffError() {
   return text;
 }
 
-// Throws what, followed by ": <libtiff text>" when libtiff reported errors since the last take.
-[[noreturn]] void fail(const std::string& what) {
-  const std::string text = takeTiffError();
-  throw std::runtime_error(text.empty() ? what : what + ": " + text);
+// Throws what, then ": <libtiff text>" when libtiff reported errors since the last take, then
+// " (<reason>)" when osError, an errno value, is not zero.
+[[noreturn]] void fail(const std::string& what, int osError = 0) {
+  std::string message = what;
+  if (const std::string text = takeTiffError(); !text.empty()) message += ": " + text;
+  if (osError != 0) message += " (" + std::generic_category().message(osError) + ")";
+  throw std::runtime_error(message);
 }
 
 // libtiff does not know the GDAL_NODATA tag: TIFFSetField refuses it and a reader sees an anonymous
@@ -108,6 +114,8 @@ void ensureTagsRegistered() {
     XTIFFInitialize();
     g_parentExtender = TIFFSetTagExtender(registerGdalTags);
     TIFFSetErrorHandler(captureTiffError);
+    // Our own files raise no warnings; another program's file would otherwise print them during load.
+    TIFFSetWarningHandler(nullptr);
   });
 }
 
@@ -218,8 +226,13 @@ void DemRaster::save(const std::filesystem::path& path) const {
   // Declared before the TIFF handle, so that on failure the file is removed after the handle closes.
   TempFileGuard tmpGuard(tmp);
   {
-    TiffHandle tif(XTIFFOpen(tmp.string().c_str(), "w"));
-    if (!tif) fail("cannot create " + tmp.string());
+    // errno is cleared just before each call that can fail in the operating system and read just
+    // after a failure, so that, for example, a full disk is named as the cause.
+    const std::string tmpName = tmp.string();
+    errno = 0;
+    TiffHandle tif(XTIFFOpen(tmpName.c_str(), "w"));
+    const int openError = errno;
+    if (!tif) fail("cannot create " + tmpName, openError);
     TIFF* t = tif.get();
     // Checked so that a tag libtiff does not know fails the save instead of being left out.
     const auto setField = [&](const char* name, uint32_t tag, auto... values) {
@@ -267,17 +280,23 @@ void DemRaster::save(const std::filesystem::path& path) const {
     std::vector<float> row(static_cast<std::size_t>(width_));
     for (int y = 0; y < height_; ++y) {
       std::memcpy(row.data(), &data_[index(0, y)], row.size() * sizeof(float));
+      errno = 0;
       if (TIFFWriteScanline(t, row.data(), static_cast<uint32_t>(y), 0) < 0) {
-        fail("write failed on row " + std::to_string(y) + " of " + tmp.string());
+        const int writeError = errno;
+        fail("write failed on row " + std::to_string(y) + " of " + tmp.string(), writeError);
       }
     }
     // XTIFFClose swallows errors from writing the last strip and the directory. Flushing first
     // surfaces them, so a failed write never reaches the rename and the previous checkpoint survives.
-    if (TIFFFlush(t) != 1) fail("cannot finish writing " + tmp.string());
+    errno = 0;
+    if (TIFFFlush(t) != 1) {
+      const int flushError = errno;
+      fail("cannot finish writing " + tmp.string(), flushError);
+    }
     // The data must be on disk before the rename makes it the checkpoint.
     if (fsync(TIFFFileno(t)) != 0) {
-      const std::string reason = std::generic_category().message(errno);
-      fail("cannot finish writing " + tmp.string() + ": " + reason);
+      const int syncError = errno;
+      fail("cannot finish writing " + tmp.string(), syncError);
     }
   }
   std::error_code ec;

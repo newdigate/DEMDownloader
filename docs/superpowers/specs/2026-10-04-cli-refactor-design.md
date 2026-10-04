@@ -244,9 +244,10 @@ program registers the `GDAL_NODATA` tag (42113) with libtiff itself, because
 libtiff does not know it by default.
 
 `save` writes `<output>.tmp`, flushes and syncs it to disk, and only then
-renames it over the output. libtiff's diagnostics are not printed: the
-program installs a libtiff error handler that collects them, and they are
-appended to the message of the `load` or `save` error they explain.
+renames it over the output. libtiff's diagnostics are not printed: errors
+are collected by a libtiff error handler and appended to the message of the
+`load` or `save` error they explain, followed for a failed write by the
+operating system's reason in parentheses, and warnings are discarded.
 
 Pixel semantics:
 
@@ -272,7 +273,8 @@ On start, when the output exists and `--overwrite` is not given:
    format cannot be resumed". A file whose `IMAGEDESCRIPTION` does not start
    with `dl_elevation;` was not written by this tool and is refused, before
    anything is allocated, with "was not written by dl_elevation; choose
-   another --output or use --overwrite".
+   another --output or use --overwrite". `load` also rejects a width or
+   height above `INT_MAX` before allocating.
 2. `matches(config)` compares width, height, each box edge within 1e-9
    degrees, and the layer from `IMAGEDESCRIPTION`. Any mismatch is an error
    that lists every differing field and suggests `--overwrite` or a different
@@ -449,13 +451,15 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `(none)`; a hand-written RGB16 TIFF is rejected with the legacy message; a
   hand-written float32 GeoTIFF whose tiepoint has a NaN west edge is rejected
   as an invalid bounding box, and one without the dl_elevation description
-  as not written by dl_elevation; a missing file's error carries libtiff's
-  reason; after `save` no `.tmp` file remains; a `save` whose directory write
-  fails (a file-size limit one byte short of a complete file) throws, leaves
-  no `.tmp` and keeps the previous file loadable with its old values, and so
-  does a `save` whose strip write fails part way (a limit of half the file)
-  or whose temporary file cannot be created (a file-size limit of zero);
-  `todoInRow` and `rowsWithWork` on a half-filled raster.
+  as not written by dl_elevation; a file claiming a width above `INT_MAX` is
+  rejected before anything is allocated; a missing file's error carries
+  libtiff's reason; after `save` no `.tmp` file remains; a `save` whose
+  directory write fails (a file-size limit one byte short of a complete file)
+  throws with the operating system's reason, leaves no `.tmp` and keeps the
+  previous file loadable with its old values, and so does a `save` whose
+  strip write fails part way (a limit of half the file) or whose temporary
+  file cannot be created (a file-size limit of zero); `todoInRow` and
+  `rowsWithWork` on a half-filled raster.
 - **Downloader**: with `FakeFetcher` (value is a function of x and y;
   configurable NoData and failure sets; optional latch to block mid-row) and
   `RecordingSink`: only NaN pixels are fetched; rows without work emit no

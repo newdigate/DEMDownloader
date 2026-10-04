@@ -1786,6 +1786,29 @@ TEST_CASE("a GeoTIFF that dl_elevation did not write is rejected", "[demraster]"
   CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("not written by dl_elevation"));
 }
 
+TEST_CASE("oversized dimensions are rejected before allocation", "[demraster]") {
+  TempDir dir;
+  const auto file = dir.path / "oversized.tif";
+  {
+    // libtiff will not read back a directory without strip offsets, so one four-byte placeholder
+    // strip stands in for the 8 GiB that a single row of this width would take.
+    TIFF* tif = XTIFFOpen(file.string().c_str(), "w");
+    REQUIRE(tif != nullptr);
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 2147483649u);
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 1u);
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 32);
+    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 1u);
+    TIFFSetField(tif, TIFFTAG_IMAGEDESCRIPTION, "dl_elevation;layer=;wms=");
+    float placeholder = 0.0f;
+    REQUIRE(TIFFWriteRawStrip(tif, 0, &placeholder, 4) == 4);
+    XTIFFClose(tif);
+  }
+  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("is too large"));
+}
+
 TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {
   TempDir dir;
   const auto absent = dir.path / "absent.tif";
@@ -1811,6 +1834,7 @@ TEST_CASE("a failed directory write throws and keeps the previous checkpoint", "
   const LimitedSave attempt = saveUnderLimit(r, file, complete - 1);
   REQUIRE(attempt.limited);
   CHECK_THAT(attempt.error, ContainsSubstring("cannot finish writing"));
+  CHECK_THAT(attempt.error, ContainsSubstring("(File too large)"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
@@ -1829,6 +1853,7 @@ TEST_CASE("a failed strip write throws and keeps the previous checkpoint", "[dem
   const LimitedSave attempt = saveUnderLimit(r, file, complete / 2);
   REQUIRE(attempt.limited);
   CHECK_THAT(attempt.error, ContainsSubstring("write failed on row"));
+  CHECK_THAT(attempt.error, ContainsSubstring("(File too large)"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(5, 5) == 12.5f);
@@ -1846,6 +1871,7 @@ TEST_CASE("a checkpoint that cannot be created leaves no temp file behind", "[de
   const LimitedSave attempt = saveUnderLimit(r, file, 0);
   REQUIRE(attempt.limited);
   CHECK_THAT(attempt.error, ContainsSubstring("cannot create"));
+  CHECK_THAT(attempt.error, ContainsSubstring("(File too large)"));
   CHECK_FALSE(std::filesystem::exists(dir.path / "dem.tif.tmp"));
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
@@ -1893,9 +1919,9 @@ struct RasterMetadata {
 // A float32 elevation grid in metres. Row 0 is the north edge, column 0 the west edge.
 // NaN means "no value yet"; kNoData means the server has no elevation there.
 // Threading: set may run concurrently on distinct cells, and nothing else may overlap a set.
-// The first load or save sets libtiff up for the whole process: it registers the GDAL_NODATA tag and
+// The first load or save sets libtiff up for the whole process: it registers the GDAL_NODATA tag,
 // installs an error handler that collects libtiff's errors for the exception messages instead of
-// printing them.
+// printing them, and silences libtiff's warnings.
 class DemRaster {
  public:
   static constexpr float kNoData = -32768.0f;
@@ -1914,7 +1940,8 @@ class DemRaster {
   // Writes <path>.tmp beside the output, syncs it to disk, then renames it over <path>, so a crash
   // mid-write leaves the previous file intact. The rename replaces a symlink at <path> with a regular
   // file, and a single file bind-mounted at <path> cannot be replaced. Throws std::runtime_error on
-  // any failure, with libtiff's explanation appended when it gave one.
+  // any failure, with libtiff's explanation and, for a failed write, the operating system's reason
+  // appended.
   void save(const std::filesystem::path& path) const;
 
   // True when this raster can be resumed for cfg. Otherwise `why` lists every differing field,
@@ -2023,8 +2050,10 @@ class TempFileGuard {
 thread_local std::string lastTiffError;
 
 // Installed in place of libtiff's default handler, which prints to stderr, so that the text reaches
-// the user in an exception message instead of interrupting the progress output.
+// the user in an exception message instead of interrupting the progress output. errno is preserved
+// for the caller, which reports the operating system's reason for a failed write.
 void captureTiffError(const char* module, const char* fmt, va_list ap) {
+  const int savedErrno = errno;
   char text[1024];
   std::vsnprintf(text, sizeof text, fmt, ap);
   try {
@@ -2034,6 +2063,7 @@ void captureTiffError(const char* module, const char* fmt, va_list ap) {
   } catch (...) {
     // Out of memory: the text is lost, but the caller still reports the failure itself.
   }
+  errno = savedErrno;
 }
 
 // Returns the libtiff errors collected on this thread and forgets them.
@@ -2043,10 +2073,13 @@ std::string takeTiffError() {
   return text;
 }
 
-// Throws what, followed by ": <libtiff text>" when libtiff reported errors since the last take.
-[[noreturn]] void fail(const std::string& what) {
-  const std::string text = takeTiffError();
-  throw std::runtime_error(text.empty() ? what : what + ": " + text);
+// Throws what, then ": <libtiff text>" when libtiff reported errors since the last take, then
+// " (<reason>)" when osError, an errno value, is not zero.
+[[noreturn]] void fail(const std::string& what, int osError = 0) {
+  std::string message = what;
+  if (const std::string text = takeTiffError(); !text.empty()) message += ": " + text;
+  if (osError != 0) message += " (" + std::generic_category().message(osError) + ")";
+  throw std::runtime_error(message);
 }
 
 // libtiff does not know the GDAL_NODATA tag: TIFFSetField refuses it and a reader sees an anonymous
@@ -2070,6 +2103,8 @@ void ensureTagsRegistered() {
     XTIFFInitialize();
     g_parentExtender = TIFFSetTagExtender(registerGdalTags);
     TIFFSetErrorHandler(captureTiffError);
+    // Our own files raise no warnings; another program's file would otherwise print them during load.
+    TIFFSetWarningHandler(nullptr);
   });
 }
 
@@ -2180,8 +2215,13 @@ void DemRaster::save(const std::filesystem::path& path) const {
   // Declared before the TIFF handle, so that on failure the file is removed after the handle closes.
   TempFileGuard tmpGuard(tmp);
   {
-    TiffHandle tif(XTIFFOpen(tmp.string().c_str(), "w"));
-    if (!tif) fail("cannot create " + tmp.string());
+    // errno is cleared just before each call that can fail in the operating system and read just
+    // after a failure, so that, for example, a full disk is named as the cause.
+    const std::string tmpName = tmp.string();
+    errno = 0;
+    TiffHandle tif(XTIFFOpen(tmpName.c_str(), "w"));
+    const int openError = errno;
+    if (!tif) fail("cannot create " + tmpName, openError);
     TIFF* t = tif.get();
     // Checked so that a tag libtiff does not know fails the save instead of being left out.
     const auto setField = [&](const char* name, uint32_t tag, auto... values) {
@@ -2229,17 +2269,23 @@ void DemRaster::save(const std::filesystem::path& path) const {
     std::vector<float> row(static_cast<std::size_t>(width_));
     for (int y = 0; y < height_; ++y) {
       std::memcpy(row.data(), &data_[index(0, y)], row.size() * sizeof(float));
+      errno = 0;
       if (TIFFWriteScanline(t, row.data(), static_cast<uint32_t>(y), 0) < 0) {
-        fail("write failed on row " + std::to_string(y) + " of " + tmp.string());
+        const int writeError = errno;
+        fail("write failed on row " + std::to_string(y) + " of " + tmp.string(), writeError);
       }
     }
     // XTIFFClose swallows errors from writing the last strip and the directory. Flushing first
     // surfaces them, so a failed write never reaches the rename and the previous checkpoint survives.
-    if (TIFFFlush(t) != 1) fail("cannot finish writing " + tmp.string());
+    errno = 0;
+    if (TIFFFlush(t) != 1) {
+      const int flushError = errno;
+      fail("cannot finish writing " + tmp.string(), flushError);
+    }
     // The data must be on disk before the rename makes it the checkpoint.
     if (fsync(TIFFFileno(t)) != 0) {
-      const std::string reason = std::generic_category().message(errno);
-      fail("cannot finish writing " + tmp.string() + ": " + reason);
+      const int syncError = errno;
+      fail("cannot finish writing " + tmp.string(), syncError);
     }
   }
   std::error_code ec;
@@ -2319,7 +2365,7 @@ Notes for the engineer: `XTIFFOpen` registers the GeoTIFF tags with libtiff, whi
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[demraster]"`
-Expected: `All tests passed (N assertions in 16 test cases)`.
+Expected: `All tests passed (N assertions in 17 test cases)`.
 
 - [ ] **Step 7: Commit**
 
