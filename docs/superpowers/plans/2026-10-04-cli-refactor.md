@@ -392,6 +392,8 @@ inline demdl::Config exampleConfig() {
 ```cpp
 #include <catch2/catch_test_macros.hpp>
 
+#include <utility>
+
 #include "ExampleConfig.h"
 #include "demdl/Config.h"
 
@@ -410,11 +412,25 @@ TEST_CASE("a URL with a port keeps the port in the origin", "[config]") {
   REQUIRE(ep.has_value());
   CHECK(ep->origin == "http://127.0.0.1:8080");
   CHECK(ep->path == "/wms");
+  // Both ends of the port range, and '-', '_' and '.' inside a host name, are accepted.
+  CHECK(parseWmsUrl("http://a-b.c_d:1/x").has_value());
+  CHECK(parseWmsUrl("https://h:65535").has_value());
+}
+
+TEST_CASE("bracketed IPv6 hosts are accepted", "[config]") {
+  const auto withPort = parseWmsUrl("https://[::1]:8443/wms");
+  REQUIRE(withPort.has_value());
+  CHECK(withPort->origin == "https://[::1]:8443");
+  CHECK(withPort->path == "/wms");
+  const auto withoutPort = parseWmsUrl("http://[2001:db8::1]/wms");
+  REQUIRE(withoutPort.has_value());
+  CHECK(withoutPort->origin == "http://[2001:db8::1]");
 }
 
 TEST_CASE("a URL without a path gets the root path", "[config]") {
   const auto ep = parseWmsUrl("https://host.test");
   REQUIRE(ep.has_value());
+  CHECK(ep->origin == "https://host.test");
   CHECK(ep->path == "/");
 }
 
@@ -427,6 +443,19 @@ TEST_CASE("unsupported or malformed URLs are rejected", "[config]") {
   CHECK_FALSE(parseWmsUrl("https://host test/wms").has_value());
   CHECK_FALSE(parseWmsUrl("https://host.test?x=1").has_value());
   CHECK_FALSE(parseWmsUrl("HTTPS://host.test/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test:abc/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test::8080/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://user:pw@host.test/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test:65536/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("http://127.0.0.1:0/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test/wms?x=1").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test/wms#frag").has_value());
+  CHECK_FALSE(parseWmsUrl("https://[::1/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test:8080:9090/wms").has_value());
+  CHECK_FALSE(parseWmsUrl("https://fe80::1/wms").has_value());
+  // Whitespace and control characters are refused in the path as well as in the host.
+  CHECK_FALSE(parseWmsUrl("https://host.test/a b").has_value());
+  CHECK_FALSE(parseWmsUrl("https://host.test/wms\r\nX: 1").has_value());
 }
 
 TEST_CASE("the example configuration is valid", "[config]") {
@@ -457,6 +486,34 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config output = exampleConfig();
   output.output.clear();
   CHECK(output.validate() == "output path must not be empty");
+
+  Config swapped = exampleConfig();
+  std::swap(swapped.box.north, swapped.box.south);
+  CHECK(swapped.validate() == "north must be greater than south");
+
+  Config layer = exampleConfig();
+  layer.layer.clear();
+  CHECK(layer.validate() == "layer must not be empty");
+
+  Config height = exampleConfig();
+  height.height = -1;
+  CHECK(height.validate() == "width and height must be positive");
+
+  Config manyThreads = exampleConfig();
+  manyThreads.threads = 65;
+  CHECK(manyThreads.validate() == "threads must be at most 64");
+  manyThreads.threads = 64;
+  CHECK(manyThreads.validate().empty());
+
+  Config directory = exampleConfig();
+  directory.output = "out/";
+  CHECK(directory.validate() == "output must name a file");
+
+  // Two faults at once: the grid is checked before the thread count, which pins the check order.
+  Config both = exampleConfig();
+  both.width = 0;
+  both.threads = 0;
+  CHECK(both.validate() == "width and height must be positive");
 }
 ```
 
@@ -495,25 +552,29 @@ Expected: FAIL with `Cannot find source file: src/demdl/Config.cpp` (CMake re-ru
 namespace demdl {
 
 struct WmsEndpoint {
-  std::string origin;  // "https://host[:port]", what httplib::Client is constructed with
-  std::string path;    // "/erdas-iws/ogc/wms/GeoSpatial%20Datasets", kept as given
+  std::string origin;  // "scheme://host[:port]", what httplib::Client is constructed with
+  std::string path;    // whatever followed the authority, as given; "/" when the URL had none
 };
 
-// Splits "scheme://host[:port]/path". nullopt unless the scheme is http or https and a host is present.
-std::optional<WmsEndpoint> parseWmsUrl(const std::string& url);
+// Splits "scheme://host[:port][/path]". The scheme is http or https (case-sensitive), the host is a
+// hostname (A-Za-z0-9._-) or a bracketed IPv6 literal, and the port, if given, is 1 to 65535.
+// Userinfo, queries, fragments, whitespace and control characters are refused, and so is anything
+// else that does not fit: the result is then nullopt.
+[[nodiscard]] std::optional<WmsEndpoint> parseWmsUrl(const std::string& url);
 
-// Every runtime option. Mirrors the command-line flags one to one; no parsing lives here.
+// Every runtime option, mirroring the command-line flags one to one.
+// No command-line parsing lives here.
 struct Config {
   BoundingBox box;
   int width = 0;
   int height = 0;
-  std::filesystem::path output;
+  std::filesystem::path output;  // relative to the current directory; must name a file
   std::string wmsUrl = "https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets";
   std::string layer = "Elevation_CCT_GLM2019_5m_DEM";
-  int threads = 8;
-  int maxRetries = 8;
+  int threads = 8;     // capped at 64 to go easy on a public server
+  int maxRetries = 8;  // retries after the first attempt; 0 means a single attempt
   int maxConsecutiveFailures = 100;
-  std::string caBundle;
+  std::string caBundle;  // empty means the system trust store; no effect when insecure is set
   bool insecure = false;
   bool preview = false;
   bool overwrite = false;
@@ -532,24 +593,85 @@ struct Config {
 ```cpp
 #include "demdl/Config.h"
 
+#include <cstddef>
+
 namespace demdl {
 
+namespace {
+
+// The character tests are ASCII only, so the result does not depend on the locale.
+bool isDigit(char c) { return c >= '0' && c <= '9'; }
+
+bool isHexDigit(char c) { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+// One or more characters from A-Za-z0-9._-
+bool isHostname(const std::string& host) {
+  if (host.empty()) return false;
+  for (const char c : host) {
+    const bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    if (!letter && !isDigit(c) && c != '.' && c != '_' && c != '-') return false;
+  }
+  return true;
+}
+
+// "[", one or more hex digits or colons, "]".
+bool isIpv6Literal(const std::string& host) {
+  if (host.size() < 3 || host.front() != '[' || host.back() != ']') return false;
+  for (std::size_t i = 1; i + 1 < host.size(); ++i) {
+    if (!isHexDigit(host[i]) && host[i] != ':') return false;
+  }
+  return true;
+}
+
+// 1 to 5 decimal digits with a value from 1 to 65535.
+bool isPort(const std::string& text) {
+  if (text.empty() || text.size() > 5) return false;
+  int value = 0;
+  for (const char c : text) {
+    if (!isDigit(c)) return false;
+    value = value * 10 + (c - '0');
+  }
+  return value >= 1 && value <= 65535;
+}
+
+// "host" or "host:port". The port follows the first ':' that is not inside the brackets of an
+// IPv6 literal.
+bool isAuthority(const std::string& authority) {
+  std::size_t hostEnd = 0;
+  if (!authority.empty() && authority.front() == '[') {
+    const auto close = authority.find(']');
+    if (close == std::string::npos) return false;
+    hostEnd = close + 1;
+  } else {
+    hostEnd = authority.find(':');
+    if (hostEnd == std::string::npos) hostEnd = authority.size();
+  }
+  const std::string host = authority.substr(0, hostEnd);
+  if (!isIpv6Literal(host) && !isHostname(host)) return false;
+  if (hostEnd == authority.size()) return true;
+  return authority[hostEnd] == ':' && isPort(authority.substr(hostEnd + 1));
+}
+
+}  // namespace
+
 std::optional<WmsEndpoint> parseWmsUrl(const std::string& url) {
+  // Grammar: "http" or "https", "://", a host with an optional ":port", then nothing or a path
+  // starting with "/". The client appends its own query to the path, so a query or fragment in the
+  // URL is refused, as are userinfo, whitespace and control characters.
+  for (const char c : url) {
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte <= 0x20 || byte == 0x7F || c == '?' || c == '#') return std::nullopt;
+  }
   const auto schemeEnd = url.find("://");
   if (schemeEnd == std::string::npos) return std::nullopt;
   const std::string scheme = url.substr(0, schemeEnd);
   if (scheme != "http" && scheme != "https") return std::nullopt;
   const std::string rest = url.substr(schemeEnd + 3);
   const auto slash = rest.find('/');
-  const std::string hostPort = rest.substr(0, slash);
-  // The authority must be a non-empty host with an optional port. A query or fragment without a
-  // path is refused rather than swallowed into the origin.
-  if (hostPort.empty() || hostPort.front() == ':' || hostPort.back() == ':' ||
-      hostPort.find_first_of(" \t?#") != std::string::npos) {
-    return std::nullopt;
-  }
+  const std::string authority = rest.substr(0, slash);
+  if (!isAuthority(authority)) return std::nullopt;
   WmsEndpoint ep;
-  ep.origin = scheme + "://" + hostPort;
+  ep.origin = scheme + "://" + authority;
   ep.path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
   return ep;
 }
@@ -558,11 +680,13 @@ std::string Config::validate() const {
   if (const std::string err = box.validate(); !err.empty()) return err;
   if (width <= 0 || height <= 0) return "width and height must be positive";
   if (output.empty()) return "output path must not be empty";
+  if (!output.has_filename()) return "output must name a file";
   if (!parseWmsUrl(wmsUrl)) {
     return "wms-url must look like scheme://host[:port]/path with scheme http or https";
   }
   if (layer.empty()) return "layer must not be empty";
   if (threads < 1) return "threads must be at least 1";
+  if (threads > 64) return "threads must be at most 64";
   if (maxRetries < 0) return "max-retries must be at least 0";
   if (maxConsecutiveFailures < 1) return "max-consecutive-failures must be at least 1";
   return {};
@@ -574,7 +698,7 @@ std::string Config::validate() const {
 - [ ] **Step 7: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[config]"`
-Expected: `All tests passed (N assertions in 6 test cases)`.
+Expected: `All tests passed (N assertions in 7 test cases)`.
 
 - [ ] **Step 8: Commit**
 

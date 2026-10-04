@@ -110,9 +110,12 @@ compares each edge with an absolute tolerance. This replaces the current code,
 in which the variable named `north` holds the smaller latitude.
 
 **Config** is a struct mirroring the flags in section 5 plus `validate()`,
-which checks the box, positive grid size, `threads >= 1`,
-`maxRetries >= 0`, `maxConsecutiveFailures >= 1`, and that the WMS URL parses
-as `scheme://host[:port]/path`. No parsing library appears in the library.
+which checks the box, positive grid size, `threads` between 1 and 64,
+`maxRetries >= 0`, `maxConsecutiveFailures >= 1`, that the output path names
+a file, and that the WMS URL parses as `scheme://host[:port]/path`. The scheme
+is `http` or `https`, the host is a hostname or a bracketed IPv6 literal, the
+port is 1 to 65535, and userinfo, queries, fragments and whitespace are
+refused. No parsing library appears in the library.
 
 **WmsQuery** has two free functions.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
