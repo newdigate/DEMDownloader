@@ -56,7 +56,8 @@ add_library(demdl STATIC
   src/demdl/BoundingBox.cpp
   src/demdl/Config.cpp
   src/demdl/WmsQuery.cpp
-  src/demdl/RetryPolicy.cpp)
+  src/demdl/RetryPolicy.cpp
+  src/demdl/DemRaster.cpp)
 target_include_directories(demdl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${GEOTIFF_INCLUDE_DIR})
 target_include_directories(demdl SYSTEM PRIVATE ${ctpl_SOURCE_DIR})
 # httplib::httplib exists on both paths: the Homebrew package only exports the
@@ -75,7 +76,8 @@ if(DL_ELEVATION_TESTS)
     tests/test_BoundingBox.cpp
     tests/test_Config.cpp
     tests/test_WmsQuery.cpp
-    tests/test_RetryPolicy.cpp)
+    tests/test_RetryPolicy.cpp
+    tests/test_DemRaster.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
   catch_discover_tests(demdl_tests)
