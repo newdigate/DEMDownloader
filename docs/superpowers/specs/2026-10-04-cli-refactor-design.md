@@ -121,9 +121,10 @@ refused. No parsing library appears in the library.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
-`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins: a finite
-number after it is a `Value`, anything else (`nan` and `inf` included) is a
-`ParseError`. Without the marker the body is `NoData` only when it does not
+`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins: a number
+after it is a `Value` only when it is finite and within float range, because
+the raster stores float32; anything else (no number, `nan`, `inf`, `1e300`) is
+a `ParseError`. Without the marker the body is `NoData` only when it does not
 contain `ServiceException`. WMS servers often report a fault, such as a wrong
 layer name, as HTTP 200 with an XML `ServiceExceptionReport`; that body is a
 `ParseError`, so it is retried and never recorded as a permanent NoData.
@@ -404,9 +405,10 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   1.3.0 requires for EPSG:4326); a layer name with spaces is percent-encoded,
   and so are non-ASCII bytes (`\xC3\xA9` gives `%C3%A9`); parsing of
   `BAND 0: 123.45`, `BAND 0: -1.5`, `BAND 0: 1086.25`, a body without the
-  marker (NoData), `BAND 0: abc`, `BAND 0: nan`, `BAND 0: inf` and
-  `BAND 0: -inf` (all ParseError), and a `ServiceException` body (ParseError,
-  unless the band marker is also present, which wins).
+  marker (NoData), `BAND 0: abc`, `BAND 0: nan`, `BAND 0: inf`,
+  `BAND 0: -inf`, `BAND 0: 1e300` and `BAND 0: -1e300` (all ParseError; the
+  last two are outside float range), and a `ServiceException` body
+  (ParseError, unless the band marker is also present, which wins).
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp

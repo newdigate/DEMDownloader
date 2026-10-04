@@ -28,7 +28,8 @@ std::string featureInfoUrl(const Config& cfg, int x, int y);
 // marker, a body containing "ServiceException" (an XML exception report, which WMS servers send
 // with HTTP 200 for faults such as an unknown layer) is ParseError so that the caller retries it;
 // any other body is NoData. A marker without a parseable number is ParseError, and so is a
-// non-finite one such as "nan" or "inf".
+// non-finite one such as "nan" or "inf" and one outside float range, because the raster stores
+// float32; a Value therefore always fits in a float.
 ParseResult parseElevation(std::string_view body);
 
 }  // namespace demdl

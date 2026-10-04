@@ -807,6 +807,8 @@ TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: nan").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: inf").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: -inf").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: 1e300").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: -1e300").kind == ParseResult::Kind::ParseError);
 }
 ```
 
@@ -864,7 +866,8 @@ std::string featureInfoUrl(const Config& cfg, int x, int y);
 // marker, a body containing "ServiceException" (an XML exception report, which WMS servers send
 // with HTTP 200 for faults such as an unknown layer) is ParseError so that the caller retries it;
 // any other body is NoData. A marker without a parseable number is ParseError, and so is a
-// non-finite one such as "nan" or "inf".
+// non-finite one such as "nan" or "inf" and one outside float range, because the raster stores
+// float32; a Value therefore always fits in a float.
 ParseResult parseElevation(std::string_view body);
 
 }  // namespace demdl
@@ -878,6 +881,7 @@ ParseResult parseElevation(std::string_view body);
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 namespace demdl {
@@ -948,8 +952,11 @@ ParseResult parseElevation(std::string_view body) {
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
-  // unfetched pixel and be requested again on every run.
-  if (end == begin || !std::isfinite(value)) return {ParseResult::Kind::ParseError, 0.0};
+  // unfetched pixel and be requested again on every run. The raster stores float32, so a value
+  // outside float range is refused too: cast to float it would become infinity.
+  if (end == begin || !std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
+    return {ParseResult::Kind::ParseError, 0.0};
+  }
   return {ParseResult::Kind::Value, value};
 }
 

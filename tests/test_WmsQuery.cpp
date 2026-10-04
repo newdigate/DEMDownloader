@@ -83,4 +83,6 @@ TEST_CASE("a band marker without a number is a parse error", "[wmsquery]") {
   CHECK(parseElevation("BAND 0: nan").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: inf").kind == ParseResult::Kind::ParseError);
   CHECK(parseElevation("BAND 0: -inf").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: 1e300").kind == ParseResult::Kind::ParseError);
+  CHECK(parseElevation("BAND 0: -1e300").kind == ParseResult::Kind::ParseError);
 }

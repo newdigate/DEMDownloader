@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 namespace demdl {
@@ -73,8 +74,11 @@ ParseResult parseElevation(std::string_view body) {
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
-  // unfetched pixel and be requested again on every run.
-  if (end == begin || !std::isfinite(value)) return {ParseResult::Kind::ParseError, 0.0};
+  // unfetched pixel and be requested again on every run. The raster stores float32, so a value
+  // outside float range is refused too: cast to float it would become infinity.
+  if (end == begin || !std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
+    return {ParseResult::Kind::ParseError, 0.0};
+  }
   return {ParseResult::Kind::Value, value};
 }
 
