@@ -71,6 +71,11 @@ target_link_libraries(demdl PUBLIC httplib::httplib TIFF::TIFF ${GEOTIFF_LIBRARY
 target_compile_options(demdl PRIVATE -Wall -Wextra)
 target_compile_definitions(demdl PUBLIC DL_ELEVATION_VERSION="${PROJECT_VERSION}")
 
+# Cli.cpp is compiled once and shared by the executable and the tests.
+add_library(demdl_cli OBJECT src/app/Cli.cpp)
+target_link_libraries(demdl_cli PUBLIC demdl CLI11::CLI11)
+target_compile_options(demdl_cli PRIVATE -Wall -Wextra)
+
 if(DL_ELEVATION_TESTS)
   enable_testing()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
@@ -84,8 +89,9 @@ if(DL_ELEVATION_TESTS)
     tests/test_StopToken.cpp
     tests/test_Downloader.cpp
     tests/test_ElevationClient.cpp
-    tests/test_ConsoleReporter.cpp)
-  target_link_libraries(demdl_tests PRIVATE demdl Catch2::Catch2WithMain)
+    tests/test_ConsoleReporter.cpp
+    tests/test_Cli.cpp)
+  target_link_libraries(demdl_tests PRIVATE demdl demdl_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
   catch_discover_tests(demdl_tests)
 endif()

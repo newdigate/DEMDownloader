@@ -248,16 +248,19 @@ CLI11; the version string is the CMake project version, starting at 0.2.0.
 | `--width`, `--height` | yes | | grid size in pixels |
 | `--output PATH`, `-o` | yes | | GeoTIFF path, relative to the current directory |
 | `--wms-url URL` | no | `https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets` | scheme, host and path of the WMS endpoint |
-| `--layer NAME` | no | `Elevation_CCT_GLM2019_5m_DEM` | WMS layer, used for both `LAYERS` and `QUERY_LAYERS` |
+| `--layer NAME` | no | `Elevation_CCT_GLM2019_5m_DEM` | WMS layer name, taken unencoded; used for `LAYERS` and `QUERY_LAYERS` |
 | `--threads N` | no | 8 | worker threads (1..64), one keep-alive connection each |
 | `--max-retries N` | no | 8 | retries per pixel after the first attempt (0..100) |
-| `--max-consecutive-failures N` | no | 100 | pixels failing in a row before the run stops |
-| `--ca-bundle PATH` | no | unset | PEM bundle for certificate verification |
-| `--insecure` | no | off | disable certificate verification |
-| `--preview` | no | off | open the OpenGL window; error if built without preview support |
+| `--max-consecutive-failures N` | no | 100 | stop after this many pixels fail in a row (at least 1) |
+| `--ca-bundle PATH` | no | unset | PEM bundle for certificate verification (file must exist; excludes `--insecure`) |
+| `--insecure` | no | off | disable certificate verification (excludes `--ca-bundle`) |
+| `--preview` | no | off | open the OpenGL preview window (fails if built without preview support) |
 | `--overwrite` | no | off | ignore an existing output and start fresh |
 | `--dry-run` | no | off | validate, report the plan, make no requests, write nothing |
 | `--verbose` | no | off | log every pixel in addition to every row |
+
+CLI11 converts integer values with `std::strtoll` in base 0, so a leading `0`
+makes a value octal (`--width 0100` is 64) and `0x` makes it hexadecimal.
 
 Example, today's Simon's Town run with the latitude names corrected:
 
@@ -663,8 +666,18 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   in verbose mode flush nothing. Four threads posting 1000 verbose events each
   produce exactly the 4000 expected lines, none interleaved.
 - **Cli**: the example argv yields the expected Config; omitting `--north`
-  fails; `--insecure` and `--ca-bundle` set their fields; `--threads 0`
-  fails validation.
+  is a usage error (exit 1) whose message names the flag; `--help` exits 0
+  and lists `--wms-url`, `--max-consecutive-failures` and the ranges
+  `(1..64)` and `(0..100)`; `--version` exits 0 and prints the project
+  version; the network and mode flags with `--insecure` set their fields
+  and leave `caBundle` empty; `--ca-bundle` naming a file created in a
+  temporary directory sets `caBundle` to that path, and a path that does
+  not exist is a usage error naming the flag and the path; `--insecure`
+  with an existing `--ca-bundle` is a usage error reading
+  `--ca-bundle excludes --insecure`; `--threads abc` is a usage error
+  naming `--threads`; `--width 0100` gives 64 and `--width 0x10` gives 16,
+  pinning CLI11's base-0 integer conversion; and `--threads 0` parses but
+  fails `Config::validate` with `threads must be at least 1`.
 
 `PreviewWindow` and the real server are not tested.
 
