@@ -53,12 +53,14 @@
 | `src/demdl/ConsoleReporter.h/.cpp` | headless sink, `formatDuration` | 10 |
 | `src/app/Cli.h/.cpp` | `parseArgs` with CLI11 | 11 |
 | `src/app/main.cpp` | wiring, signals, dry run, exit codes | 12 |
+| `src/app/ExitCodes.h` | exit codes and the run-summary mapping | 12 |
 | `src/preview/Shader.h` | trimmed GL shader helper | 13 |
 | `src/preview/PreviewWindow.h/.cpp` | GLFW sink | 13 |
 | `tests/ExampleConfig.h` | the Simon's Town Config used by several tests | 2 |
 | `tests/TempDir.h` | RAII temporary directory | 6 |
 | `tests/FakeFetcher.h`, `tests/RecordingSink.h` | test doubles | 7 |
 | `tests/test_*.cpp` | one per unit | the unit's task |
+| `tests/test_EndToEnd.cpp` | the executable against a loopback WMS | 12 |
 | `CLAUDE.md` | rewritten for the new layout | 14 |
 | deleted: `main.cpp`, `include/`, `opengl.cmake.in` | | 14 |
 
@@ -5552,13 +5554,484 @@ git commit -m "feat: CLI11 argument parsing into Config" -m "Co-Authored-By: Cla
 
 ### Task 12: main and the executable
 
-Implements spec sections 9 and 10 (wiring, signals, dry run, exit codes). The preview hooks are included behind `#ifdef DL_ELEVATION_HAVE_PREVIEW` now so Task 13 only adds a target. Deviation 5 applies.
+Implements spec sections 9 and 10 (wiring, signals, dry run, exit codes) and the `[exitcodes]` and `[e2e]` tests of section 11. The preview hooks are included behind `#ifdef DL_ELEVATION_HAVE_PREVIEW` now so Task 13 only adds a target. Deviation 5 applies: `main` polls the stop token every 100 ms and writes the `stopping: ...` line to stderr.
+
+The end-to-end tests are the only checks of the whole pipeline. They run the built executable against a WMS on a loopback port; nothing in this task contacts the real server.
 
 **Files:**
+- Create: `src/app/ExitCodes.h`
 - Create: `src/app/main.cpp`
-- Modify: `CMakeLists.txt` (new executable target)
+- Create: `tests/test_ExitCodes.cpp`
+- Create: `tests/test_EndToEnd.cpp`
+- Modify: `CMakeLists.txt` (new executable target; the two test sources, the tests' dependency on the executable and its path)
 
-- [ ] **Step 1: Add the executable to CMake**
+- [ ] **Step 1: Write the failing test `tests/test_ExitCodes.cpp`**
+
+```cpp
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+
+#include <cstdint>
+#include <vector>
+
+#include "app/ExitCodes.h"
+#include "demdl/ProgressSink.h"
+
+using demdl::RunSummary;
+using demdl::StopReason;
+using demdl::cli::exitCodeFor;
+using demdl::cli::kExitComplete;
+using demdl::cli::kExitIncomplete;
+using demdl::cli::kExitSecondSignal;
+using demdl::cli::kExitStopped;
+using demdl::cli::kExitUsage;
+
+namespace {
+
+// Every combination of the fields exitCodeFor reads, each with and without pixels left and failures.
+std::vector<RunSummary> everySummaryShape() {
+  std::vector<RunSummary> shapes;
+  for (const StopReason reason : {StopReason::None, StopReason::Signal, StopReason::WindowClosed,
+                                  StopReason::ConsecutiveFailures, StopReason::WriteError}) {
+    for (const std::uint64_t remaining : {std::uint64_t{0}, std::uint64_t{3}}) {
+      for (const std::uint64_t failed : {std::uint64_t{0}, std::uint64_t{3}}) {
+        for (const bool writeFailed : {false, true}) {
+          RunSummary s;
+          s.remainingNaN = remaining;
+          s.failed = failed;
+          s.stopReason = reason;
+          s.checkpointWriteFailed = writeFailed;
+          shapes.push_back(s);
+        }
+      }
+    }
+  }
+  return shapes;
+}
+
+}  // namespace
+
+// One case per row of the exit-code table in spec section 10, then the checkpoint-write rule.
+
+TEST_CASE("a run that leaves no NaN pixel exits 0", "[exitcodes]") {
+  STATIC_REQUIRE(kExitComplete == 0);
+  RunSummary s;
+  s.pixelsFetched = 500;
+  s.rowsSaved = 5;
+  CHECK(exitCodeFor(s) == kExitComplete);
+  // A stop requested after the last row was saved leaves the file complete all the same.
+  s.stopReason = StopReason::Signal;
+  CHECK(exitCodeFor(s) == kExitComplete);
+}
+
+TEST_CASE("a usage or configuration error is exit code 1, which no run summary maps to", "[exitcodes]") {
+  STATIC_REQUIRE(kExitUsage == 1);
+  for (const RunSummary& s : everySummaryShape()) CHECK(exitCodeFor(s) != kExitUsage);
+}
+
+TEST_CASE("a run stopped early with pixels left exits 2 whatever stopped it", "[exitcodes]") {
+  STATIC_REQUIRE(kExitStopped == 2);
+  const StopReason reason = GENERATE(StopReason::Signal, StopReason::WindowClosed,
+                                     StopReason::ConsecutiveFailures, StopReason::WriteError);
+  RunSummary s;
+  s.pixelsFetched = 300;
+  s.rowsSaved = 3;
+  s.remainingNaN = 200;
+  s.stopReason = reason;
+  s.checkpointWriteFailed = reason == StopReason::WriteError;  // as the Downloader reports a failed save
+  CHECK(exitCodeFor(s) == kExitStopped);
+}
+
+TEST_CASE("a run that reaches the end with failed pixels exits 3", "[exitcodes]") {
+  STATIC_REQUIRE(kExitIncomplete == 3);
+  RunSummary s;
+  s.pixelsFetched = 497;
+  s.failed = 3;
+  s.remainingNaN = 3;
+  s.rowsSaved = 5;
+  CHECK(exitCodeFor(s) == kExitIncomplete);
+}
+
+TEST_CASE("a second interrupt is exit code 130, which no run summary maps to", "[exitcodes]") {
+  STATIC_REQUIRE(kExitSecondSignal == 130);
+  for (const RunSummary& s : everySummaryShape()) CHECK(exitCodeFor(s) != kExitSecondSignal);
+}
+
+TEST_CASE("a failed checkpoint write exits 2 even when no NaN pixel is counted", "[exitcodes]") {
+  RunSummary s;
+  s.pixelsFetched = 500;
+  s.remainingNaN = 0;
+  s.stopReason = StopReason::WriteError;
+  s.checkpointWriteFailed = true;
+  CHECK(exitCodeFor(s) == kExitStopped);
+}
+
+TEST_CASE("a failed checkpoint write after a signal exits 2", "[exitcodes]") {
+  // The signal came first and stays the recorded reason. With pixels left the reason alone gives 2;
+  // with none counted, only the write failure does.
+  RunSummary s;
+  s.remainingNaN = GENERATE(as<std::uint64_t>{}, 0, 200);
+  s.stopReason = StopReason::Signal;
+  s.checkpointWriteFailed = true;
+  CHECK(exitCodeFor(s) == kExitStopped);
+}
+```
+
+- [ ] **Step 2: Write the failing test `tests/test_EndToEnd.cpp`**
+
+The test starts the executable with `posix_spawn` and serves it from an `httplib::Server` on 127.0.0.1. A request the server holds at a `Gate` stays in flight until the test releases it, so the signal cases wait for the state they need instead of relying on timing: with a fixed response delay, whether `main`'s 100 ms poll sees the stop before the run ends depends on how the delay lines up with the poll.
+
+```cpp
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <httplib.h>
+
+#include <atomic>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <thread>
+#include <vector>
+
+#include "FakeFetcher.h"  // Gate
+#include "TempDir.h"
+#include "demdl/DemRaster.h"
+
+extern char** environ;
+
+using namespace std::chrono_literals;
+using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::StartsWith;
+using demdl::DemRaster;
+
+namespace {
+
+// The dl_elevation built by this CMake tree. These tests point it at a loopback server only.
+const char* const kExecutable = DL_ELEVATION_EXE;
+
+// How long a child may run, and how long a test waits for anything it expects of one.
+constexpr std::chrono::seconds kDeadline{20};
+
+// Pixel (I, J) as one number, for the server's settings.
+constexpr int pixelKey(int i, int j) { return i * 1000 + j; }
+
+// The whole of `text` as a non-negative int, otherwise -1.
+int parseIndex(const std::string& text) {
+  int value = -1;
+  const char* const end = text.data() + text.size();
+  const auto [ptr, ec] = std::from_chars(text.data(), end, value);
+  return ec == std::errc() && ptr == end && value >= 0 ? value : -1;
+}
+
+// A WMS on a loopback port. GetFeatureInfo for pixel (I, J) answers "BAND 0: <I*10+J>", except at the
+// NoData pixel, which gets a plain body without a band, and at the failing pixel, which gets a 500.
+// Requests are counted as they arrive. Every request after the first `holdAfter` waits at `gate` until
+// the test releases it, which keeps requests in flight for as long as a test needs; once released, the
+// gate stays open.
+struct LoopbackWms {
+  httplib::Server server;
+  std::thread thread;
+  int port = 0;
+  std::atomic<int> requests{0};
+  std::atomic<int> noDataPixel{-1};   // a pixelKey, or -1 for none
+  std::atomic<int> failingPixel{-1};  // a pixelKey, or -1 for none
+  std::atomic<int> holdAfter{-1};     // -1 holds nothing
+  Gate gate;
+
+  LoopbackWms() {
+    server.Get("/wms", [this](const httplib::Request& req, httplib::Response& res) { respond(req, res); });
+    port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    thread = std::thread([this] { server.listen_after_bind(); });
+    server.wait_until_ready();
+  }
+  ~LoopbackWms() {
+    gate.release();  // a held request would keep stop() waiting
+    server.stop();
+    thread.join();
+  }
+  LoopbackWms(const LoopbackWms&) = delete;
+  LoopbackWms& operator=(const LoopbackWms&) = delete;
+
+  void respond(const httplib::Request& req, httplib::Response& res) {
+    const int arrived = ++requests;
+    const int hold = holdAfter.load();
+    if (hold >= 0 && arrived > hold) gate.wait();
+    const int i = parseIndex(req.get_param_value("I"));
+    const int j = parseIndex(req.get_param_value("J"));
+    if (i < 0 || j < 0) {
+      res.status = 400;
+    } else if (pixelKey(i, j) == failingPixel.load()) {
+      res.status = 500;
+    } else if (pixelKey(i, j) == noDataPixel.load()) {
+      res.set_content("GetFeatureInfo results:\n", "text/plain");
+    } else {
+      res.set_content("GetFeatureInfo results:\nBAND 0: " + std::to_string(i * 10 + j) + "\n", "text/plain");
+    }
+  }
+
+  std::string url() const { return "http://127.0.0.1:" + std::to_string(port) + "/wms"; }
+};
+
+std::string readFile(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// What a child left behind once it exited.
+struct Finished {
+  int status = -1;  // the exit code, or minus the number of the signal that ended the process
+  std::string out;
+  std::string err;
+};
+
+// dl_elevation started with `args`, stdin from /dev/null, stdout and stderr to files in `dir`. SIGINT and
+// SIGTERM start at their default actions and unblocked, whatever this process has, so main's handlers
+// alone decide what a signal does. A child still running when the object goes away is killed.
+class Child {
+ public:
+  Child(const std::vector<std::string>& args, const std::filesystem::path& dir)
+      : outPath_(dir / "stdout.txt"), errPath_(dir / "stderr.txt") {
+    std::vector<char*> argv{const_cast<char*>(kExecutable)};
+    for (const std::string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    REQUIRE(posix_spawn_file_actions_init(&actions) == 0);
+    REQUIRE(posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0);
+    REQUIRE(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, outPath_.c_str(),
+                                             O_WRONLY | O_CREAT | O_TRUNC, 0644) == 0);
+    REQUIRE(posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, errPath_.c_str(),
+                                             O_WRONLY | O_CREAT | O_TRUNC, 0644) == 0);
+    posix_spawnattr_t attributes;
+    REQUIRE(posix_spawnattr_init(&attributes) == 0);
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGINT);
+    sigaddset(&defaults, SIGTERM);
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    int flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    // macOS: only the three descriptors above reach the child, not the server's accepted sockets.
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    REQUIRE(posix_spawnattr_setsigdefault(&attributes, &defaults) == 0);
+    REQUIRE(posix_spawnattr_setsigmask(&attributes, &unblocked) == 0);
+    REQUIRE(posix_spawnattr_setflags(&attributes, static_cast<short>(flags)) == 0);
+    const int spawned = posix_spawn(&pid_, kExecutable, &actions, &attributes, argv.data(), environ);
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    REQUIRE(spawned == 0);
+  }
+  ~Child() {
+    if (pid_ > 0) {
+      kill(pid_, SIGKILL);
+      waitpid(pid_, nullptr, 0);
+    }
+  }
+  Child(const Child&) = delete;
+  Child& operator=(const Child&) = delete;
+
+  const std::filesystem::path& errPath() const { return errPath_; }
+
+  void signal(int number) const { REQUIRE(kill(pid_, number) == 0); }
+
+  // Waits for the child to exit. Past kDeadline it kills the child and fails the test.
+  Finished wait() {
+    const auto deadline = std::chrono::steady_clock::now() + kDeadline;
+    int status = 0;
+    for (;;) {
+      const pid_t done = waitpid(pid_, &status, WNOHANG);
+      const int waitError = errno;
+      if (done == pid_) break;
+      if (done < 0 && waitError != EINTR) FAIL("waitpid failed: " << std::generic_category().message(waitError));
+      if (std::chrono::steady_clock::now() > deadline) {
+        kill(pid_, SIGKILL);
+        waitpid(pid_, &status, 0);
+        pid_ = -1;
+        FAIL("dl_elevation did not exit within " << kDeadline.count() << " s; stderr:\n" << readFile(errPath_));
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    pid_ = -1;
+    return {WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status), readFile(outPath_), readFile(errPath_)};
+  }
+
+ private:
+  std::filesystem::path outPath_;
+  std::filesystem::path errPath_;
+  pid_t pid_ = -1;
+};
+
+Finished runToExit(const std::vector<std::string>& args, const std::filesystem::path& dir) {
+  Child child(args, dir);
+  return child.wait();
+}
+
+// Polls `path` until it contains `text`; false once kDeadline has passed.
+bool awaitText(const std::filesystem::path& path, std::string_view text) {
+  const auto deadline = std::chrono::steady_clock::now() + kDeadline;
+  while (readFile(path).find(text) == std::string::npos) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(10ms);
+  }
+  return true;
+}
+
+// The example box on a width x height grid, fetched from `wms` into `output`, followed by `extra`.
+std::vector<std::string> commandLine(const LoopbackWms& wms, const std::filesystem::path& output, int width,
+                                     int height, const std::vector<std::string>& extra) {
+  std::vector<std::string> args{"--north", "-34.1845418", "--south", "-34.2163447", "--west", "18.4185791",
+                                "--east", "18.4625244", "--width", std::to_string(width), "--height",
+                                std::to_string(height), "--output", output.string(), "--wms-url", wms.url()};
+  args.insert(args.end(), extra.begin(), extra.end());
+  return args;
+}
+
+// Every pixel of the file holds I*10+J, except kNoData at `noData` and NaN at `failed` (pixelKeys, or -1).
+void checkPixels(const std::filesystem::path& path, int width, int height, int noData, int failed) {
+  const DemRaster raster = DemRaster::load(path);
+  REQUIRE(raster.width() == width);
+  REQUIRE(raster.height() == height);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      CAPTURE(x, y);
+      const float value = raster.at(x, y);
+      if (pixelKey(x, y) == noData) {
+        CHECK(value == DemRaster::kNoData);
+      } else if (pixelKey(x, y) == failed) {
+        CHECK(std::isnan(value));
+      } else {
+        CHECK(value == static_cast<float>(x * 10 + y));
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("a full run fills the file, keeps NoData and leaves a failed pixel NaN", "[e2e]") {
+  LoopbackWms wms;
+  wms.noDataPixel = pixelKey(1, 2);
+  wms.failingPixel = pixelKey(3, 1);
+  const TempDir dir;
+  const std::filesystem::path output = dir.path / "dem.tif";
+  const Finished result = runToExit(commandLine(wms, output, 4, 3, {"--threads", "2", "--max-retries", "0"}), dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.status == 3);
+  for (const char* line : {"starting:", "row 1/3", "row 2/3", "row 3/3", "done:", "retry the 1 failed pixel"}) {
+    CHECK_THAT(result.out, ContainsSubstring(line));
+  }
+  CHECK_THAT(result.err, ContainsSubstring("warning: first failed request: http 500 (not retried)"));
+  CHECK(wms.requests.load() == 12);  // one attempt per pixel
+  checkPixels(output, 4, 3, pixelKey(1, 2), pixelKey(3, 1));
+}
+
+TEST_CASE("a rerun requests only the failed pixel and completes the file", "[e2e]") {
+  LoopbackWms wms;
+  wms.noDataPixel = pixelKey(1, 2);
+  wms.failingPixel = pixelKey(3, 1);
+  const TempDir dir;
+  const std::filesystem::path output = dir.path / "dem.tif";
+  const std::vector<std::string> args = commandLine(wms, output, 4, 3, {"--threads", "2", "--max-retries", "0"});
+  REQUIRE(runToExit(args, dir.path).status == 3);
+
+  wms.failingPixel = -1;
+  wms.requests = 0;
+  const Finished rerun = runToExit(args, dir.path);
+  INFO("stdout:\n" << rerun.out << "stderr:\n" << rerun.err);
+  CHECK(rerun.status == 0);
+  CHECK(wms.requests.load() == 1);  // NoData is final, and every other pixel already has its value
+  checkPixels(output, 4, 3, pixelKey(1, 2), -1);
+}
+
+TEST_CASE("a dry run prints the plan, makes no request and writes nothing", "[e2e]") {
+  LoopbackWms wms;
+  const TempDir dir;
+  const std::filesystem::path output = dir.path / "dem.tif";
+  const Finished result = runToExit(commandLine(wms, output, 4, 3, {"--dry-run"}), dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.status == 0);
+  CHECK_THAT(result.out, StartsWith("dry run"));
+  CHECK_THAT(result.out, ContainsSubstring("  first request: " + wms.url() + "?SERVICE=WMS&"));
+  CHECK(wms.requests.load() == 0);
+  CHECK_FALSE(std::filesystem::exists(output));
+}
+
+TEST_CASE("SIGINT stops the run after the requests in flight, and a rerun completes the file", "[e2e]") {
+  LoopbackWms wms;
+  wms.holdAfter = 10;
+  const TempDir dir;
+  const std::filesystem::path output = dir.path / "dem.tif";
+  const std::vector<std::string> args = commandLine(wms, output, 16, 8, {"--threads", "2"});
+  {
+    Child child(args, dir.path);
+    // Ten requests are answered and the eleventh is held, so the run cannot end before main, which polls
+    // every 100 ms, has seen the stop and announced it. A fixed response delay would race that poll.
+    REQUIRE(wms.gate.awaitArrivals(1, kDeadline));
+    child.signal(SIGINT);
+    REQUIRE(awaitText(child.errPath(), "stopping: interrupted; waiting for "));
+    wms.gate.release();
+    const Finished stopped = child.wait();
+    INFO("stdout:\n" << stopped.out << "stderr:\n" << stopped.err);
+    CHECK(stopped.status == 2);
+    CHECK_THAT(stopped.out, ContainsSubstring("stopped: interrupted"));
+    CHECK_THAT(stopped.out, ContainsSubstring("resume the remaining"));
+  }
+  const DemRaster partial = DemRaster::load(output);
+  CHECK(partial.countNaN() > 0);
+  CHECK(partial.countNaN() < partial.pixelCount());  // the partial first row was saved
+
+  const Finished rerun = runToExit(args, dir.path);  // the gate stays open, so nothing is held now
+  INFO("stdout:\n" << rerun.out << "stderr:\n" << rerun.err);
+  CHECK(rerun.status == 0);
+  checkPixels(output, 16, 8, -1, -1);
+}
+
+TEST_CASE("a second SIGINT exits at once with status 130", "[e2e]") {
+  LoopbackWms wms;
+  wms.holdAfter = 0;  // every request is held, so only the second signal can end the run
+  const TempDir dir;
+  Child child(commandLine(wms, dir.path / "dem.tif", 4, 3, {"--threads", "2"}), dir.path);
+  REQUIRE(wms.gate.awaitArrivals(1, kDeadline));
+  child.signal(SIGINT);
+  REQUIRE(awaitText(child.errPath(), "stopping: interrupted"));  // the first signal has been handled
+  child.signal(SIGINT);
+  const Finished result = child.wait();
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.status == 130);
+}
+
+TEST_CASE("a usage error exits 1 before any request", "[e2e]") {
+  LoopbackWms wms;
+  const TempDir dir;
+  const std::filesystem::path output = dir.path / "dem.tif";
+  const Finished result = runToExit(commandLine(wms, output, 4, 3, {"--threads", "0"}), dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.status == 1);
+  CHECK_THAT(result.err, ContainsSubstring("error: threads must be at least 1"));
+  CHECK(wms.requests.load() == 0);
+  CHECK_FALSE(std::filesystem::exists(output));
+}
+```
+
+- [ ] **Step 3: Add the executable and the tests to CMake**
 
 Insert after the `demdl_cli` block and before `if(DL_ELEVATION_TESTS)`:
 
@@ -5568,12 +6041,64 @@ target_link_libraries(dl_elevation PRIVATE demdl demdl_cli)
 target_compile_options(dl_elevation PRIVATE -Wall -Wextra)
 ```
 
-- [ ] **Step 2: Build to verify it fails**
+Then update the test target:
+
+```cmake
+  add_executable(demdl_tests
+    tests/test_BoundingBox.cpp
+    tests/test_Config.cpp
+    tests/test_WmsQuery.cpp
+    tests/test_RetryPolicy.cpp
+    tests/test_DemRaster.cpp
+    tests/test_StopToken.cpp
+    tests/test_Downloader.cpp
+    tests/test_ElevationClient.cpp
+    tests/test_ConsoleReporter.cpp
+    tests/test_Cli.cpp
+    tests/test_ExitCodes.cpp
+    tests/test_EndToEnd.cpp)
+  target_link_libraries(demdl_tests PRIVATE demdl demdl_cli Catch2::Catch2WithMain)
+  target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
+  # The end-to-end tests run the executable itself, so it is built first and its path is compiled in.
+  add_dependencies(demdl_tests dl_elevation)
+  target_compile_definitions(demdl_tests PRIVATE DL_ELEVATION_EXE="$<TARGET_FILE:dl_elevation>")
+```
+
+- [ ] **Step 4: Build to verify it fails**
 
 Run: `cmake --build build`
-Expected: FAIL with `Cannot find source file: src/app/main.cpp`.
+Expected: FAIL with `Cannot find source file: src/app/main.cpp`. Compiled on its own, `tests/test_ExitCodes.cpp` fails with `'app/ExitCodes.h' file not found`.
 
-- [ ] **Step 3: Write `src/app/main.cpp`**
+- [ ] **Step 5: Write `src/app/ExitCodes.h`**
+
+```cpp
+#pragma once
+
+#include "demdl/ProgressSink.h"
+
+namespace demdl::cli {
+
+// The process exit codes, spec section 10.
+inline constexpr int kExitComplete = 0;        // the output has no NaN pixel left
+inline constexpr int kExitUsage = 1;           // usage or configuration error before any request, or an
+                                               // unexpected internal error during the run
+inline constexpr int kExitStopped = 2;         // stopped early; the checkpoint is intact and a rerun resumes
+inline constexpr int kExitIncomplete = 3;      // ran to the end with failed pixels; a rerun retries them
+inline constexpr int kExitSecondSignal = 130;  // a second SIGINT or SIGTERM: immediate exit
+
+// The exit code for a finished run. A failed checkpoint write decides first: the file lacks the row whose
+// save failed, so whatever the counts say, the run stopped early.
+[[nodiscard]] inline int exitCodeFor(const demdl::RunSummary& s) noexcept {
+  if (s.checkpointWriteFailed) return kExitStopped;
+  if (s.remainingNaN == 0) return kExitComplete;
+  if (s.stopReason != demdl::StopReason::None) return kExitStopped;
+  return kExitIncomplete;
+}
+
+}  // namespace demdl::cli
+```
+
+- [ ] **Step 6: Write `src/app/main.cpp`**
 
 ```cpp
 #include <atomic>
@@ -5590,11 +6115,13 @@ Expected: FAIL with `Cannot find source file: src/app/main.cpp`.
 #include <vector>
 
 #include "app/Cli.h"
+#include "app/ExitCodes.h"
 #include "demdl/Config.h"
 #include "demdl/ConsoleReporter.h"
 #include "demdl/DemRaster.h"
 #include "demdl/Downloader.h"
 #include "demdl/ElevationClient.h"
+#include "demdl/PixelFetcher.h"
 #include "demdl/ProgressSink.h"
 #include "demdl/RetryPolicy.h"
 #include "demdl/StopToken.h"
@@ -5605,13 +6132,19 @@ Expected: FAIL with `Cannot find source file: src/app/main.cpp`.
 
 namespace {
 
-demdl::StopToken* g_stop = nullptr;
-std::atomic<int> g_signalCount{0};
+// The signal handler touches these two and nothing else: lock-free atomics only (the token holds two),
+// constant-initialised so that they are ready before any signal can arrive.
+constinit demdl::StopToken g_stopToken;
+constinit std::atomic<int> g_signalCount{0};
+static_assert(std::atomic<int>::is_always_lock_free);
 
-// Only lock-free atomics are touched here; nothing is printed from a signal handler.
+constexpr const char* kOverwriteHint = "use --overwrite to start fresh or choose another --output\n";
+
+// SIGINT and SIGTERM: the first requests a stop, the second exits at once. Nothing is printed here;
+// main announces the stop when it sees the token raised.
 void onSignal(int) {
-  if (g_signalCount.fetch_add(1) >= 1) std::_Exit(130);
-  if (g_stop != nullptr) g_stop->request(demdl::StopReason::Signal);
+  if (g_signalCount.fetch_add(1) >= 1) std::_Exit(demdl::cli::kExitSecondSignal);
+  g_stopToken.request(demdl::StopReason::Signal);
 }
 
 void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, bool created) {
@@ -5637,10 +6170,28 @@ void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, bool cr
   }
 }
 
-int exitCodeFor(const demdl::RunSummary& s) {
-  if (s.remainingNaN == 0) return 0;
-  if (s.stopReason != demdl::StopReason::None) return 2;
-  return 3;
+// The existing output, loaded for resuming. Empty, with the reason printed, when it cannot be resumed.
+std::optional<demdl::DemRaster> loadForResume(const demdl::Config& cfg) {
+  std::optional<demdl::DemRaster> raster;
+  try {
+    raster = demdl::DemRaster::load(cfg.output);
+  } catch (const std::exception& e) {
+    const std::string what = e.what();
+    std::cerr << "error: " << what << "\n";
+    // DemRaster's message for a file that dl_elevation did not write names --overwrite already.
+    if (what.find("--overwrite") == std::string::npos) std::cerr << kOverwriteHint;
+    return std::nullopt;
+  }
+  std::string why;
+  if (!raster->matches(cfg, why)) {
+    std::cerr << "error: " << cfg.output.string() << " was created for different parameters:\n"
+              << why << kOverwriteHint;
+    return std::nullopt;
+  }
+  if (const std::string warning = raster->wmsUrlWarning(cfg); !warning.empty()) {
+    std::cerr << "warning: " << warning << "\n";
+  }
+  return raster;
 }
 
 }  // namespace
@@ -5649,103 +6200,139 @@ int main(int argc, char** argv) {
   using namespace std::chrono_literals;
   using namespace demdl;
 
+  // Tied, every stderr write would first flush stdout, so a warning from a worker thread (ElevationClient
+  // writes two, once per process) could push out half of a line the reporter is still writing.
+  // sync_with_stdio(false) must never be called: the standard streams may be shared between threads only
+  // while they are synchronised with stdio.
+  std::cerr.tie(nullptr);
+
   Config cfg;
   const cli::ParseOutcome parsed = cli::parseArgs(argc, argv, cfg, std::cout, std::cerr);
-  if (parsed.exitNow) return parsed.exitCode;
+  if (parsed.exitNow) return parsed.exitCode;  // 0 after --help or --version, cli::kExitUsage after an error
   if (const std::string err = cfg.validate(); !err.empty()) {
     std::cerr << "error: " << err << "\n";
-    return 1;
+    return cli::kExitUsage;
   }
 #ifndef DL_ELEVATION_HAVE_PREVIEW
   if (cfg.preview) {
     std::cerr << "error: this build has no preview support; configure with -DDL_ELEVATION_PREVIEW=ON\n";
-    return 1;
+    return cli::kExitUsage;
   }
 #endif
+
+  RetryPolicy policy;
+  policy.maxRetries = cfg.maxRetries;
 
   std::optional<DemRaster> raster;
   bool created = false;
   try {
-    if (std::filesystem::exists(cfg.output) && !cfg.overwrite) {
-      raster = DemRaster::load(cfg.output);
-      std::string why;
-      if (!raster->matches(cfg, why)) {
-        std::cerr << "error: " << cfg.output.string() << " was created for different parameters:\n"
-                  << why << "use --overwrite to start fresh or choose another --output\n";
-        return 1;
-      }
-      if (const std::string warning = raster->wmsUrlWarning(cfg); !warning.empty()) {
-        std::cerr << "warning: " << warning << "\n";
-      }
+    if (!cfg.overwrite && std::filesystem::exists(cfg.output)) {
+      raster = loadForResume(cfg);
+      if (!raster) return cli::kExitUsage;
     } else {
       raster = DemRaster::create(cfg.width, cfg.height, cfg.box, RasterMetadata{cfg.layer, cfg.wmsUrl});
       created = true;
     }
+    {
+      // A probe, discarded at once: the constructor throws for a WMS URL or an HTTP client it cannot use,
+      // which would otherwise surface only through the run's future. It sends no request.
+      const ElevationClient probe(cfg, policy);
+    }
     if (cfg.dryRun) {
       printPlan(cfg, *raster, created);
-      return 0;
+      return cli::kExitComplete;
     }
-    if (created) raster->save(cfg.output);  // validates the path early; the file is openable while it fills
+    // A new file, or one with work left, is written before the first request, so that an unwritable
+    // directory or a full disk fails here and a new file can be opened while it fills. A complete file is
+    // not rewritten.
+    if (raster->countNaN() > 0) raster->save(cfg.output);
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
-    return 1;
+    return cli::kExitUsage;
   }
 
-  StopToken stop;
-  g_stop = &stop;
   std::signal(SIGINT, onSignal);
   std::signal(SIGTERM, onSignal);
-  std::signal(SIGPIPE, SIG_IGN);
-
-  RetryPolicy policy;
-  policy.maxRetries = cfg.maxRetries;
-  const FetcherFactory factory = [&cfg, policy](int) -> std::unique_ptr<PixelFetcher> {
-    return std::make_unique<ElevationClient>(cfg, policy);
-  };
+  std::signal(SIGPIPE, SIG_IGN);  // ElevationClient relies on it: httplib's client does not suppress SIGPIPE
 
   std::unique_ptr<ProgressSink> sink;
 #ifdef DL_ELEVATION_HAVE_PREVIEW
   PreviewWindow* preview = nullptr;
   if (cfg.preview) {
     try {
-      auto window = std::make_unique<PreviewWindow>(*raster, stop);
+      auto window = std::make_unique<PreviewWindow>(*raster, g_stopToken);
       preview = window.get();
       sink = std::move(window);
     } catch (const std::exception& e) {
       std::cerr << "error: " << e.what() << "\n";
-      return 1;
+      return cli::kExitUsage;
     }
   }
 #endif
   if (!sink) sink = std::make_unique<ConsoleReporter>(std::cout, cfg.verbose);
 
-  Downloader downloader(*raster, cfg.output, factory, *sink, stop,
-                        DownloaderOptions{cfg.threads, cfg.maxConsecutiveFailures});
-  std::future<RunSummary> result = std::async(std::launch::async, [&downloader] { return downloader.run(); });
+  const FetcherFactory factory = [&cfg, policy](int) -> std::unique_ptr<PixelFetcher> {
+    return std::make_unique<ElevationClient>(cfg, policy);
+  };
+  std::optional<Downloader> downloader;
+  std::future<RunSummary> result;
+  try {
+    downloader.emplace(*raster, cfg.output, factory, *sink, g_stopToken,
+                       DownloaderOptions{cfg.threads, cfg.maxConsecutiveFailures});
+    // Off the main thread, which belongs to the preview window when there is one.
+    result = std::async(std::launch::async, [&downloader] { return downloader->run(); });
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return cli::kExitUsage;
+  }
 
   bool announced = false;
   while (result.wait_for(100ms) != std::future_status::ready) {
 #ifdef DL_ELEVATION_HAVE_PREVIEW
     if (preview != nullptr) preview->pump();
 #endif
-    if (stop.stop.load() && !announced) {
+    if (!announced && g_stopToken.requested()) {
       announced = true;
-      std::cout << "stopping: " << describe(stop.reason()) << "; waiting for " << downloader.inFlight()
-                << " in-flight requests\n";
+      // One string in one insertion, on stderr: the reporter owns stdout and writes under its own mutex,
+      // so a line written to stdout from here could land inside one of its lines.
+      const std::string line = std::string("stopping: ") + describe(g_stopToken.reason()) + "; waiting for " +
+                               std::to_string(downloader->inFlight()) + " in-flight requests\n";
+      std::cerr << line;
     }
   }
-  const RunSummary summary = result.get();
-  g_stop = nullptr;
-  return exitCodeFor(summary);
+
+  RunSummary summary;
+  try {
+    summary = result.get();
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return cli::kExitUsage;
+  } catch (...) {
+    std::cerr << "error: unknown exception\n";
+    return cli::kExitUsage;
+  }
+#ifdef DL_ELEVATION_HAVE_PREVIEW
+  if (preview != nullptr) {
+    writeSummary(std::cout, summary);  // the window prints nothing, so the finish lines come from here
+    std::cout.flush();
+  }
+#endif
+  return cli::exitCodeFor(summary);
 }
 ```
 
-- [ ] **Step 4: Build**
+- [ ] **Step 7: Build and run the tests**
 
-Run: `cmake --build build`
-Expected: builds `dl_elevation` with no errors.
+Run: `cmake --build build && ./build/demdl_tests "[exitcodes]"`
+Expected: builds `dl_elevation` and `demdl_tests` with no warnings, then `All tests passed (N assertions in 7 test cases)`.
 
-- [ ] **Step 5: Smoke-test the dry run (no network)**
+Run: `./build/demdl_tests "[e2e]"`
+Expected: `All tests passed (N assertions in 6 test cases)` in about a second.
+
+Run: `ctest --test-dir build --output-on-failure`
+Expected: `100% tests passed out of 143`.
+
+- [ ] **Step 8: Smoke-test the dry run (no network)**
 
 Run:
 
@@ -5772,7 +6359,7 @@ exit 0
 Run: `ls "${TMPDIR:-/tmp}/demdl-smoke.tif"`
 Expected: `No such file or directory`. A dry run writes nothing.
 
-- [ ] **Step 6: Smoke-test the error paths**
+- [ ] **Step 9: Smoke-test the error paths**
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --threads 0; echo "exit $?"`
 Expected: `error: threads must be at least 1` on stderr, then `exit 1`.
@@ -5781,12 +6368,12 @@ Run: `./build/dl_elevation --help >/dev/null; echo "exit $?"`
 Expected: `exit 0`.
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --preview --dry-run; echo "exit $?"`
-Expected on a build without the preview target (which is every build until Task 13): `error: this build has no preview support; configure with -DDL_ELEVATION_PREVIEW=ON` and `exit 1`.
+Expected on a build without the preview target (which is every build until Task 13): `error: this build has no preview support; configure with -DDL_ELEVATION_PREVIEW=ON` on stderr, then `exit 1`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add CMakeLists.txt src/app/main.cpp
+git add CMakeLists.txt src/app/ExitCodes.h src/app/main.cpp tests/test_ExitCodes.cpp tests/test_EndToEnd.cpp
 git commit -m "feat: dl_elevation executable with dry run, signal handling and exit codes" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -6379,7 +6966,7 @@ Run: `./build/dl_elevation --version`
 Expected: `0.2.0`.
 
 Run: `./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 16 --height 8 --output "${TMPDIR:-/tmp}/demdl-smoke.tif" --dry-run; echo "exit $?"`
-Expected: the plan from Task 12 Step 5 and `exit 0`.
+Expected: the plan from Task 12 Step 8 and `exit 0`.
 
 - [ ] **Step 5: Repository state**
 

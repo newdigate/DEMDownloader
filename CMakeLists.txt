@@ -81,6 +81,10 @@ add_library(demdl_cli OBJECT src/app/Cli.cpp)
 target_link_libraries(demdl_cli PUBLIC demdl PRIVATE CLI11::CLI11)
 target_compile_options(demdl_cli PRIVATE -Wall -Wextra)
 
+add_executable(dl_elevation src/app/main.cpp)
+target_link_libraries(dl_elevation PRIVATE demdl demdl_cli)
+target_compile_options(dl_elevation PRIVATE -Wall -Wextra)
+
 if(DL_ELEVATION_TESTS)
   enable_testing()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
@@ -95,8 +99,13 @@ if(DL_ELEVATION_TESTS)
     tests/test_Downloader.cpp
     tests/test_ElevationClient.cpp
     tests/test_ConsoleReporter.cpp
-    tests/test_Cli.cpp)
+    tests/test_Cli.cpp
+    tests/test_ExitCodes.cpp
+    tests/test_EndToEnd.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl demdl_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
+  # The end-to-end tests run the executable itself, so it is built first and its path is compiled in.
+  add_dependencies(demdl_tests dl_elevation)
+  target_compile_definitions(demdl_tests PRIVATE DL_ELEVATION_EXE="$<TARGET_FILE:dl_elevation>")
   catch_discover_tests(demdl_tests)
 endif()

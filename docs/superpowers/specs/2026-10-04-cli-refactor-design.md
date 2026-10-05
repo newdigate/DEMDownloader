@@ -480,10 +480,14 @@ sink prints nothing. The starting line, each row line and the finish lines
 are flushed as they are written, so that with stdout redirected to a file
 each row reaches the log when it is saved; the frequent verbose pixel lines
 are not flushed. The line that announces a stop as it happens, for example
-`stopping: interrupted; waiting for 8 in-flight requests`, is printed by
-`main` when it sees the stop token raised, not by the reporter: `main` polls
+`stopping: interrupted; waiting for 8 in-flight requests`, is written by
+`main`, not by the reporter, when it sees the stop token raised: `main` polls
 the token every 100 ms, because nothing may print from inside a signal
-handler.
+handler. It goes to stderr, built as one string and written with a single
+insertion, because the reporter owns stdout and writes under its own mutex,
+so a line from `main` on stdout could land inside one of the reporter's. A
+run that ends before the first poll after the stop prints no such line; its
+summary still says `stopped:`.
 
 **PreviewWindow** implements the sink over GLFW 3.3 core profile in a 640x480
 resizable window titled `dl_elevation 34.0%`. It owns a per-pixel state byte
@@ -502,18 +506,42 @@ closes when the run finishes.
 
 `main` flow:
 
-1. `parseArgs` into `Config`; `validate()`. Errors exit 1.
-2. Load or create the `DemRaster` per section 7. Errors exit 1.
-3. `--dry-run`: print the plan, exit 0.
-4. Write the initial file if newly created.
-5. Install handlers: SIGINT and SIGTERM call `request(StopReason::Signal)` on
+1. Untie stderr from stdout (`std::cerr.tie(nullptr)`). Tied, every stderr
+   write would first flush stdout, so a warning from a worker thread
+   (`ElevationClient`'s two once-per-process warnings) could push out half of
+   a line the reporter is still writing. `sync_with_stdio(false)` is never
+   called: the standard streams may be shared between threads only while
+   they are synchronised with stdio.
+2. `parseArgs` into `Config`; `validate()`; refuse `--preview` in a build
+   without the preview. Errors exit 1.
+3. Load or create the `DemRaster` per section 7. A failed load prints
+   `error: <message>` and, unless the message already names `--overwrite`,
+   `use --overwrite to start fresh or choose another --output`. Errors
+   exit 1.
+4. Construct one `ElevationClient` and discard it: the constructor throws for
+   a WMS URL or an HTTP client it cannot use, which would otherwise surface
+   only through the run's future. The probe sends no request. An error exits
+   1, dry run or not.
+5. `--dry-run`: print the plan, exit 0.
+6. Write the file before the first request when it is new or, resumed, still
+   has NaN pixels, so that an unwritable directory or a full disk exits 1
+   before any request. A complete file is not rewritten.
+7. Install handlers: SIGINT and SIGTERM call `request(StopReason::Signal)` on
    the shared `StopToken`; a second signal calls `_Exit(130)`. SIGPIPE is set
-   to `SIG_IGN`.
-6. Choose the sink: `PreviewWindow` if `--preview`, else `ConsoleReporter`.
-7. Start the `Downloader` on its own thread.
-8. Headless: join the downloader. Preview: run the GLFW loop on the main
-   thread until the run finishes or the window closes, then join.
-9. Print the summary and exit with the code from section 10.
+   to `SIG_IGN`. The handler touches nothing but a signal counter and the
+   token, both constant-initialised at namespace scope and made of lock-free
+   atomics.
+8. Choose the sink: `PreviewWindow` if `--preview`, else `ConsoleReporter`.
+9. Construct the `Downloader`, whose constructor validates its options, and
+   start `run()` on its own thread with `std::async`. A failure exits 1.
+10. Poll the run's future every 100 ms; with `--preview` each poll also pumps
+    the GLFW window on the main thread. The first poll that finds the token
+    raised writes the `stopping:` line of section 8.
+11. Collect the summary. An exception that escapes `run()` prints
+    `error: <message>` (`error: unknown exception` for a type not derived
+    from `std::exception`) and exits 1. After a `--preview` run, whose sink
+    prints nothing, `main` prints the finish lines with `writeSummary`. Exit
+    with the code from section 10.
 
 `StopToken` is the shared stop flag. `request(reason)` raises the flag and
 records the reason only if none is recorded yet, so the first reason wins;
@@ -532,20 +560,30 @@ one `ElevationClient` per worker id so each thread reuses its own connection.
 | Code | Meaning |
 |---|---|
 | 0 | complete: `remainingNaN == 0` |
-| 1 | usage or configuration error; nothing requested |
+| 1 | usage or configuration error before any request, or an unexpected internal error during the run (message on stderr) |
 | 2 | stopped early (signal, window closed, consecutive failures, write error); checkpoint intact; rerun resumes |
 | 3 | ran to the end but `failed > 0`; rerun resumes |
 | 130 | second interrupt, immediate exit |
 
-Mapping: `remainingNaN == 0` gives 0; otherwise `stopReason != None` gives 2;
-otherwise 3. Library code throws `std::runtime_error` for unrecoverable
-conditions before the run starts; `main` catches at the top level, prints the
-message to stderr and exits 1. During the run the only expected failure is a
-checkpoint write. It always sets `checkpointWriteFailed`, even when another
-stop reason came first and stays the recorded one, and otherwise surfaces as
-`stopReason == WriteError`. Either way the run exits 2, because
+The codes are named in the header-only `src/app/ExitCodes.h` (namespace
+`demdl::cli`) as `kExitComplete`, `kExitUsage`, `kExitStopped`,
+`kExitIncomplete` and `kExitSecondSignal`. `main` returns them, its signal
+handler passes the last to `_Exit`, and only `parseArgs`'s own 0 or 1 after
+`--help`, `--version` or a usage error is passed on as it comes. The header's
+`exitCodeFor(const RunSummary&)` maps a finished run: `checkpointWriteFailed`
+gives 2; otherwise `remainingNaN == 0` gives 0; otherwise
+`stopReason != None` gives 2; otherwise 3. Library code throws
+`std::runtime_error` for unrecoverable conditions before the run starts;
+`main` catches them, prints the message to stderr and exits 1. During the run
+the only expected failure is a checkpoint write. It always sets
+`checkpointWriteFailed`, even when another stop reason came first and stays
+the recorded one, and otherwise surfaces as `stopReason == WriteError`.
+Either way the run exits 2: the checkpoint rule comes first, and
 `remainingNaN` describes the last checkpoint written, where the failed row's
-pixels are still NaN. Jobs never throw across the future boundary.
+pixels are still NaN. Jobs never throw across the future boundary; anything
+else that escapes `run()`, such as a fetcher factory failing for a later
+worker or an allocation failure, reaches `main` through the future and
+exits 1.
 
 ## 11. Tests
 
@@ -711,6 +749,40 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `--threads 3 --threads 4` is one saying `--threads: At most 1 required`;
   and `--threads 0` parses but fails `Config::validate` with
   `threads must be at least 1`.
+- **ExitCodes** (`[exitcodes]`), one case per row of section 10's table: a
+  run with no NaN pixel left gives 0, also when a stop was requested after
+  the last save; 1 and 130 have those values and no run summary maps to
+  either (every combination of stop reason, pixels left, failures and a
+  failed checkpoint write is tried); each of the four stop reasons with
+  pixels left gives 2; a run that reaches the end with failed pixels gives 3.
+  A failed checkpoint write gives 2 even when no NaN pixel is counted, and
+  after a signal that stays the recorded reason, with or without pixels left.
+- **End to end** (`[e2e]`), the only checks of the whole pipeline: the built
+  `dl_elevation`, whose path is compiled into the tests, is started with
+  `posix_spawn` (stdout and stderr to files, SIGINT and SIGTERM at their
+  defaults and unblocked, at most 20 s per child) against an
+  `httplib::Server` on 127.0.0.1. The server answers GetFeatureInfo for pixel
+  (I, J) with `BAND 0: <I*10+J>`, a configurable NoData pixel with a plain
+  body and a configurable failing pixel with HTTP 500; it counts requests and
+  can hold them at a gate until the test releases them, so the signal cases
+  wait for the state they need instead of relying on timing. A full run on
+  the example box with a 4 x 3 grid, `--threads 2` and `--max-retries 0`
+  exits 3 after exactly 12 requests, prints `starting:`, `row 1/3`,
+  `row 2/3`, `row 3/3`, `done:` and `retry the 1 failed pixel`, warns
+  `warning: first failed request: http 500 (not retried)` on stderr, and
+  leaves `I*10+J` everywhere except -32768 at the NoData pixel and NaN at the
+  failed one; once the server stops failing it, a rerun exits 0 after exactly
+  one request and leaves the file complete. A dry run exits 0, prints the
+  plan, starting with `dry run` and naming the loopback URL in its first
+  request, and neither requests nor writes anything. On a 16 x 8 grid with
+  `--threads 2`, SIGINT sent while the eleventh request is held prints
+  `stopping: interrupted; waiting for N in-flight requests` on stderr before
+  the request is released, then `stopped: interrupted` and
+  `resume the remaining ...` on stdout, exits 2 and leaves a file with some
+  pixels saved and some NaN, which a rerun completes with exit 0. A second
+  SIGINT, sent once the first has been announced while every request is
+  held, exits 130. `--threads 0` exits 1 with
+  `error: threads must be at least 1`, no request and no file.
 
 `PreviewWindow` and the real server are not tested.
 
