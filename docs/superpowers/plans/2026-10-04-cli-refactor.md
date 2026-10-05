@@ -6491,6 +6491,10 @@ int main(int argc, char** argv) {
   policy.maxRetries = cfg.maxRetries;
 
   std::optional<DemRaster> raster;
+  std::unique_ptr<ProgressSink> sink;
+#ifdef DL_ELEVATION_HAVE_PREVIEW
+  PreviewWindow* preview = nullptr;
+#endif
   try {
     const bool outputExists = std::filesystem::exists(cfg.output);
     const char* outputPlan = "will be created";
@@ -6521,6 +6525,17 @@ int main(int argc, char** argv) {
       printPlan(cfg, *raster, outputPlan);
       return cli::kExitComplete;
     }
+    // The sink comes before the first write, so a preview window that cannot open (no display, a raster
+    // larger than the GPU's textures) ends the run with nothing written, and --overwrite has not yet
+    // replaced the existing file.
+#ifdef DL_ELEVATION_HAVE_PREVIEW
+    if (cfg.preview) {
+      auto window = std::make_unique<PreviewWindow>(*raster, g_stopToken);
+      preview = window.get();
+      sink = std::move(window);
+    }
+#endif
+    if (!sink) sink = std::make_unique<ConsoleReporter>(std::cout, cfg.verbose);
     if (writesOutput) raster->save(cfg.output);
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
@@ -6528,22 +6543,6 @@ int main(int argc, char** argv) {
   }
 
   installSignalHandlers();
-
-  std::unique_ptr<ProgressSink> sink;
-#ifdef DL_ELEVATION_HAVE_PREVIEW
-  PreviewWindow* preview = nullptr;
-  if (cfg.preview) {
-    try {
-      auto window = std::make_unique<PreviewWindow>(*raster, g_stopToken);
-      preview = window.get();
-      sink = std::move(window);
-    } catch (const std::exception& e) {
-      std::cerr << "error: " << e.what() << "\n";
-      return cli::kExitError;
-    }
-  }
-#endif
-  if (!sink) sink = std::make_unique<ConsoleReporter>(std::cout, cfg.verbose);
 
   const FetcherFactory factory = [&cfg, policy](int) -> std::unique_ptr<PixelFetcher> {
     return std::make_unique<ElevationClient>(cfg, policy);
@@ -6669,7 +6668,7 @@ git commit -m "feat: dl_elevation executable with dry run, signal handling and e
 
 ### Task 13: Preview window
 
-Implements the `PreviewWindow` sink from spec section 8, the `[palette]` tests from section 11 and the `DL_ELEVATION_PREVIEW` option from section 12. Deviation 7 applies. The colours live in the header-only `src/preview/Palette.h`, which includes no OpenGL, so `[palette]` is compiled into `demdl_tests` in every configuration and is the preview's one automated test. The window refuses a raster larger than the GPU's maximum texture size, cleans up GLFW itself when its constructor throws, and hides as soon as it is closed while the run drains. It is checked by the compile, the `--preview --dry-run` probe and a run against a loopback WMS; a live run is optional and gated on the owner.
+Implements the `PreviewWindow` sink from spec section 8, the `[palette]` tests from section 11 and the `DL_ELEVATION_PREVIEW` option from section 12. Deviation 7 applies. The colours live in the header-only `src/preview/Palette.h`, which includes no OpenGL, so `[palette]` is compiled into `demdl_tests` in every configuration and is the preview's one automated test. The window colours its texture outside the lock that the workers report through, refuses a raster larger than the GPU's maximum texture size and shaders that do not build, cleans up GLFW itself when its constructor throws, keeps GLFW from changing the working directory on macOS, and hides as soon as it is closed while the run drains. `main` (Task 12) creates it before the first save, so a window that cannot open leaves the output as it was. It is checked by the compile, the `--preview --dry-run` probe and a run against a loopback WMS; a live run is optional and gated on the owner.
 
 **Files:**
 - Create: `tests/test_Palette.cpp`
@@ -6684,9 +6683,10 @@ Implements the `PreviewWindow` sink from spec section 8, the `[palette]` tests f
 ```cpp
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <string>
-#include <vector>
 
 #include "preview/Palette.h"
 
@@ -6704,6 +6704,16 @@ struct StringMaker<Rgb> {
 };
 
 }  // namespace Catch
+
+namespace {
+
+// The largest difference between two colours in any one channel.
+int distance(Rgb a, Rgb b) { return std::max({std::abs(a.r - b.r), std::abs(a.g - b.g), std::abs(a.b - b.b)}); }
+
+// The i-th of 10001 evenly spaced samples of [0, 1], both ends included.
+float sample(int i) { return static_cast<float>(i) / 10000.0f; }
+
+}  // namespace
 
 TEST_CASE("the status colours are the spec's", "[palette]") {
   CHECK(demdl::kTodoColour == Rgb{40, 40, 40});
@@ -6726,15 +6736,34 @@ TEST_CASE("a value outside 0 to 1 is clamped and NaN counts as the minimum", "[p
   CHECK(valueColour(std::numeric_limits<float>::quiet_NaN()) == valueColour(0.0f));
 }
 
-TEST_CASE("no value is drawn in the NoData, Failed or to-do colour", "[palette]") {
-  // 10001 evenly spaced samples of [0, 1], both ends included.
-  std::vector<float> clashes;
-  for (int i = 0; i <= 10000; ++i) {
-    const float t = static_cast<float>(i) / 10000.0f;
-    const Rgb c = valueColour(t);
-    if (c == demdl::kNoDataColour || c == demdl::kFailedColour || c == demdl::kTodoColour) clashes.push_back(t);
+TEST_CASE("the value colours change by at most 2 per channel from one sample to the next", "[palette]") {
+  int largest = 0;
+  float where = 0.0f;
+  for (int i = 1; i <= 10000; ++i) {
+    const int step = distance(valueColour(sample(i - 1)), valueColour(sample(i)));
+    if (step > largest) {
+      largest = step;
+      where = sample(i);
+    }
   }
-  CHECK(clashes == std::vector<float>{});
+  INFO("the largest step ends at t = " << where);
+  CHECK(largest <= 2);
+}
+
+TEST_CASE("every value colour is at least 64 from the NoData, Failed and to-do colours", "[palette]") {
+  int nearest = 255;
+  float where = 0.0f;
+  for (int i = 0; i <= 10000; ++i) {
+    const Rgb c = valueColour(sample(i));
+    const int d = std::min(
+        {distance(c, demdl::kNoDataColour), distance(c, demdl::kFailedColour), distance(c, demdl::kTodoColour)});
+    if (d < nearest) {
+      nearest = d;
+      where = sample(i);
+    }
+  }
+  INFO("the nearest is at t = " << where);
+  CHECK(nearest >= 64);
 }
 ```
 
@@ -6747,16 +6776,18 @@ if(DL_ELEVATION_PREVIEW)
   find_package(PkgConfig REQUIRED)
   pkg_search_module(glfw REQUIRED IMPORTED_TARGET glfw3)
   add_library(demdl_preview STATIC src/preview/PreviewWindow.cpp)
-  target_link_libraries(demdl_preview PUBLIC demdl PkgConfig::glfw)
+  # PreviewWindow.h includes no GLFW or OpenGL header, so those stay PRIVATE; a static library still hands
+  # them on to whatever links it, for linking only.
+  target_link_libraries(demdl_preview PUBLIC demdl PRIVATE PkgConfig::glfw)
   target_compile_definitions(demdl_preview PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_options(demdl_preview PRIVATE -Wall -Wextra)
   if(APPLE)
-    target_link_libraries(demdl_preview PUBLIC
+    target_link_libraries(demdl_preview PRIVATE
       "-framework OpenGL" "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
   else()
     find_package(OpenGL REQUIRED)
     pkg_search_module(glew REQUIRED IMPORTED_TARGET glew)
-    target_link_libraries(demdl_preview PUBLIC OpenGL::GL PkgConfig::glew)
+    target_link_libraries(demdl_preview PRIVATE OpenGL::GL PkgConfig::glew)
   endif()
   target_link_libraries(dl_elevation PRIVATE demdl_preview)
   target_compile_definitions(dl_elevation PRIVATE DL_ELEVATION_HAVE_PREVIEW)
@@ -6814,6 +6845,9 @@ inline constexpr Rgb kFailedColour{255, 0, 255};
 // Maps t in [0, 1] (low to high) onto light blue (0, 128, 255), cyan, green, yellow and red (255, 0, 0).
 // Stops short of pure blue (NoData) and never reaches magenta (Failed) or the to-do grey. NaN counts as 0
 // and t is clamped to [0, 1] first, so every input has a colour.
+// Two status colours do recur: the top of the range draws the same red as Queued, and a narrow band near
+// t = 0.43 the same green as InFlight. Both states are transient, so the overlap is accepted for now;
+// changing the status colours is the owner's call.
 [[nodiscard]] inline Rgb valueColour(float t) noexcept {
   const double clamped = std::isnan(t) ? 0.0 : std::clamp(static_cast<double>(t), 0.0, 1.0);
   const double a = (1.0 - clamped) * 3.5;
@@ -6837,7 +6871,7 @@ inline constexpr Rgb kFailedColour{255, 0, 255};
 
 // The including translation unit must include the OpenGL headers before this file.
 
-#include <iostream>
+#include <stdexcept>
 #include <string>
 
 namespace demdl {
@@ -6846,22 +6880,32 @@ namespace demdl {
 // helper: no file loading, no GLM, only the one uniform setter the preview needs.
 class Shader {
  public:
+  // Throws std::runtime_error with the driver's log when a shader does not compile or the program
+  // does not link, after deleting the shader and program objects it created.
   Shader(const std::string& vertexSource, const std::string& fragmentSource) {
     const unsigned int vertex = compile(GL_VERTEX_SHADER, vertexSource, "vertex");
-    const unsigned int fragment = compile(GL_FRAGMENT_SHADER, fragmentSource, "fragment");
+    unsigned int fragment = 0;
+    try {
+      fragment = compile(GL_FRAGMENT_SHADER, fragmentSource, "fragment");
+    } catch (...) {
+      glDeleteShader(vertex);
+      throw;
+    }
     id_ = glCreateProgram();
     glAttachShader(id_, vertex);
     glAttachShader(id_, fragment);
     glLinkProgram(id_);
+    // The program keeps what it linked, so the shader objects can go whether or not it linked.
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
     int success = 0;
     glGetProgramiv(id_, GL_LINK_STATUS, &success);
     if (!success) {
-      char log[1024];
+      char log[1024] = "";
       glGetProgramInfoLog(id_, sizeof log, nullptr, log);
-      std::cerr << "shader link error: " << log << "\n";
+      glDeleteProgram(id_);  // the destructor does not run for a constructor that throws
+      throw std::runtime_error("shader link error: " + tidy(log));
     }
-    glDeleteShader(vertex);
-    glDeleteShader(fragment);
   }
   ~Shader() {
     if (id_ != 0) glDeleteProgram(id_);
@@ -6873,6 +6917,7 @@ class Shader {
   void setInt(const char* name, int value) const { glUniform1i(glGetUniformLocation(id_, name), value); }
 
  private:
+  // Throws, having deleted the shader, when the source does not compile.
   static unsigned int compile(unsigned int type, const std::string& source, const char* label) {
     const unsigned int shader = glCreateShader(type);
     const char* text = source.c_str();
@@ -6881,11 +6926,19 @@ class Shader {
     int success = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
     if (!success) {
-      char log[1024];
+      char log[1024] = "";
       glGetShaderInfoLog(shader, sizeof log, nullptr, log);
-      std::cerr << label << " shader compile error: " << log << "\n";
+      glDeleteShader(shader);
+      throw std::runtime_error(std::string(label) + " shader compile error: " + tidy(log));
     }
     return shader;
+  }
+
+  // The driver's log without its trailing line break.
+  static std::string tidy(const char* log) {
+    std::string text(log);
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+    return text;
   }
 
   unsigned int id_ = 0;
@@ -6899,6 +6952,7 @@ class Shader {
 ```cpp
 #pragma once
 
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -6920,9 +6974,9 @@ class Shader;
 // thread; the sink methods may be called from any thread.
 class PreviewWindow : public ProgressSink {
  public:
-  // Throws std::runtime_error when GLFW cannot initialise or open a window, or when the raster is
-  // wider or taller than the GPU's maximum texture size. Before it throws, it destroys the window,
-  // if it opened one, and terminates GLFW.
+  // Throws std::runtime_error when GLFW cannot initialise or open a window, when the shaders do not
+  // build, or when the raster is wider or taller than the GPU's maximum texture size. Before it
+  // throws, it destroys the window, if it opened one, and terminates GLFW.
   PreviewWindow(const DemRaster& raster, StopToken& stop);
   ~PreviewWindow() override;
   PreviewWindow(const PreviewWindow&) = delete;
@@ -6944,6 +6998,7 @@ class PreviewWindow : public ProgressSink {
   void initGl();
   void redraw();
   std::size_t index(int x, int y) const {
+    assert(x >= 0 && x < width_ && y >= 0 && y < height_);
     return static_cast<std::size_t>(y) * static_cast<std::size_t>(width_) + static_cast<std::size_t>(x);
   }
 
@@ -6951,6 +7006,7 @@ class PreviewWindow : public ProgressSink {
   int height_;
   StopToken& stop_;
 
+  // Written by the sink methods on any thread, under mutex_.
   std::mutex mutex_;
   std::vector<std::uint8_t> cells_;
   std::vector<float> values_;
@@ -6958,12 +7014,15 @@ class PreviewWindow : public ProgressSink {
   float maxValue_;
   double percent_ = 0.0;
 
+  // The main thread's own.
   GLFWwindow* window_ = nullptr;
   unsigned int texture_ = 0;
   unsigned int vao_ = 0;
   unsigned int vbo_ = 0;
   unsigned int ebo_ = 0;
   std::unique_ptr<Shader> shader_;
+  std::vector<std::uint8_t> cellsCopy_;  // redraw's snapshot of cells_, sized up front
+  std::vector<float> valuesCopy_;        // and of values_
   std::vector<unsigned char> rgb_;
   std::chrono::steady_clock::time_point lastRedraw_;
   bool closed_ = false;  // the window was closed: the stop is requested and the window hidden
@@ -7023,6 +7082,13 @@ void main() {
 
 void onFramebufferResized(GLFWwindow*, int width, int height) { glViewport(0, 0, width, height); }
 
+// GLFW's description of its latest error as ": <description>", or nothing when it has none.
+std::string glfwReason() {
+  const char* description = nullptr;
+  if (glfwGetError(&description) != GLFW_NO_ERROR && description != nullptr) return std::string(": ") + description;
+  return {};
+}
+
 }  // namespace
 
 PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
@@ -7033,6 +7099,8 @@ PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
       values_(raster.pixelCount(), 0.0f),
       minValue_(std::numeric_limits<float>::infinity()),
       maxValue_(-std::numeric_limits<float>::infinity()),
+      cellsCopy_(raster.pixelCount(), kTodo),
+      valuesCopy_(raster.pixelCount(), 0.0f),
       rgb_(raster.pixelCount() * 3, 0) {
   for (int y = 0; y < height_; ++y) {
     for (int x = 0; x < width_; ++x) {
@@ -7051,7 +7119,13 @@ PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
   }
   const std::uint64_t done = raster.pixelCount() - raster.countNaN();
   percent_ = 100.0 * static_cast<double>(done) / static_cast<double>(raster.pixelCount());
-  if (!glfwInit()) throw std::runtime_error("GLFW initialisation failed");
+#ifdef __APPLE__
+  // Otherwise GLFW changes the working directory to the Resources directory of what macOS takes for the
+  // application bundle, which a bare executable can have too (a Resources directory beside it, in a
+  // directory named after it), and the checkpoints of a relative --output would be written there.
+  glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
+#endif
+  if (!glfwInit()) throw std::runtime_error("GLFW initialisation failed" + glfwReason());
   try {
     initGl();
   } catch (...) {
@@ -7088,12 +7162,22 @@ void PreviewWindow::initGl() {
   glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
   window_ = glfwCreateWindow(640, 480, "dl_elevation", nullptr, nullptr);
-  if (window_ == nullptr) throw std::runtime_error("GLFW could not create a window; is a display available?");
+  if (window_ == nullptr) {
+    throw std::runtime_error("GLFW could not create a window" + glfwReason() + "; is a display available?");
+  }
   glfwMakeContextCurrent(window_);
   glfwSetFramebufferSizeCallback(window_, onFramebufferResized);
 #ifndef __APPLE__
   glewExperimental = GL_TRUE;
-  if (glewInit() != GLEW_OK) throw std::runtime_error("GLEW initialisation failed");
+  const GLenum glewStatus = glewInit();
+#ifdef GLEW_ERROR_NO_GLX_DISPLAY
+  // GLEW 2.2 built for GLX returns this for a context made through EGL, as GLFW 3.4 makes them on Wayland,
+  // after it has loaded the core functions the preview uses, so it is not a failure here.
+  const bool glewReady = glewStatus == GLEW_OK || glewStatus == GLEW_ERROR_NO_GLX_DISPLAY;
+#else
+  const bool glewReady = glewStatus == GLEW_OK;
+#endif
+  if (!glewReady) throw std::runtime_error("GLEW initialisation failed");
 #endif
 
   // The whole raster is uploaded as one texture.
@@ -7133,7 +7217,8 @@ void PreviewWindow::initGl() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  // Magnified without smoothing, so a small raster keeps a crisp status map.
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   // Rows are width*3 bytes, which need not be a multiple of the default 4-byte alignment.
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 }
@@ -7158,25 +7243,32 @@ void PreviewWindow::pump() {
 
 void PreviewWindow::redraw() {
   char title[64];
+  float lo = 0.0f;
+  float hi = 0.0f;
   {
+    // Only the snapshot is taken under the lock, so a worker reporting a pixel waits for these copies at
+    // most, never for the colouring below. The copies have the right size already and do not allocate.
     std::lock_guard<std::mutex> lock(mutex_);
-    const float lo = minValue_;
-    const float span = maxValue_ > lo ? maxValue_ - lo : 1.0f;
-    for (std::size_t i = 0; i < cells_.size(); ++i) {
-      Rgb c = kTodoColour;
-      switch (cells_[i]) {
-        case kTodo: break;
-        case kNoData: c = kNoDataColour; break;
-        case kQueued: c = kQueuedColour; break;
-        case kInFlight: c = kInFlightColour; break;
-        case kFailed: c = kFailedColour; break;
-        case kValue: c = valueColour((values_[i] - lo) / span); break;
-      }
-      rgb_[3 * i] = c.r;
-      rgb_[3 * i + 1] = c.g;
-      rgb_[3 * i + 2] = c.b;
-    }
+    cellsCopy_ = cells_;
+    valuesCopy_ = values_;
+    lo = minValue_;
+    hi = maxValue_;
     std::snprintf(title, sizeof title, "dl_elevation %.1f%%", percent_);
+  }
+  const float span = hi > lo ? hi - lo : 1.0f;
+  for (std::size_t i = 0; i < cellsCopy_.size(); ++i) {
+    Rgb c = kTodoColour;
+    switch (cellsCopy_[i]) {
+      case kTodo: break;
+      case kNoData: c = kNoDataColour; break;
+      case kQueued: c = kQueuedColour; break;
+      case kInFlight: c = kInFlightColour; break;
+      case kFailed: c = kFailedColour; break;
+      case kValue: c = valueColour((valuesCopy_[i] - lo) / span); break;
+    }
+    rgb_[3 * i] = c.r;
+    rgb_[3 * i + 1] = c.g;
+    rgb_[3 * i + 2] = c.b;
   }
   glfwSetWindowTitle(window_, title);
   glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
@@ -7224,10 +7316,10 @@ void PreviewWindow::onRunFinished(const RunSummary&) {}
 - [ ] **Step 8: Build, test and probe**
 
 Run: `cmake --build build && ./build/demdl_tests "[palette]"`
-Expected: builds `demdl_preview`, relinks `dl_elevation` and rebuilds `demdl_tests` with no warnings, then `All tests passed (N assertions in 4 test cases)`.
+Expected: builds `demdl_preview`, relinks `dl_elevation` and rebuilds `demdl_tests` with no warnings, then `All tests passed (N assertions in 5 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 152`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
+Expected: `100% tests passed out of 153`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --preview --dry-run; echo "exit $?"`
 Expected: the dry-run plan and `exit 0`. The "no preview support" error from Task 12 is gone, which proves the define reached `main.cpp`. No window opens because a dry run returns before the sink is created.
@@ -7273,8 +7365,11 @@ Expected: the window opens, fills top to bottom for about six seconds and closes
 Restart the WMS with 300 ms per request (`kill %1; python3 "${TMPDIR:-/tmp}/demdl-wms.py" 0.3 &`), run the same command with `--output "${TMPDIR:-/tmp}/demdl-loopback-stop.tif"` and press Ctrl-C after a few seconds.
 Expected: `stopping: interrupted; waiting for N in-flight requests` on stderr; `done: ...`, `stopped: interrupted` and `rerun with the same arguments to resume the remaining N pixels` on stdout; `exit 2`. With the 5 ms WMS back, the same command completes the file and exits 0. Closing the window by hand during a run against the 300 ms WMS hides it at once and ends with `stopped: preview window closed` and `exit 2`.
 
-Run: the first command with `--width 65536 --height 1 --output "${TMPDIR:-/tmp}/demdl-wide.tif"`
+Run: `cp "${TMPDIR:-/tmp}/demdl-loopback.tif" "${TMPDIR:-/tmp}/demdl-wide.tif"`, then the first command with `--width 65536 --height 1 --overwrite --output "${TMPDIR:-/tmp}/demdl-wide.tif"`
 Expected: `error: the raster is 65536 x 1, larger than this GPU's maximum texture size 16384; run without --preview` (the last number is the GPU's) and `exit 1`, with no request.
+
+Run: `cmp "${TMPDIR:-/tmp}/demdl-loopback.tif" "${TMPDIR:-/tmp}/demdl-wide.tif" && echo same`
+Expected: `same`. The window is opened before the first save, so `--overwrite` never replaced the file.
 
 Stop the WMS with `kill %1`.
 

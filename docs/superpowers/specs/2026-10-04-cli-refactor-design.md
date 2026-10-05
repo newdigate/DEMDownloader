@@ -494,8 +494,12 @@ summary still says `stopped:`.
 **PreviewWindow** implements the sink over GLFW 3.3 core profile in a 640x480
 resizable window titled `dl_elevation 34.0%`. It owns a per-pixel state byte
 array and a float value array under one mutex, updated by events. The main
-thread polls GLFW events, and every 500 ms rebuilds an RGB8 texture from those
-arrays and draws it on a fullscreen quad. The colours live in the header-only
+thread polls GLFW events, and every 500 ms copies those arrays, the value
+range and the title text under the mutex, then, with the mutex released,
+rebuilds an RGB8 texture from the copies and draws it on a fullscreen quad,
+magnified without smoothing so that a small raster stays a crisp status map.
+A worker reporting a pixel therefore waits for the copies at most, never for
+the colouring of every pixel. The colours live in the header-only
 `src/preview/Palette.h`, which includes no OpenGL or GLFW header, so the tests
 build it in every configuration: an `Rgb` struct with `==`; the status colours
 as named constants, to-do (NaN) dark grey (40, 40, 40), NoData blue
@@ -503,20 +507,34 @@ as named constants, to-do (NaN) dark grey (40, 40, 40), NoData blue
 magenta (255, 0, 255); and `valueColour(t)`, which maps t from 0 to 1 onto
 light blue (0, 128, 255), cyan, green, yellow and red (255, 0, 0), so that no
 value is drawn in the NoData blue, the Failed magenta or the to-do grey. NaN
-counts as 0, and t is clamped to [0, 1] first. Values are scaled over the
-minimum and maximum seen so far, so the palette stays consistent as new maxima
-arrive instead of being pinned to 700 m. The fragment shader samples the
-texture unchanged, which removes the broken `maxValue` uniform.
+counts as 0, and t is clamped to [0, 1] first. Two status colours do recur
+among the values: the top of the range (t above 0.9988) draws the same red as
+Queued, and a narrow band near t = 0.43 the same green as InFlight. Both
+states are transient, so the overlap is accepted for now; changing the status
+colours is the owner's call. Values are scaled over the minimum and maximum
+seen so far, so the palette stays consistent as new maxima arrive instead of
+being pinned to 700 m. The fragment shader samples the texture unchanged,
+which removes the broken `maxValue` uniform.
 
 The raster is uploaded as one texture, so once the window's context is
 current the constructor reads `GL_MAX_TEXTURE_SIZE` and refuses a raster
 wider or taller than that with `the raster is W x H, larger than this GPU's
-maximum texture size N; run without --preview`. `main` reports it like any
-other failure to open the window: `error: ...` and exit 1, before any
-request. The destructor does not run for a constructor that throws, so any
-failure after `glfwInit` succeeded (creating the window, GLEW on Linux, the
-texture-size check) destroys the window, if there is one, and calls
-`glfwTerminate` before the exception leaves the constructor. The first `pump`
+maximum texture size N; run without --preview`. Shaders that do not compile
+or link throw as well, with the driver's log in the message, and GLFW's own
+description of its error is appended to `GLFW initialisation failed` and to
+`GLFW could not create a window`. `main` creates the window before it first
+writes the output (section 9), so it reports any of these as `error: ...`
+and exits 1 with nothing written or requested. The destructor does not run
+for a constructor that throws, so any failure after `glfwInit` succeeded
+(creating the window, GLEW on Linux, the texture-size check, the shaders)
+destroys the window, if there is one, and calls `glfwTerminate` before the
+exception leaves the constructor. On Linux, `GLEW_ERROR_NO_GLX_DISPLAY` from
+`glewInit` is not a failure: GLEW 2.2 built for GLX returns it for an EGL
+context, as GLFW 3.4 makes them on Wayland. On macOS, GLFW is told not to
+change the working directory (`GLFW_COCOA_CHDIR_RESOURCES`), which it would
+otherwise do for an executable that macOS takes for a bundle (a `Resources`
+directory beside it, in a directory named after it), so a relative
+`--output` stays relative to where the tool was started. The first `pump`
 that finds the window closed requests a stop with reason `WindowClosed`,
 once, and hides the window at once, so the close takes effect visibly while
 in-flight requests drain; a hidden window is not drawn again. Otherwise the
@@ -550,10 +568,15 @@ window closes when the run finishes and `main` destroys the sink.
    1, dry run or not.
 6. `--dry-run`: print the plan, which says whether the output will be
    created, resumed or overwritten, and exit 0.
-7. Write the file before the first request when it is new or, resumed, still
+7. Choose the sink: `PreviewWindow` if `--preview`, else `ConsoleReporter`.
+   It comes before the first write, so a window that cannot open (no
+   display, a raster larger than the GPU's maximum texture size, shaders that
+   do not build) exits 1 with nothing written, and `--overwrite` has not yet
+   replaced the existing file.
+8. Write the file before the first request when it is new or, resumed, still
    has NaN pixels, so that a failing write, such as a full disk, exits 1
    before any request, and a new file can be opened while it fills.
-8. Install the handlers with `sigaction`, with `SA_RESTART`, SIGINT and
+9. Install the handlers with `sigaction`, with `SA_RESTART`, SIGINT and
    SIGTERM each blocking both while the handler runs. The first signal calls
    `request(StopReason::Signal)` on the shared `StopToken`. A second one
    resets its signal to the default action, unblocks it and raises it, so the
@@ -563,7 +586,6 @@ window closes when the run finishes and `main` destroys the sink.
    `sigaction`. The handler touches nothing but a signal counter and the
    token, both constant-initialised at namespace scope and made of lock-free
    atomics, and makes only async-signal-safe calls.
-9. Choose the sink: `PreviewWindow` if `--preview`, else `ConsoleReporter`.
 10. Construct the `Downloader`, whose constructor validates its options, and
     start `run()` on a `std::thread` of its own, which hands back the
     summary, or the exception that escaped, through a `std::promise`. A
@@ -847,9 +869,11 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   configuration because `Palette.h` needs no OpenGL: the five status colours
   have the values of section 8; `valueColour(0)` is (0, 128, 255) and
   `valueColour(1)` is (255, 0, 0); -1 and negative infinity give the colour of
-  0, 2 and infinity that of 1, and NaN that of 0; and 10001 evenly spaced
-  samples of [0, 1] never give the NoData blue, the Failed magenta or the
-  to-do grey.
+  0, 2 and infinity that of 1, and NaN that of 0; and across 10001 evenly
+  spaced samples of [0, 1] no channel changes by more than 2 from one sample
+  to the next, and every colour stays at least 64 away, in its largest
+  channel difference, from the NoData blue, the Failed magenta and the to-do
+  grey.
 
 `PreviewWindow` itself and the real server have no automated test. The
 window is checked by hand, in a desktop session, against a loopback WMS: a
@@ -860,7 +884,8 @@ with the file complete and prints the finish lines on stdout. With 300 ms per
 request, Ctrl-C part-way prints the `stopping:` line on stderr and the finish
 lines, `stopped: interrupted` among them, on stdout, and exits 2, and a rerun
 completes the file; closing the window part-way hides it at once and exits 2.
-A 65536 x 1 raster exits 1 with the texture-size message before any request.
+A 65536 x 1 raster exits 1 with the texture-size message before anything is
+written or requested, so with `--overwrite` an existing file keeps its bytes.
 
 ## 12. Build changes
 
@@ -881,7 +906,9 @@ A 65536 x 1 raster exits 1 with the texture-size message before any request.
 - libtiff via `find_package(TIFF REQUIRED)`; libgeotiff via `find_path` and
   `find_library` as today, now actually used.
 - Preview: glfw via pkg-config; on Apple link the OpenGL, Cocoa, IOKit and
-  CoreVideo frameworks; on Linux link GLEW and GL. No GLM, assimp, FreeType,
+  CoreVideo frameworks; on Linux link GLEW and GL. All of them are PRIVATE to
+  `demdl_preview`, whose header includes none of theirs; as a static library
+  it still hands them on to the executable's link. No GLM, assimp, FreeType,
   CoreAudio or AudioUnit.
 - `-Wall -Wextra` on `demdl`, `dl_elevation` and `demdl_preview`.
 - `.gitignore` adds `build*/`, `*.tif`, `*.tif.tmp`.

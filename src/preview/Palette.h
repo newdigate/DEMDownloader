@@ -22,6 +22,9 @@ inline constexpr Rgb kFailedColour{255, 0, 255};
 // Maps t in [0, 1] (low to high) onto light blue (0, 128, 255), cyan, green, yellow and red (255, 0, 0).
 // Stops short of pure blue (NoData) and never reaches magenta (Failed) or the to-do grey. NaN counts as 0
 // and t is clamped to [0, 1] first, so every input has a colour.
+// Two status colours do recur: the top of the range draws the same red as Queued, and a narrow band near
+// t = 0.43 the same green as InFlight. Both states are transient, so the overlap is accepted for now;
+// changing the status colours is the owner's call.
 [[nodiscard]] inline Rgb valueColour(float t) noexcept {
   const double clamped = std::isnan(t) ? 0.0 : std::clamp(static_cast<double>(t), 0.0, 1.0);
   const double a = (1.0 - clamped) * 3.5;

@@ -46,6 +46,13 @@ void main() {
 
 void onFramebufferResized(GLFWwindow*, int width, int height) { glViewport(0, 0, width, height); }
 
+// GLFW's description of its latest error as ": <description>", or nothing when it has none.
+std::string glfwReason() {
+  const char* description = nullptr;
+  if (glfwGetError(&description) != GLFW_NO_ERROR && description != nullptr) return std::string(": ") + description;
+  return {};
+}
+
 }  // namespace
 
 PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
@@ -56,6 +63,8 @@ PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
       values_(raster.pixelCount(), 0.0f),
       minValue_(std::numeric_limits<float>::infinity()),
       maxValue_(-std::numeric_limits<float>::infinity()),
+      cellsCopy_(raster.pixelCount(), kTodo),
+      valuesCopy_(raster.pixelCount(), 0.0f),
       rgb_(raster.pixelCount() * 3, 0) {
   for (int y = 0; y < height_; ++y) {
     for (int x = 0; x < width_; ++x) {
@@ -74,7 +83,13 @@ PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
   }
   const std::uint64_t done = raster.pixelCount() - raster.countNaN();
   percent_ = 100.0 * static_cast<double>(done) / static_cast<double>(raster.pixelCount());
-  if (!glfwInit()) throw std::runtime_error("GLFW initialisation failed");
+#ifdef __APPLE__
+  // Otherwise GLFW changes the working directory to the Resources directory of what macOS takes for the
+  // application bundle, which a bare executable can have too (a Resources directory beside it, in a
+  // directory named after it), and the checkpoints of a relative --output would be written there.
+  glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
+#endif
+  if (!glfwInit()) throw std::runtime_error("GLFW initialisation failed" + glfwReason());
   try {
     initGl();
   } catch (...) {
@@ -111,12 +126,22 @@ void PreviewWindow::initGl() {
   glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
   window_ = glfwCreateWindow(640, 480, "dl_elevation", nullptr, nullptr);
-  if (window_ == nullptr) throw std::runtime_error("GLFW could not create a window; is a display available?");
+  if (window_ == nullptr) {
+    throw std::runtime_error("GLFW could not create a window" + glfwReason() + "; is a display available?");
+  }
   glfwMakeContextCurrent(window_);
   glfwSetFramebufferSizeCallback(window_, onFramebufferResized);
 #ifndef __APPLE__
   glewExperimental = GL_TRUE;
-  if (glewInit() != GLEW_OK) throw std::runtime_error("GLEW initialisation failed");
+  const GLenum glewStatus = glewInit();
+#ifdef GLEW_ERROR_NO_GLX_DISPLAY
+  // GLEW 2.2 built for GLX returns this for a context made through EGL, as GLFW 3.4 makes them on Wayland,
+  // after it has loaded the core functions the preview uses, so it is not a failure here.
+  const bool glewReady = glewStatus == GLEW_OK || glewStatus == GLEW_ERROR_NO_GLX_DISPLAY;
+#else
+  const bool glewReady = glewStatus == GLEW_OK;
+#endif
+  if (!glewReady) throw std::runtime_error("GLEW initialisation failed");
 #endif
 
   // The whole raster is uploaded as one texture.
@@ -156,7 +181,8 @@ void PreviewWindow::initGl() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  // Magnified without smoothing, so a small raster keeps a crisp status map.
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   // Rows are width*3 bytes, which need not be a multiple of the default 4-byte alignment.
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 }
@@ -181,25 +207,32 @@ void PreviewWindow::pump() {
 
 void PreviewWindow::redraw() {
   char title[64];
+  float lo = 0.0f;
+  float hi = 0.0f;
   {
+    // Only the snapshot is taken under the lock, so a worker reporting a pixel waits for these copies at
+    // most, never for the colouring below. The copies have the right size already and do not allocate.
     std::lock_guard<std::mutex> lock(mutex_);
-    const float lo = minValue_;
-    const float span = maxValue_ > lo ? maxValue_ - lo : 1.0f;
-    for (std::size_t i = 0; i < cells_.size(); ++i) {
-      Rgb c = kTodoColour;
-      switch (cells_[i]) {
-        case kTodo: break;
-        case kNoData: c = kNoDataColour; break;
-        case kQueued: c = kQueuedColour; break;
-        case kInFlight: c = kInFlightColour; break;
-        case kFailed: c = kFailedColour; break;
-        case kValue: c = valueColour((values_[i] - lo) / span); break;
-      }
-      rgb_[3 * i] = c.r;
-      rgb_[3 * i + 1] = c.g;
-      rgb_[3 * i + 2] = c.b;
-    }
+    cellsCopy_ = cells_;
+    valuesCopy_ = values_;
+    lo = minValue_;
+    hi = maxValue_;
     std::snprintf(title, sizeof title, "dl_elevation %.1f%%", percent_);
+  }
+  const float span = hi > lo ? hi - lo : 1.0f;
+  for (std::size_t i = 0; i < cellsCopy_.size(); ++i) {
+    Rgb c = kTodoColour;
+    switch (cellsCopy_[i]) {
+      case kTodo: break;
+      case kNoData: c = kNoDataColour; break;
+      case kQueued: c = kQueuedColour; break;
+      case kInFlight: c = kInFlightColour; break;
+      case kFailed: c = kFailedColour; break;
+      case kValue: c = valueColour((valuesCopy_[i] - lo) / span); break;
+    }
+    rgb_[3 * i] = c.r;
+    rgb_[3 * i + 1] = c.g;
+    rgb_[3 * i + 2] = c.b;
   }
   glfwSetWindowTitle(window_, title);
   glClearColor(0.1f, 0.1f, 0.1f, 1.0f);

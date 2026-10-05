@@ -181,6 +181,10 @@ int main(int argc, char** argv) {
   policy.maxRetries = cfg.maxRetries;
 
   std::optional<DemRaster> raster;
+  std::unique_ptr<ProgressSink> sink;
+#ifdef DL_ELEVATION_HAVE_PREVIEW
+  PreviewWindow* preview = nullptr;
+#endif
   try {
     const bool outputExists = std::filesystem::exists(cfg.output);
     const char* outputPlan = "will be created";
@@ -211,6 +215,17 @@ int main(int argc, char** argv) {
       printPlan(cfg, *raster, outputPlan);
       return cli::kExitComplete;
     }
+    // The sink comes before the first write, so a preview window that cannot open (no display, a raster
+    // larger than the GPU's textures) ends the run with nothing written, and --overwrite has not yet
+    // replaced the existing file.
+#ifdef DL_ELEVATION_HAVE_PREVIEW
+    if (cfg.preview) {
+      auto window = std::make_unique<PreviewWindow>(*raster, g_stopToken);
+      preview = window.get();
+      sink = std::move(window);
+    }
+#endif
+    if (!sink) sink = std::make_unique<ConsoleReporter>(std::cout, cfg.verbose);
     if (writesOutput) raster->save(cfg.output);
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
@@ -218,22 +233,6 @@ int main(int argc, char** argv) {
   }
 
   installSignalHandlers();
-
-  std::unique_ptr<ProgressSink> sink;
-#ifdef DL_ELEVATION_HAVE_PREVIEW
-  PreviewWindow* preview = nullptr;
-  if (cfg.preview) {
-    try {
-      auto window = std::make_unique<PreviewWindow>(*raster, g_stopToken);
-      preview = window.get();
-      sink = std::move(window);
-    } catch (const std::exception& e) {
-      std::cerr << "error: " << e.what() << "\n";
-      return cli::kExitError;
-    }
-  }
-#endif
-  if (!sink) sink = std::make_unique<ConsoleReporter>(std::cout, cfg.verbose);
 
   const FetcherFactory factory = [&cfg, policy](int) -> std::unique_ptr<PixelFetcher> {
     return std::make_unique<ElevationClient>(cfg, policy);

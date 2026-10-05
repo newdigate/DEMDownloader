@@ -89,16 +89,18 @@ if(DL_ELEVATION_PREVIEW)
   find_package(PkgConfig REQUIRED)
   pkg_search_module(glfw REQUIRED IMPORTED_TARGET glfw3)
   add_library(demdl_preview STATIC src/preview/PreviewWindow.cpp)
-  target_link_libraries(demdl_preview PUBLIC demdl PkgConfig::glfw)
+  # PreviewWindow.h includes no GLFW or OpenGL header, so those stay PRIVATE; a static library still hands
+  # them on to whatever links it, for linking only.
+  target_link_libraries(demdl_preview PUBLIC demdl PRIVATE PkgConfig::glfw)
   target_compile_definitions(demdl_preview PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_options(demdl_preview PRIVATE -Wall -Wextra)
   if(APPLE)
-    target_link_libraries(demdl_preview PUBLIC
+    target_link_libraries(demdl_preview PRIVATE
       "-framework OpenGL" "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
   else()
     find_package(OpenGL REQUIRED)
     pkg_search_module(glew REQUIRED IMPORTED_TARGET glew)
-    target_link_libraries(demdl_preview PUBLIC OpenGL::GL PkgConfig::glew)
+    target_link_libraries(demdl_preview PRIVATE OpenGL::GL PkgConfig::glew)
   endif()
   target_link_libraries(dl_elevation PRIVATE demdl_preview)
   target_compile_definitions(dl_elevation PRIVATE DL_ELEVATION_HAVE_PREVIEW)

@@ -1,8 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <string>
-#include <vector>
 
 #include "preview/Palette.h"
 
@@ -20,6 +21,16 @@ struct StringMaker<Rgb> {
 };
 
 }  // namespace Catch
+
+namespace {
+
+// The largest difference between two colours in any one channel.
+int distance(Rgb a, Rgb b) { return std::max({std::abs(a.r - b.r), std::abs(a.g - b.g), std::abs(a.b - b.b)}); }
+
+// The i-th of 10001 evenly spaced samples of [0, 1], both ends included.
+float sample(int i) { return static_cast<float>(i) / 10000.0f; }
+
+}  // namespace
 
 TEST_CASE("the status colours are the spec's", "[palette]") {
   CHECK(demdl::kTodoColour == Rgb{40, 40, 40});
@@ -42,13 +53,32 @@ TEST_CASE("a value outside 0 to 1 is clamped and NaN counts as the minimum", "[p
   CHECK(valueColour(std::numeric_limits<float>::quiet_NaN()) == valueColour(0.0f));
 }
 
-TEST_CASE("no value is drawn in the NoData, Failed or to-do colour", "[palette]") {
-  // 10001 evenly spaced samples of [0, 1], both ends included.
-  std::vector<float> clashes;
-  for (int i = 0; i <= 10000; ++i) {
-    const float t = static_cast<float>(i) / 10000.0f;
-    const Rgb c = valueColour(t);
-    if (c == demdl::kNoDataColour || c == demdl::kFailedColour || c == demdl::kTodoColour) clashes.push_back(t);
+TEST_CASE("the value colours change by at most 2 per channel from one sample to the next", "[palette]") {
+  int largest = 0;
+  float where = 0.0f;
+  for (int i = 1; i <= 10000; ++i) {
+    const int step = distance(valueColour(sample(i - 1)), valueColour(sample(i)));
+    if (step > largest) {
+      largest = step;
+      where = sample(i);
+    }
   }
-  CHECK(clashes == std::vector<float>{});
+  INFO("the largest step ends at t = " << where);
+  CHECK(largest <= 2);
+}
+
+TEST_CASE("every value colour is at least 64 from the NoData, Failed and to-do colours", "[palette]") {
+  int nearest = 255;
+  float where = 0.0f;
+  for (int i = 0; i <= 10000; ++i) {
+    const Rgb c = valueColour(sample(i));
+    const int d = std::min(
+        {distance(c, demdl::kNoDataColour), distance(c, demdl::kFailedColour), distance(c, demdl::kTodoColour)});
+    if (d < nearest) {
+      nearest = d;
+      where = sample(i);
+    }
+  }
+  INFO("the nearest is at t = " << where);
+  CHECK(nearest >= 64);
 }
