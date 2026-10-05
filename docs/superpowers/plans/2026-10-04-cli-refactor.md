@@ -883,10 +883,9 @@ TEST_CASE("the value is the number at the start of the marker's line", "[wmsquer
 }
 
 TEST_CASE("a number with other text glued to it is a parse error", "[wmsquery]") {
-  // strtod would read 1, 12, 12, 12.5 and 42.5 from these, and a stored value is never fetched again;
-  // a parse error is retried.
-  for (const char* body :
-       {"BAND 0: 1.#QNAN", "BAND 0: 12,5", "BAND 0: 12abc", "BAND 0: 12.5e", "<pre>BAND 0: 42.5</pre>"}) {
+  // strtod would read 1, 12, 12 and 12.5 from these, and a stored value is never fetched again; a parse
+  // error is retried.
+  for (const char* body : {"BAND 0: 1.#QNAN", "BAND 0: 12,5", "BAND 0: 12abc", "BAND 0: 12.5e"}) {
     CAPTURE(body);
     CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
   }
@@ -907,10 +906,13 @@ TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsqu
   const std::string owsReport = "  <?xml version=\"1.0\"?><ows:ExceptionReport/>";
   CHECK(parseElevation(owsReport).kind == ParseResult::Kind::ParseError);
 
-  // The band marker still wins over markup.
-  const auto wrapped = parseElevation("<pre>BAND 0: 42.5\n</pre>");
-  REQUIRE(wrapped.kind == ParseResult::Kind::Value);
-  CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
+  // The band marker still wins over markup. No number can contain '<', so it may end one.
+  for (const char* body : {"<pre>BAND 0: 42.5</pre>", "<pre>BAND 0: 42.5\n</pre>"}) {
+    CAPTURE(body);
+    const auto wrapped = parseElevation(body);
+    REQUIRE(wrapped.kind == ParseResult::Kind::Value);
+    CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
+  }
 }
 
 TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") {
@@ -1006,11 +1008,11 @@ std::string featureInfoUrl(const Config& cfg, int x, int y);
 
 // Classifies the text/plain body of a GetFeatureInfo response.
 // "BAND 0:" anywhere in the body is a band, whatever else the body says. The number that starts the
-// rest of that line is the value, and it must end the line or be followed by whitespace: trailing text
-// such as " m" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError, because a Value is stored
-// for good while a ParseError is retried. The number must be on the marker's own line. It is a Value
-// only when finite and within float range (the raster stores float32, so a Value always fits in a
-// float); no number, "nan", "inf" and 1e300 are ParseError.
+// rest of that line is the value, and it must be followed by whitespace, '<' or the end of the body:
+// trailing text such as " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError,
+// because a Value is stored for good while a ParseError is retried. The number must be on the
+// marker's own line. It is a Value only when finite and within float range (the raster stores
+// float32, so a Value always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
 // Without the marker the body is NoData only when it is not blank (empty or only whitespace), does
 // not contain "ServiceException" and does not start with markup ('<' as the first non-whitespace
 // character). NoData is stored as -32768 and never re-requested, so any other body, such as an
@@ -1110,10 +1112,11 @@ ParseResult parseElevation(std::string_view body) {
   const char* begin = token.c_str();
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
-  // The number must end the line or be followed by whitespace. strtod stops at the first character
-  // it cannot use, so "12,5", "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for
-  // good and never fetched again; as a parse error the pixel is retried.
-  const bool ended = end == begin + token.size() || isWhitespace(*end);
+  // The number must be followed by whitespace, '<' or the end of the body: no number contains '<', so
+  // markup such as "</pre>" may end one. strtod stops at the first character it cannot use, so "12,5",
+  // "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for good and never fetched
+  // again; as a parse error the pixel is retried.
+  const bool ended = end == begin + token.size() || isWhitespace(*end) || *end == '<';
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
   // unfetched pixel and be requested again on every run. The raster stores float32, so values
   // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does

@@ -84,10 +84,11 @@ ParseResult parseElevation(std::string_view body) {
   const char* begin = token.c_str();
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
-  // The number must end the line or be followed by whitespace. strtod stops at the first character
-  // it cannot use, so "12,5", "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for
-  // good and never fetched again; as a parse error the pixel is retried.
-  const bool ended = end == begin + token.size() || isWhitespace(*end);
+  // The number must be followed by whitespace, '<' or the end of the body: no number contains '<', so
+  // markup such as "</pre>" may end one. strtod stops at the first character it cannot use, so "12,5",
+  // "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for good and never fetched
+  // again; as a parse error the pixel is retried.
+  const bool ended = end == begin + token.size() || isWhitespace(*end) || *end == '<';
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
   // unfetched pixel and be requested again on every run. The raster stores float32, so values
   // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does

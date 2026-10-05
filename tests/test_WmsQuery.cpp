@@ -84,10 +84,9 @@ TEST_CASE("the value is the number at the start of the marker's line", "[wmsquer
 }
 
 TEST_CASE("a number with other text glued to it is a parse error", "[wmsquery]") {
-  // strtod would read 1, 12, 12, 12.5 and 42.5 from these, and a stored value is never fetched again;
-  // a parse error is retried.
-  for (const char* body :
-       {"BAND 0: 1.#QNAN", "BAND 0: 12,5", "BAND 0: 12abc", "BAND 0: 12.5e", "<pre>BAND 0: 42.5</pre>"}) {
+  // strtod would read 1, 12, 12 and 12.5 from these, and a stored value is never fetched again; a parse
+  // error is retried.
+  for (const char* body : {"BAND 0: 1.#QNAN", "BAND 0: 12,5", "BAND 0: 12abc", "BAND 0: 12.5e"}) {
     CAPTURE(body);
     CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
   }
@@ -108,10 +107,13 @@ TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsqu
   const std::string owsReport = "  <?xml version=\"1.0\"?><ows:ExceptionReport/>";
   CHECK(parseElevation(owsReport).kind == ParseResult::Kind::ParseError);
 
-  // The band marker still wins over markup.
-  const auto wrapped = parseElevation("<pre>BAND 0: 42.5\n</pre>");
-  REQUIRE(wrapped.kind == ParseResult::Kind::Value);
-  CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
+  // The band marker still wins over markup. No number can contain '<', so it may end one.
+  for (const char* body : {"<pre>BAND 0: 42.5</pre>", "<pre>BAND 0: 42.5\n</pre>"}) {
+    CAPTURE(body);
+    const auto wrapped = parseElevation(body);
+    REQUIRE(wrapped.kind == ParseResult::Kind::Value);
+    CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
+  }
 }
 
 TEST_CASE("a WMS service exception is a parse error, not NoData", "[wmsquery]") {

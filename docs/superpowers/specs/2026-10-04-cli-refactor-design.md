@@ -46,7 +46,7 @@ Non-goals for this iteration:
 |---|---|
 | Output format | Single-band float32 GeoTIFF in metres. Old RGB16 files are not resumable and are left untouched. |
 | TLS | Verify certificates by default using the system trust store. `--ca-bundle` replaces that store rather than adding to it; `--insecure` disables verification. |
-| Response parsing | Parse the whole number after `BAND 0:`, which must end the line or be followed by whitespace. A 200 body is NoData only when it lacks the marker and is plain (not blank, no `ServiceException`, not markup); anything else without a finite in-range number is a parse error. Parse errors and transport failures are retried, then left for the next run. |
+| Response parsing | Parse the whole number after `BAND 0:`, which must be followed by whitespace, `<` or the end of the body. A 200 body is NoData only when it lacks the marker and is plain (not blank, no `ServiceException`, not markup); anything else without a finite in-range number is a parse error. Parse errors and transport failures are retried, then left for the next run. |
 | Concurrency | `--threads` default 8 (was 50). Exponential backoff between retries. `--max-retries` default 8 (was 500). |
 | Shutdown | SIGINT, SIGTERM and SIGHUP (unless ignored at startup, as under `nohup`) stop queueing, drain in-flight requests, save, exit. |
 | Preview | Off by default; `--preview` opens the window. |
@@ -161,11 +161,12 @@ target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
 `Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins over
 everything else in the body. The number at the start of the marker's line is
-parsed, and it must end the line or be followed by whitespace (space, tab, CR,
-LF, VT or FF), after which any text is ignored: `BAND 0: 12.5 m` is 12.5, but
-text glued to the number, as in `1.#QNAN`, `12,5`, `12abc` or `12.5e`, makes
-a `ParseError`, because a stored value is final and never fetched again while
-a parse error is retried. A number on the next line does not count. The
+parsed, and it must be followed by whitespace (space, tab, CR, LF, VT or FF),
+`<` or the end of the body, after which any text is ignored: `BAND 0: 12.5 m`
+is 12.5, and so is `<pre>BAND 0: 12.5</pre>`, because no number contains `<`;
+but text glued to the number, as in `1.#QNAN`, `12,5`, `12abc` or `12.5e`,
+makes a `ParseError`, because a stored value is final and never fetched again
+while a parse error is retried. A number on the next line does not count. The
 result is a `Value` only when the number is finite and within float range,
 because the raster stores float32; anything else (no number, `nan`, `inf`,
 `1e300`) is a `ParseError`. Without the marker the body
@@ -795,21 +796,20 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   (`%25`); `featureInfoUrl` throws `std::invalid_argument` when the WMS URL
   does not parse; parsing of `BAND 0: 123.45`, `BAND 0: -1.5` and
   `BAND 0: 1086.25`; `BAND 0: 12.5 m`, `BAND 0: 12.5\tm`, `BAND 0: 12.5\r\n`
-  and `BAND 0: 12.5` at the end of the body (all 12.5: the number may end
-  the line or be followed by whitespace and any text); `BAND 0: abc`,
+  and `BAND 0: 12.5` at the end of the body (all 12.5: whitespace or `<` and
+  then any text may follow the number, or nothing); `BAND 0: abc`,
   `BAND 0:`, `BAND 0:` followed by a newline and a number, `BAND 0: nan`,
   `BAND 0: inf`, `BAND 0: -inf`, `BAND 0: 1e300`, `BAND 0: -1e300`,
   `BAND 0: 3.5e38` and, with text glued to the number, `BAND 0: 1.#QNAN`,
-  `BAND 0: 12,5`, `BAND 0: 12abc`, `BAND 0: 12.5e` and
-  `<pre>BAND 0: 42.5</pre>` (all ParseError), while
+  `BAND 0: 12,5`, `BAND 0: 12abc` and `BAND 0: 12.5e` (all ParseError), while
   `BAND 0: 3.4028234663852886e38`, exactly `FLT_MAX`, is a Value; a body
   without the marker is NoData when it is plain, such as
   `GetFeatureInfo results:` or `GetFeatureInfo results:\nno bands\n`, but an
   empty body, a whitespace-only body, an HTML page, an XML
   `ows:ExceptionReport` after leading spaces and a `ServiceException` body are
   ParseError, and the band marker wins over all of them when it is present
-  (`<pre>BAND 0: 42.5\n</pre>` is 42.5); a default-constructed `ParseResult`
-  is a ParseError.
+  (`<pre>BAND 0: 42.5</pre>` and `<pre>BAND 0: 42.5\n</pre>` are 42.5); a
+  default-constructed `ParseResult` is a ParseError.
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp
