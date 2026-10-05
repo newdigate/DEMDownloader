@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.27)
+# CMake 3.29+ de-duplicates static libraries on the link line (CMP0156); without it, naming demdl
+# directly and again through demdl_cli's PUBLIC link makes the Xcode 15 linker warn about a duplicate.
+if(POLICY CMP0156)
+  cmake_policy(SET CMP0156 NEW)
+endif()
 project(DownloadElevation VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

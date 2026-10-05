@@ -25,6 +25,7 @@
 
 ## Working conventions
 
+- Catch2 test names must not begin with `-`: ctest passes the name to the binary as an argument, and Catch2 reads it as an option, so such a case is skipped or fails with 'Unrecognised token'.
 - Work on a branch: `git switch -c refactor/cli` before Task 1, or in a worktree per `superpowers:using-git-worktrees`.
 - Build directory is `build/`. Configure once with `cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B build`. Rebuild with `cmake --build build`. Run every test with `ctest --test-dir build --output-on-failure`. Run one unit's cases by tag, for example `./build/demdl_tests "[wmsquery]"`.
 - Headers start with `#pragma once`. Everything lives in `namespace demdl`; test helpers in `tests/` are in the global namespace.
@@ -5179,6 +5180,16 @@ Then update the test target:
     tests/test_ConsoleReporter.cpp
     tests/test_Cli.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl demdl_cli Catch2::Catch2WithMain)
+```
+
+Insert right after `cmake_minimum_required`:
+
+```cmake
+# CMake 3.29+ de-duplicates static libraries on the link line (CMP0156); without it, naming demdl
+# directly and again through demdl_cli's PUBLIC link makes the Xcode 15 linker warn about a duplicate.
+if(POLICY CMP0156)
+  cmake_policy(SET CMP0156 NEW)
+endif()
 ```
 
 - [ ] **Step 3: Build to verify it fails**
