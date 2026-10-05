@@ -246,13 +246,17 @@ TEST_CASE("a stop request saves the partial row and goes no further", "[download
 TEST_CASE("too many consecutive failures stop the run", "[downloader]") {
   Fixture f;
   auto raster = DemRaster::create(10, 1, kBox, {});
-  Downloader d(raster, f.output, f.factory([](int, int) { return failedResult("connection refused"); }),
+  // One worker takes the columns in order, and only the third failure, which reaches the limit,
+  // says "connection refused": the stop message must name that one.
+  Downloader d(raster, f.output, f.factory([](int x, int) {
+                 return failedResult(x == 2 ? "connection refused" : "http 503");
+               }),
                f.sink, f.stop, DownloaderOptions{1, 3});
 
   const demdl::RunSummary summary = d.run();
 
   CHECK(summary.stopReason == StopReason::ConsecutiveFailures);
-  CHECK(summary.stopMessage == "server unreachable: 3 consecutive failures");
+  CHECK(summary.stopMessage == "server unreachable: 3 consecutive failures; last error: connection refused");
   CHECK(summary.failed == 3);
   CHECK(f.calls.load() == 3);
   CHECK(summary.remainingNaN == 10);

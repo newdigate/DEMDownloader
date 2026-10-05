@@ -19,7 +19,7 @@
 3. The shared stop flag is wrapped in a `StopToken` (an atomic bool plus an atomic `StopReason`) so the signal handler, the preview window and the downloader can all record why the run stopped. `PixelFetcher::fetch` still receives a bare `const std::atomic<bool>&`.
 4. `Config` gets a `.cpp` for `validate()` and `parseWmsUrl()`, and `WmsQuery` exposes `formatCoordinate()` so the URL, the mismatch report and the dry run print degrees identically.
 5. The `stopping: ...` line is printed by `main`, which polls the token every 100 ms, because nothing may print from inside a signal handler.
-6. httplib timeouts use the `(seconds, microseconds)` overloads, which exist in every version in play.
+6. httplib timeouts use the `(seconds, microseconds)` overloads, which exist in every version in play; `set_max_timeout`, which has no such overload, takes milliseconds.
 7. The value palette in the preview spans red to light blue rather than the full rainbow, so the minimum value is not pure blue (NoData) and the magenta end (Failed) is never used for a value.
 8. The raster's metadata struct is `RasterMetadata`, and reads and writes go through `at() const` and `set()` rather than a `float&` accessor, so every concurrent write passes through one function.
 
@@ -3116,13 +3116,17 @@ TEST_CASE("a stop request saves the partial row and goes no further", "[download
 TEST_CASE("too many consecutive failures stop the run", "[downloader]") {
   Fixture f;
   auto raster = DemRaster::create(10, 1, kBox, {});
-  Downloader d(raster, f.output, f.factory([](int, int) { return failedResult("connection refused"); }),
+  // One worker takes the columns in order, and only the third failure, which reaches the limit,
+  // says "connection refused": the stop message must name that one.
+  Downloader d(raster, f.output, f.factory([](int x, int) {
+                 return failedResult(x == 2 ? "connection refused" : "http 503");
+               }),
                f.sink, f.stop, DownloaderOptions{1, 3});
 
   const demdl::RunSummary summary = d.run();
 
   CHECK(summary.stopReason == StopReason::ConsecutiveFailures);
-  CHECK(summary.stopMessage == "server unreachable: 3 consecutive failures");
+  CHECK(summary.stopMessage == "server unreachable: 3 consecutive failures; last error: connection refused");
   CHECK(summary.failed == 3);
   CHECK(f.calls.load() == 3);
   CHECK(summary.remainingNaN == 10);
@@ -3305,6 +3309,9 @@ Expected: FAIL with `Cannot find source file: src/demdl/Downloader.cpp`.
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 
 #include "demdl/DemRaster.h"
 #include "demdl/PixelFetcher.h"
@@ -3363,6 +3370,8 @@ class Downloader {
     std::atomic<std::uint64_t> noData{0};
     std::atomic<std::uint64_t> failed{0};
     std::atomic<int> consecutiveFailures{0};  // reset by every Value or NoData
+    std::mutex limitMutex;
+    std::optional<std::string> limitError;  // guarded by limitMutex; the failure that reached the limit
   };
 
   // One pool job: unless a stop came first, fetches pixel (x, row), stores the result, updates the
@@ -3393,6 +3402,7 @@ class Downloader {
 #include <cstdint>
 #include <exception>
 #include <future>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -3513,6 +3523,8 @@ RunSummary Downloader::run() {
   if (summary.stopReason == StopReason::ConsecutiveFailures) {
     summary.stopMessage =
         "server unreachable: " + std::to_string(options_.maxConsecutiveFailures) + " consecutive failures";
+    const std::lock_guard<std::mutex> lock(runTally.limitMutex);
+    if (runTally.limitError) summary.stopMessage += "; last error: " + *runTally.limitError;
   } else {
     summary.stopMessage = describe(summary.stopReason);
   }
@@ -3566,7 +3578,13 @@ void Downloader::fetchPixel(PixelFetcher& fetcher, int x, int row, RowTally& row
       const int streak = ++runTally.consecutiveFailures;
       sink_.onPixelState(PixelEvent{
           .x = x, .y = row, .state = PixelState::Failed, .attempts = result.attempts, .error = result.error});
-      if (streak >= options_.maxConsecutiveFailures) stop_.request(StopReason::ConsecutiveFailures);
+      if (streak >= options_.maxConsecutiveFailures) {
+        {
+          const std::lock_guard<std::mutex> lock(runTally.limitMutex);
+          if (!runTally.limitError) runTally.limitError = result.error;  // the first to reach the limit
+        }
+        stop_.request(StopReason::ConsecutiveFailures);
+      }
       break;
     }
   }
@@ -3607,17 +3625,29 @@ Implements spec section 4.3 (ElevationClient) and the in-process server test in 
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "ExampleConfig.h"
+#include "TempDir.h"
 #include "demdl/ElevationClient.h"
 
 using namespace std::chrono_literals;
@@ -3625,6 +3655,7 @@ using demdl::Config;
 using demdl::ElevationClient;
 using demdl::FetchResult;
 using demdl::RetryPolicy;
+using demdl::describeUnparseableBody;
 
 namespace {
 
@@ -3647,65 +3678,150 @@ Config configFor(const std::string& wmsUrl) {
   return c;
 }
 
-// Serves canned GetFeatureInfo bodies on loopback. The pixel column I selects the behaviour: 0 a
-// band value, 1 a plain body without a band, 2 a 500 and then a band value, 4 a 200 service
-// exception report, any other column a 404. Every request's remote port and decoded parameters are
-// recorded. httplib re-encodes the query on the wire (%2C goes out as ','), so tests compare the
-// decoded parameters and never the raw request target.
+// A self-signed EC P-256 certificate for 127.0.0.1, made at test time so that no key is committed.
+// It is valid from an hour ago to a day ahead and carries subjectAltName IP:127.0.0.1 and
+// basicConstraints CA:TRUE, so that as a CA bundle it is its own trust anchor.
+struct LoopbackCertificate {
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key{EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256"),
+                                                          &EVP_PKEY_free};
+  std::unique_ptr<X509, decltype(&X509_free)> cert{X509_new(), &X509_free};
+
+  LoopbackCertificate() {
+    REQUIRE(key != nullptr);
+    REQUIRE(cert != nullptr);
+    X509* const x = cert.get();
+    X509_NAME* const name = X509_get_subject_name(x);
+    const auto* const commonName = reinterpret_cast<const unsigned char*>("127.0.0.1");
+    REQUIRE(X509_set_version(x, X509_VERSION_3) == 1);
+    REQUIRE(ASN1_INTEGER_set(X509_get_serialNumber(x), 1) == 1);
+    REQUIRE(X509_gmtime_adj(X509_getm_notBefore(x), -60 * 60) != nullptr);
+    REQUIRE(X509_gmtime_adj(X509_getm_notAfter(x), 24 * 60 * 60) != nullptr);
+    REQUIRE(X509_set_pubkey(x, key.get()) == 1);
+    REQUIRE(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, commonName, -1, -1, 0) == 1);
+    REQUIRE(X509_set_issuer_name(x, name) == 1);
+    X509V3_CTX ctx{};
+    X509V3_set_ctx(&ctx, x, x, nullptr, nullptr, 0);
+    for (const auto& [nid, value] : {std::pair{NID_subject_alt_name, "IP:127.0.0.1"},
+                                     std::pair{NID_basic_constraints, "critical,CA:TRUE"}}) {
+      X509_EXTENSION* const extension = X509V3_EXT_conf_nid(nullptr, &ctx, nid, value);
+      REQUIRE(extension != nullptr);
+      const int added = X509_add_ext(x, extension, -1);
+      X509_EXTENSION_free(extension);
+      REQUIRE(added == 1);
+    }
+    REQUIRE(X509_sign(x, key.get(), EVP_sha256()) > 0);
+  }
+
+  // Writes the certificate as PEM, for use as a CA bundle.
+  void writePem(const std::filesystem::path& path) const {
+    std::FILE* const file = std::fopen(path.c_str(), "w");
+    REQUIRE(file != nullptr);
+    const int written = PEM_write_X509(file, cert.get());
+    REQUIRE(std::fclose(file) == 0);
+    REQUIRE(written == 1);
+  }
+};
+
+// An httplib::SSLServer presenting the certificate. httplib 0.46 has no constructor that takes an
+// X509* and an EVP_PKEY*, so the context callback installs them; SSL_CTX_use_certificate and
+// SSL_CTX_use_PrivateKey take references of their own.
+std::unique_ptr<httplib::Server> tlsServer(const LoopbackCertificate& certificate) {
+  return std::make_unique<httplib::SSLServer>([&certificate](httplib::tls::ctx_t ctx) {
+    auto* const ssl = static_cast<SSL_CTX*>(ctx);
+    return SSL_CTX_use_certificate(ssl, certificate.cert.get()) == 1 &&
+           SSL_CTX_use_PrivateKey(ssl, certificate.key.get()) == 1;
+  });
+}
+
+// The pixel column I of a request, or -1 unless it is a single digit from 0 to 7.
+int columnOf(const httplib::Request& req) {
+  const std::string i = req.get_param_value("I");
+  return i.size() == 1 && i[0] >= '0' && i[0] <= '7' ? i[0] - '0' : -1;
+}
+
+constexpr const char* kServiceExceptionReport =
+    R"(<?xml version="1.0"?><ServiceExceptionReport>)"
+    R"(<ServiceException code="LayerNotDefined">no such layer</ServiceException>)"
+    R"(</ServiceExceptionReport>)";
+
+// What the server decoded from one request.
+struct SeenRequest {
+  std::map<std::string, std::string> params;  // BBOX, LAYERS, QUERY_LAYERS, I and J
+  std::vector<std::string> userAgents;         // every User-Agent header value
+};
+
+// Serves canned GetFeatureInfo bodies on loopback, over plain HTTP or, given a certificate, over TLS.
+// The pixel column I selects the behaviour: 0 a band value, 1 a plain body without a band, 2 a 500
+// and then a band value, 4 a 200 service exception report, any other column a 404. Hits are counted
+// per column; the remote port of every request and what the latest one carried are recorded.
+// httplib re-encodes the query on the wire (%2C goes out as ','), so tests compare the decoded
+// parameters and never the raw request target.
 struct CannedServer {
-  httplib::Server server;
+  std::unique_ptr<httplib::Server> server;
+  std::string scheme;
   std::thread thread;
-  std::atomic<int> hitsForColumn2{0};
-  std::atomic<int> hitsForColumn4{0};
+  std::array<std::atomic<int>, 8> hits{};  // indexed by column
   std::mutex mutex;
-  std::set<int> remotePorts;                      // guarded by mutex; one port per connection
-  std::map<std::string, std::string> lastParams;  // guarded by mutex; BBOX, LAYERS, I and J
+  std::set<int> remotePorts;  // guarded by mutex; one port per connection
+  SeenRequest latest;         // guarded by mutex
   int port = 0;
 
-  CannedServer() {
-    server.Get("/wms", [this](const httplib::Request& req, httplib::Response& res) {
-      {
-        const std::lock_guard<std::mutex> lock(mutex);
-        remotePorts.insert(req.remote_port);
-        for (const char* key : {"BBOX", "LAYERS", "I", "J"}) lastParams[key] = req.get_param_value(key);
-      }
-      const std::string column = req.get_param_value("I");
-      if (column == "0") {
-        res.set_content("GetFeatureInfo results:\nBAND 0: 12.5\n", "text/plain");
-      } else if (column == "1") {
-        res.set_content("GetFeatureInfo results:\n", "text/plain");
-      } else if (column == "2") {
-        if (hitsForColumn2++ == 0) {
-          res.status = 500;
-        } else {
-          res.set_content("BAND 0: 7\n", "text/plain");
-        }
-      } else if (column == "4") {
-        ++hitsForColumn4;
-        res.set_content(R"(<?xml version="1.0"?><ServiceExceptionReport>)"
-                        R"(<ServiceException code="LayerNotDefined">no such layer</ServiceException>)"
-                        R"(</ServiceExceptionReport>)",
-                        "application/vnd.ogc.se_xml");
-      } else {
-        res.status = 404;
-      }
-    });
-    port = server.bind_to_any_port("127.0.0.1");
-    thread = std::thread([this] { server.listen_after_bind(); });
-    server.wait_until_ready();
+  CannedServer() : CannedServer(std::make_unique<httplib::Server>(), "http") {}
+  explicit CannedServer(const LoopbackCertificate& certificate)
+      : CannedServer(tlsServer(certificate), "https") {}
+  CannedServer(std::unique_ptr<httplib::Server> s, std::string urlScheme)
+      : server(std::move(s)), scheme(std::move(urlScheme)) {
+    REQUIRE(server->is_valid());
+    server->Get("/wms", [this](const httplib::Request& req, httplib::Response& res) { respond(req, res); });
+    port = server->bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    thread = std::thread([this] { server->listen_after_bind(); });
+    server->wait_until_ready();
   }
   ~CannedServer() {
-    server.stop();
+    server->stop();
     thread.join();
   }
-  std::string url() const { return "http://127.0.0.1:" + std::to_string(port) + "/wms"; }
+
+  void respond(const httplib::Request& req, httplib::Response& res) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      remotePorts.insert(req.remote_port);
+      latest = SeenRequest{};
+      for (const char* key : {"BBOX", "LAYERS", "QUERY_LAYERS", "I", "J"}) {
+        latest.params[key] = req.get_param_value(key);
+      }
+      for (std::size_t i = 0; i < req.get_header_value_count("User-Agent"); ++i) {
+        latest.userAgents.push_back(req.get_header_value("User-Agent", "", i));
+      }
+    }
+    const int column = columnOf(req);
+    const int hit = column < 0 ? 0 : ++hits[static_cast<std::size_t>(column)];  // 1 on the first
+    if (column == 0) {
+      res.set_content("GetFeatureInfo results:\nBAND 0: 12.5\n", "text/plain");
+    } else if (column == 1) {
+      res.set_content("GetFeatureInfo results:\n", "text/plain");
+    } else if (column == 2) {
+      if (hit == 1) {
+        res.status = 500;
+      } else {
+        res.set_content("BAND 0: 7\n", "text/plain");
+      }
+    } else if (column == 4) {
+      res.set_content(kServiceExceptionReport, "application/vnd.ogc.se_xml");
+    } else {
+      res.status = 404;
+    }
+  }
+
+  std::string url() const { return scheme + "://127.0.0.1:" + std::to_string(port) + "/wms"; }
   std::size_t distinctRemotePorts() {
     const std::lock_guard<std::mutex> lock(mutex);
     return remotePorts.size();
   }
-  std::map<std::string, std::string> latestParams() {
+  SeenRequest latestRequest() {
     const std::lock_guard<std::mutex> lock(mutex);
-    return lastParams;
+    return latest;
   }
 };
 
@@ -3738,7 +3854,7 @@ TEST_CASE("a 500 is retried and the second attempt succeeds", "[elevationclient]
   CHECK(r.kind == FetchResult::Kind::Value);
   CHECK(r.value == 7.0f);
   CHECK(r.attempts == 2);
-  CHECK(srv.hitsForColumn2.load() == 2);
+  CHECK(srv.hits[2].load() == 2);
 }
 
 TEST_CASE("a status that never recovers fails after the retries", "[elevationclient]") {
@@ -3749,6 +3865,7 @@ TEST_CASE("a status that never recovers fails after the retries", "[elevationcli
   CHECK(r.kind == FetchResult::Kind::Failed);
   CHECK(r.attempts == 3);
   CHECK(r.error == "http 404");
+  CHECK(srv.hits[3].load() == 3);
 }
 
 TEST_CASE("a 200 service exception is retried and then fails", "[elevationclient]") {
@@ -3759,11 +3876,12 @@ TEST_CASE("a 200 service exception is retried and then fails", "[elevationclient
   CHECK(r.kind == FetchResult::Kind::Failed);
   CHECK(r.attempts == 3);
   CHECK(r.error == "unparseable body");
-  CHECK(srv.hitsForColumn4.load() == 3);
+  CHECK(srv.hits[4].load() == 3);
 }
 
 TEST_CASE("a refused connection fails after the retries with a transport error", "[elevationclient]") {
-  // Port 1 is privileged and never has a listener on a developer machine.
+  // On macOS unprivileged processes can bind low ports; the assumption is only that nothing listens
+  // on port 1 on a developer machine, so the connection is refused at once.
   ElevationClient client(configFor("http://127.0.0.1:1/wms"), fastPolicy());
   std::atomic<bool> stop{false};
   const FetchResult r = client.fetch(0, 0, stop);
@@ -3773,22 +3891,24 @@ TEST_CASE("a refused connection fails after the retries with a transport error",
 }
 
 TEST_CASE("a stop request cuts the backoff short", "[elevationclient]") {
+  CannedServer srv;
   RetryPolicy slow;
   slow.maxRetries = 5;
   slow.baseDelay = 10s;
   slow.maxDelay = 10s;
   slow.jitter = 0.0;
-  ElevationClient client(configFor("http://127.0.0.1:1/wms"), slow);
+  ElevationClient client(configFor(srv.url()), slow);
   std::atomic<bool> stop{false};
   std::thread stopper([&stop] {
     std::this_thread::sleep_for(150ms);
     stop = true;
   });
   const auto start = std::chrono::steady_clock::now();
-  const FetchResult r = client.fetch(0, 0, stop);
+  const FetchResult r = client.fetch(3, 0, stop);  // a 404, then a 10 s backoff
   stopper.join();
   CHECK(r.kind == FetchResult::Kind::Failed);
-  CHECK(r.error.rfind("stopped during backoff", 0) == 0);
+  CHECK(r.attempts == 1);
+  CHECK(r.error == "stopped during backoff after: http 404");
   CHECK(std::chrono::steady_clock::now() - start < 5s);
 }
 
@@ -3811,11 +3931,112 @@ TEST_CASE("the server receives the decoded BBOX, LAYERS, I and J", "[elevationcl
   const FetchResult r = client.fetch(2, 0, stop);
   CHECK(r.kind == FetchResult::Kind::Value);
   // South, west, north, east of the example box with nine decimals, as the server decodes them.
-  const std::map<std::string, std::string> params = srv.latestParams();
-  CHECK(params.at("BBOX") == "-34.216344700,18.418579100,-34.184541800,18.462524400");
-  CHECK(params.at("LAYERS") == "Elevation_CCT_GLM2019_5m_DEM");
-  CHECK(params.at("I") == "2");
-  CHECK(params.at("J") == "0");
+  const SeenRequest seen = srv.latestRequest();
+  CHECK(seen.params.at("BBOX") == "-34.216344700,18.418579100,-34.184541800,18.462524400");
+  CHECK(seen.params.at("LAYERS") == "Elevation_CCT_GLM2019_5m_DEM");
+  CHECK(seen.params.at("I") == "2");
+  CHECK(seen.params.at("J") == "0");
+}
+
+TEST_CASE("a layer name with special characters arrives decoded", "[elevationclient]") {
+  CannedServer srv;
+  Config cfg = configFor(srv.url());
+  cfg.layer = "Elevation Layer+1&2%";
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Value);
+  // Locks in how httplib re-encodes the query: the name must survive it in both parameters.
+  const SeenRequest seen = srv.latestRequest();
+  CHECK(seen.params.at("LAYERS") == "Elevation Layer+1&2%");
+  CHECK(seen.params.at("QUERY_LAYERS") == "Elevation Layer+1&2%");
+}
+
+TEST_CASE("requests identify themselves as dl_elevation", "[elevationclient]") {
+  CannedServer srv;
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Value);
+  CHECK(srv.latestRequest().userAgents == std::vector<std::string>{"dl_elevation/" DL_ELEVATION_VERSION});
+}
+
+TEST_CASE("certificate verification rejects an untrusted loopback certificate without retrying",
+          "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  CannedServer srv(certificate);
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 1);
+  CHECK(r.error == "transport: " + httplib::to_string(httplib::Error::SSLServerVerification));
+  CHECK(srv.hits[0].load() == 0);  // the handshake fails before any request is sent
+}
+
+TEST_CASE("insecure accepts an untrusted certificate", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  CannedServer srv(certificate);
+  Config cfg = configFor(srv.url());
+  cfg.insecure = true;
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Value);
+  CHECK(r.value == 12.5f);
+}
+
+TEST_CASE("a CA bundle trusts the loopback certificate", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  const TempDir dir;
+  const std::filesystem::path bundle = dir.path / "bundle.pem";
+  certificate.writePem(bundle);
+  CannedServer srv(certificate);
+  Config cfg = configFor(srv.url());
+  cfg.caBundle = bundle.string();
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Value);
+  CHECK(r.value == 12.5f);
+}
+
+TEST_CASE("a missing CA bundle fails without retrying", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  const TempDir dir;
+  CannedServer srv(certificate);
+  Config cfg = configFor(srv.url());
+  cfg.caBundle = (dir.path / "missing.pem").string();
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 1);
+  CHECK(r.error == "transport: " + httplib::to_string(httplib::Error::SSLLoadingCerts));
+  CHECK(srv.hits[0].load() == 0);  // loading the bundle fails before any request is sent
+}
+
+TEST_CASE("a blank unparseable body is described by its size", "[elevationclient]") {
+  CHECK(describeUnparseableBody("") == "warning: first unparseable response body was 0 bytes of whitespace");
+  CHECK(describeUnparseableBody(" \t\r\n") ==
+        "warning: first unparseable response body was 4 bytes of whitespace");
+}
+
+TEST_CASE("an unparseable body is shown up to 200 bytes", "[elevationclient]") {
+  const std::string body = "<" + std::string(299, 'x');
+  const std::string line = describeUnparseableBody(body);
+  const std::string prefix = "warning: first unparseable response body (300 bytes, up to 200 shown): ";
+  REQUIRE(line.rfind(prefix, 0) == 0);
+  CHECK(line.substr(prefix.size()) == body.substr(0, 200));
+}
+
+TEST_CASE("an unparseable body is shown as printable ASCII on one line", "[elevationclient]") {
+  // ESC, BEL, DEL, the UTF-8 encoding of the C1 control CSI (0xC2 0x9B) and a newline.
+  const std::string body = std::string("<p>\x1b[31mred\a\x7f") + "\xC2\x9B" + "31m</p>\n";
+  const std::string line = describeUnparseableBody(body);
+  CHECK(line ==
+        "warning: first unparseable response body (23 bytes, up to 200 shown): <p>.[31mred....31m</p>.");
+  CHECK(line.find('\n') == std::string::npos);
 }
 ```
 
@@ -3855,10 +4076,10 @@ Expected: FAIL with `Cannot find source file: src/demdl/ElevationClient.cpp`.
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <memory>
 #include <random>
 #include <string>
+#include <string_view>
 
 #include "demdl/Config.h"
 #include "demdl/PixelFetcher.h"
@@ -3872,30 +4093,44 @@ namespace demdl {
 
 // Fetches one pixel's elevation over HTTP or HTTPS with keep-alive, retries and backoff.
 // One instance per worker thread; instances are not thread-safe.
+//
+// Requests identify themselves as "dl_elevation/<version>". Timeouts: 10 s to connect, 10 s per
+// write, 30 s per read and 60 s overall per request, so a server trickling its answer cannot hold a
+// worker indefinitely. A stop cannot interrupt a request already on the wire, which ends within the
+// connection timeout plus the overall cap (70 s). The client relies on the process ignoring SIGPIPE,
+// as main arranges: httplib's client sets neither SO_NOSIGPIPE nor MSG_NOSIGNAL. Two warnings go to
+// stderr, each once per process across all instances: the error of the first failed attempt, and
+// the first unparseable body.
 class ElevationClient : public PixelFetcher {
  public:
-  // Throws std::invalid_argument when cfg.wmsUrl does not parse, or when httplib cannot set up a
+  // Uses cfg.wmsUrl, layer, box, width, height, insecure and caBundle. The box and the grid must
+  // describe the raster being filled, which main's matches() check guarantees. cfg.maxRetries is not
+  // read: the policy carries it, and main maps one onto the other.
+  // Throws std::invalid_argument when cfg.wmsUrl does not parse, or when httplib cannot create a
   // client for its origin (is_valid() is false, for example without a TLS context).
   ElevationClient(const Config& cfg, RetryPolicy policy);
   ~ElevationClient() override;
 
-  // An exception during an attempt becomes that attempt's error ("exception: ..." or "unknown
-  // exception") and is retried like any other failure. Not noexcept: building error text allocates.
+  // Failed attempts are retried per the policy, except certificate errors (a CA bundle that cannot
+  // be loaded, a chain that does not verify, a certificate that does not cover the host): those fail
+  // at once, because only a configuration change cures them. An exception during an attempt becomes
+  // that attempt's error ("exception: ..." or "unknown exception") and is retried like any other
+  // failure. Not noexcept: building error text allocates.
   [[nodiscard]] FetchResult fetch(int x, int y, const std::atomic<bool>& stop) override;
 
  private:
-  // Sleeps in 100 ms slices; returns false as soon as stop is set.
-  static bool sleepUnlessStopped(std::chrono::milliseconds delay, const std::atomic<bool>& stop);
-  // Writes the first unparseable body of the process to stderr, once across all instances: a blank
-  // body as its byte count, any other as its first 200 bytes with control characters shown as '.'.
-  static void logUnparseableBodyOnce(const std::string& body);
-
   Config cfg_;
   RetryPolicy policy_;
   std::unique_ptr<httplib::Client> client_;
   std::mt19937 rng_;
   std::uniform_real_distribution<double> unit_{0.0, 1.0};
 };
+
+// The warning line for the first unparseable response body, without a trailing newline. A blank body
+// is reported by its size, any other by its first 200 bytes with every byte outside printable ASCII
+// shown as '.', so that the warning stays on one line and cannot drive the terminal. Exposed for
+// tests.
+[[nodiscard]] std::string describeUnparseableBody(std::string_view body);
 
 }  // namespace demdl
 ```
@@ -3908,15 +4143,81 @@ class ElevationClient : public PixelFetcher {
 #include <httplib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #include "demdl/WmsQuery.h"
 
 namespace demdl {
+
+namespace {
+
+// Transport errors that no retry can cure, only a configuration change: the CA bundle cannot be
+// loaded, the chain does not verify, or the certificate does not cover the host. Retrying would
+// also hide the cause: httplib loads the bundle once per client, so a retry after a failed load
+// reports the verification failure that follows instead.
+bool needsConfigurationChange(httplib::Error error) {
+  return error == httplib::Error::SSLLoadingCerts || error == httplib::Error::SSLServerVerification ||
+         error == httplib::Error::SSLServerHostnameVerification;
+}
+
+// Sleeps in 100 ms slices; returns false as soon as stop is set.
+bool sleepUnlessStopped(std::chrono::milliseconds delay, const std::atomic<bool>& stop) {
+  std::chrono::milliseconds remaining = delay;
+  while (remaining.count() > 0) {
+    if (stop.load()) return false;
+    const std::chrono::milliseconds slice = std::min(remaining, std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(slice);
+    remaining -= slice;
+  }
+  return !stop.load();
+}
+
+// Writes the error of the first failed attempt in the process, once across all instances, so that a
+// wrong path, a bad CA bundle or an unverifiable chain shows within seconds even without --verbose.
+void logFirstFailureOnce(const std::string& error) noexcept {
+  static std::once_flag flag;
+  try {
+    // stderr, so it cannot corrupt the progress lines on stdout.
+    std::call_once(flag, [&error] { std::cerr << "warning: first failed request: " + error + "\n"; });
+  } catch (...) {
+    // A warning must never become a failure of its own.
+  }
+}
+
+// Writes the first unparseable body of the process, once across all instances.
+void logUnparseableBodyOnce(std::string_view body) noexcept {
+  static std::once_flag flag;
+  try {
+    // stderr, so it cannot corrupt the progress lines on stdout.
+    std::call_once(flag, [body] { std::cerr << describeUnparseableBody(body) + "\n"; });
+  } catch (...) {
+    // A warning must never become a failure of its own.
+  }
+}
+
+}  // namespace
+
+std::string describeUnparseableBody(std::string_view body) {
+  const std::string prefix = "warning: first unparseable response body ";
+  if (body.find_first_not_of(" \t\n\v\f\r") == std::string_view::npos) {
+    // Blank text would print as nothing, so give the size instead.
+    return prefix + "was " + std::to_string(body.size()) + " bytes of whitespace";
+  }
+  // Every byte outside printable ASCII becomes '.', so the warning stays on one line and only
+  // printable ASCII reaches the terminal: neither control characters nor UTF-8-encoded C1 controls.
+  std::string shown(body.substr(0, 200));
+  for (char& c : shown) {
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte < 0x20 || byte > 0x7E) c = '.';
+  }
+  return prefix + "(" + std::to_string(body.size()) + " bytes, up to 200 shown): " + shown;
+}
 
 ElevationClient::ElevationClient(const Config& cfg, RetryPolicy policy)
     : cfg_(cfg), policy_(policy), rng_(std::random_device{}()) {
@@ -3925,11 +4226,15 @@ ElevationClient::ElevationClient(const Config& cfg, RetryPolicy policy)
   client_ = std::make_unique<httplib::Client>(endpoint->origin);
   // httplib reports a client it could not set up through is_valid(); the calls below could then
   // dereference a null implementation.
-  if (!client_->is_valid()) throw std::invalid_argument("invalid WMS origin: " + endpoint->origin);
+  if (!client_->is_valid()) {
+    throw std::invalid_argument("cannot create an HTTP client for origin: " + endpoint->origin);
+  }
+  client_->set_default_headers({{"User-Agent", "dl_elevation/" DL_ELEVATION_VERSION}});
   client_->set_keep_alive(true);
   client_->set_connection_timeout(10, 0);
   client_->set_read_timeout(30, 0);
   client_->set_write_timeout(10, 0);
+  client_->set_max_timeout(60 * 1000);  // milliseconds, counted from the start of each request
   client_->enable_server_certificate_verification(!cfg_.insecure);
   if (!cfg_.caBundle.empty()) client_->set_ca_cert_path(cfg_.caBundle);
 }
@@ -3941,12 +4246,14 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
   for (int attempt = 0;; ++attempt) {
     result.attempts = attempt + 1;
     std::string error;
+    bool retryable = true;
     // fetch must not throw (see PixelFetcher), so building the target, the request and the parse
     // run inside the try, and an exception is this attempt's error.
     try {
       const httplib::Result response = client_->Get(featureInfoUrl(cfg_, x, y));
       if (!response) {
         error = "transport: " + httplib::to_string(response.error());
+        retryable = !needsConfigurationChange(response.error());
       } else if (response->status != 200) {
         error = "http " + std::to_string(response->status);
       } else {
@@ -3968,9 +4275,10 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
     } catch (...) {
       error = "unknown exception";
     }
-    if (attempt >= policy_.maxRetries || stop.load()) {
+    logFirstFailureOnce(error);
+    if (!retryable || attempt >= policy_.maxRetries || stop.load()) {
       result.kind = FetchResult::Kind::Failed;
-      result.error = error;
+      result.error = std::move(error);
       return result;
     }
     const std::chrono::milliseconds delay = policy_.delayFor(attempt, unit_(rng_));
@@ -3982,48 +4290,15 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
   }
 }
 
-bool ElevationClient::sleepUnlessStopped(std::chrono::milliseconds delay, const std::atomic<bool>& stop) {
-  std::chrono::milliseconds remaining = delay;
-  while (remaining.count() > 0) {
-    if (stop.load()) return false;
-    const std::chrono::milliseconds slice = std::min(remaining, std::chrono::milliseconds(100));
-    std::this_thread::sleep_for(slice);
-    remaining -= slice;
-  }
-  return !stop.load();
-}
-
-void ElevationClient::logUnparseableBodyOnce(const std::string& body) {
-  static std::once_flag flag;
-  std::call_once(flag, [&body] {
-    std::string line = "warning: first unparseable response body ";
-    if (body.find_first_not_of(" \t\n\v\f\r") == std::string::npos) {
-      // Printing blank text would show nothing, so give the size instead.
-      line += "was " + std::to_string(body.size()) + " bytes of whitespace";
-    } else {
-      // ASCII control characters (below 0x20, and DEL) become '.', so the warning stays on one line
-      // and cannot drive the terminal; bytes from 0x80 up pass through to keep UTF-8 readable.
-      std::string shown = body.substr(0, 200);
-      for (char& c : shown) {
-        const auto byte = static_cast<unsigned char>(c);
-        if (byte < 0x20 || byte == 0x7F) c = '.';
-      }
-      line += "(" + std::to_string(body.size()) + " bytes, up to 200 shown): " + shown;
-    }
-    // stderr, so the warning never mixes with the progress lines on stdout.
-    std::cerr << line + "\n";
-  });
-}
-
 }  // namespace demdl
 ```
 
-Notes for the engineer: `httplib::Client` built from an `https://` origin is the TLS client; the OpenSSL define comes from the `httplib::httplib` target, which is why Task 1 links that name. The certificate and CA calls are no-ops for plain `http://`, which the tests use. `httplib::Result` is move-only; initialising a `const` local from the call is fine under guaranteed copy elision.
+Notes for the engineer: `httplib::Client` built from an `https://` origin is the TLS client; the OpenSSL define comes from the `httplib::httplib` target, which is why Task 1 links that name. The certificate and CA calls are no-ops for plain `http://`; the TLS cases serve a certificate the test generates through the OpenSSL API and install it with `SSLServer`'s context callback, because httplib 0.46 has no constructor taking an `X509*` and an `EVP_PKEY*`. `httplib::Result` is move-only; initialising a `const` local from the call is fine under guaranteed copy elision.
 
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[elevationclient]"`
-Expected: `All tests passed (N assertions in 9 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
+Expected: `All tests passed (N assertions in 18 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
 
 - [ ] **Step 7: Commit**
 

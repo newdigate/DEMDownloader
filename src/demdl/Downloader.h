@@ -5,6 +5,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 
 #include "demdl/DemRaster.h"
 #include "demdl/PixelFetcher.h"
@@ -63,6 +66,8 @@ class Downloader {
     std::atomic<std::uint64_t> noData{0};
     std::atomic<std::uint64_t> failed{0};
     std::atomic<int> consecutiveFailures{0};  // reset by every Value or NoData
+    std::mutex limitMutex;
+    std::optional<std::string> limitError;  // guarded by limitMutex; the failure that reached the limit
   };
 
   // One pool job: unless a stop came first, fetches pixel (x, row), stores the result, updates the

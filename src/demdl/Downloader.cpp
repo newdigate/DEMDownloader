@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <exception>
 #include <future>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -127,6 +128,8 @@ RunSummary Downloader::run() {
   if (summary.stopReason == StopReason::ConsecutiveFailures) {
     summary.stopMessage =
         "server unreachable: " + std::to_string(options_.maxConsecutiveFailures) + " consecutive failures";
+    const std::lock_guard<std::mutex> lock(runTally.limitMutex);
+    if (runTally.limitError) summary.stopMessage += "; last error: " + *runTally.limitError;
   } else {
     summary.stopMessage = describe(summary.stopReason);
   }
@@ -180,7 +183,13 @@ void Downloader::fetchPixel(PixelFetcher& fetcher, int x, int row, RowTally& row
       const int streak = ++runTally.consecutiveFailures;
       sink_.onPixelState(PixelEvent{
           .x = x, .y = row, .state = PixelState::Failed, .attempts = result.attempts, .error = result.error});
-      if (streak >= options_.maxConsecutiveFailures) stop_.request(StopReason::ConsecutiveFailures);
+      if (streak >= options_.maxConsecutiveFailures) {
+        {
+          const std::lock_guard<std::mutex> lock(runTally.limitMutex);
+          if (!runTally.limitError) runTally.limitError = result.error;  // the first to reach the limit
+        }
+        stop_.request(StopReason::ConsecutiveFailures);
+      }
       break;
     }
   }
