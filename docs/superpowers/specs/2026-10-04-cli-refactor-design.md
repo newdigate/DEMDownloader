@@ -56,14 +56,15 @@ Non-goals for this iteration:
 
 | Target | Kind | Depends on | Notes |
 |---|---|---|---|
-| `demdl` | static library | `httplib::httplib`, `TIFF::TIFF`, libgeotiff, ctpl header | All logic. No OpenGL. |
-| `dl_elevation` | executable | `demdl`, `demdl_cli`, optionally `demdl_preview` | Parses flags, wires components, maps results to exit codes. |
-| `demdl_preview` | static library, optional | `demdl`, glfw, OpenGL framework (macOS) or GLEW + GL (Linux) | Built when `DL_ELEVATION_PREVIEW` is ON. Default ON on Apple, OFF elsewhere. |
-| `demdl_tests` | executable | `demdl`, `Catch2::Catch2WithMain`, `demdl_cli` | Built when `DL_ELEVATION_TESTS` is ON (default ON). Registered with `ctest`. |
+| `demdl` | static library | `httplib::httplib`, `TIFF::TIFF`, libgeotiff, ctpl header | Every `src/demdl/*.cpp`: all logic. No OpenGL. Defines `DL_ELEVATION_VERSION` for itself and everything that links it. |
+| `demdl_cli` | object library | `demdl`, `CLI11::CLI11` (private) | `src/app/Cli.cpp`, compiled once and shared by the executable and the tests; the only file that includes CLI11. |
+| `dl_elevation` | executable | `demdl`, `demdl_cli`, optionally `demdl_preview` | `src/app/main.cpp`. Parses flags, wires components, maps results to exit codes. Compiled with `DL_ELEVATION_HAVE_PREVIEW` when it links `demdl_preview`. |
+| `demdl_preview` | static library, optional | `demdl`, glfw, OpenGL framework (macOS) or GLEW + GL (Linux) | `src/preview/PreviewWindow.cpp`. Built when `DL_ELEVATION_PREVIEW` is ON. Default ON on Apple, OFF elsewhere. |
+| `demdl_tests` | executable | `demdl`, `demdl_cli`, `Catch2::Catch2WithMain`; built after `dl_elevation` | Every `tests/test_*.cpp`, `test_Palette.cpp` included whatever `DL_ELEVATION_PREVIEW` says. Built when `DL_ELEVATION_TESTS` is ON (default ON). Registered with `ctest` through `catch_discover_tests`. |
 
-`demdl_cli` is an OBJECT library holding `src/app/Cli.cpp` and linking
-`CLI11::CLI11`, so the parse function is compiled once and shared by the
-executable and the tests.
+The end-to-end tests run the executable itself, so `demdl_tests` depends on
+`dl_elevation` (`add_dependencies`) and has its path compiled in as
+`DL_ELEVATION_EXE`.
 
 GLM and assimp are removed. The quad shader needs only `glUniform1i`, so a
 trimmed `Shader.h` without GLM moves into the preview component.
@@ -73,25 +74,38 @@ trimmed `Shader.h` without GLM moves into the preview component.
 ```
 src/demdl/
   BoundingBox.h/.cpp     validated WGS84 box, pixel scale
-  Config.h               plain struct of every runtime option + validate()
+  Config.h/.cpp          plain struct of every runtime option + validate();
+                         parseWmsUrl()
   WmsQuery.h/.cpp        pure: build GetFeatureInfo URL, parse response body
   RetryPolicy.h/.cpp     pure: backoff schedule
   PixelFetcher.h         one-method interface used by Downloader
   ElevationClient.h/.cpp PixelFetcher over httplib with retries and TLS
   DemRaster.h/.cpp       float32 grid, GeoTIFF load/save, resume checks
-  ProgressSink.h         event interface
+  ProgressSink.h         event structs, StopReason, sink interface
   ConsoleReporter.h/.cpp headless sink
+  StopToken.h            shared stop flag that keeps the first reason
   Downloader.h/.cpp      row loop, pool, checkpoints, stop handling
 src/preview/
   PreviewWindow.h/.cpp   GLFW/OpenGL sink
   Shader.h               trimmed from include/shader.h
+  Palette.h              status and value colours; no OpenGL, tested in
+                         every configuration
 src/app/
-  Cli.h/.cpp             parseArgs(argc, argv) -> Config, testable
+  Cli.h/.cpp             parseArgs(argc, argv, Config&, std::ostream& out,
+                         std::ostream& err) -> ParseOutcome, testable
+  ExitCodes.h            exit-code constants and exitCodeFor(RunSummary)
   main.cpp               signal handling, wiring, exit codes
 tests/
-  test_BoundingBox.cpp, test_WmsQuery.cpp, test_RetryPolicy.cpp,
-  test_DemRaster.cpp, test_Downloader.cpp, test_ElevationClient.cpp,
-  test_Cli.cpp, FakeFetcher.h, RecordingSink.h
+  test_BoundingBox.cpp, test_Config.cpp, test_WmsQuery.cpp,
+  test_RetryPolicy.cpp, test_DemRaster.cpp, test_StopToken.cpp,
+  test_Downloader.cpp, test_ElevationClient.cpp, test_ConsoleReporter.cpp,
+  test_Cli.cpp, test_ExitCodes.cpp, test_Palette.cpp
+                         one file per unit
+  test_EndToEnd.cpp      runs the built dl_elevation against a loopback WMS
+  FakeFetcher.h, RecordingSink.h
+                         test doubles
+  TempDir.h, ExampleConfig.h
+                         helpers: a temporary directory, the example Config
 ```
 
 Deleted: root `main.cpp`, `opengl.cmake.in`, every file in `include/`
@@ -409,19 +423,62 @@ checkpoint is intact.
 
 ## 8. Progress events and sinks
 
+As declared in `src/demdl/ProgressSink.h` (namespace `demdl`). The header
+also defines `describe(StopReason)`, which gives each reason's text, such as
+`interrupted`:
+
 ```cpp
 enum class PixelState { Queued, InFlight, Value, NoData, Failed };
-struct RunPlan   { uint64_t pixelsTotal, pixelsTodo; int rowsTodo; };
-struct RowReport { int row, ok, noData, failed; std::chrono::duration<double> elapsed;
-                   uint64_t pixelsDoneTotal; };
-struct RunSummary { uint64_t pixelsFetched, noData, failed, remainingNaN; int rowsSaved;
-                    std::chrono::duration<double> elapsed; StopReason stopReason;
-                    std::string stopMessage; bool checkpointWriteFailed; };
-struct ProgressSink {
-  virtual void onRunStarted(const RunPlan&) = 0;
-  virtual void onPixelState(int x, int y, PixelState, float value) = 0;
-  virtual void onRowSaved(const RowReport&) = 0;
-  virtual void onRunFinished(const RunSummary&) = 0;
+
+enum class StopReason { None, Signal, WindowClosed, ConsecutiveFailures, WriteError };
+
+struct RunPlan {
+  std::uint64_t pixelsTotal = 0;
+  std::uint64_t pixelsTodo = 0;
+  int rowsTodo = 0;
+  int rowsTotal = 0;
+};
+
+struct PixelEvent {
+  int x = 0;
+  int y = 0;
+  PixelState state = PixelState::Queued;
+  float value = 0.0f;   // valid when state == Value
+  int attempts = 0;
+  std::string error{};  // set when state == Failed
+};
+
+struct RowReport {
+  int row = 0;  // 0-based
+  int rowsTotal = 0;
+  int ok = 0;
+  int noData = 0;
+  int failed = 0;
+  std::chrono::duration<double> elapsed{0.0};
+  std::uint64_t pixelsDoneTotal = 0;  // non-NaN pixels in the whole raster after this save
+  std::uint64_t pixelsTotal = 0;
+};
+
+struct RunSummary {
+  std::uint64_t pixelsFetched = 0;
+  std::uint64_t noData = 0;
+  std::uint64_t failed = 0;
+  // NaN pixels as of the last successful save, or at the start of the run if none succeeded.
+  std::uint64_t remainingNaN = 0;
+  int rowsSaved = 0;
+  std::chrono::duration<double> elapsed{0.0};
+  StopReason stopReason = StopReason::None;
+  std::string stopMessage{};
+  bool checkpointWriteFailed = false;  // a save threw, even if stopReason names an earlier reason
+};
+
+class ProgressSink {
+ public:
+  virtual ~ProgressSink() = default;
+  virtual void onRunStarted(const RunPlan& plan) = 0;
+  virtual void onPixelState(const PixelEvent& event) = 0;
+  virtual void onRowSaved(const RowReport& report) = 0;
+  virtual void onRunFinished(const RunSummary& summary) = 0;
 };
 ```
 
@@ -517,8 +574,8 @@ magenta (255, 0, 255); and `valueColour(t)`, which maps t from 0 to 1 onto
 light blue (0, 128, 255), cyan, green, yellow and red (255, 0, 0), so that no
 value is drawn in the NoData blue, the Failed magenta or the to-do grey. NaN
 counts as 0, and t is clamped to [0, 1] first. Two status colours do recur
-among the values: the top of the range (t above 0.9988) draws the same red as
-Queued, and a narrow band near t = 0.43 the same green as InFlight. Both
+among the values: the top of the range (t above about 0.9989) draws the same
+red as Queued, and a narrow band near t = 0.43 the same green as InFlight. Both
 states are transient, so the overlap is accepted for now; changing the status
 colours is the owner's call. Values are scaled over the minimum and maximum
 seen so far, so the palette stays consistent as new maxima arrive instead of
@@ -902,6 +959,13 @@ written or requested, so with `--overwrite` an existing file keeps its bytes.
 - `cmake_minimum_required(VERSION 3.27)`, `project(DownloadElevation VERSION
   0.2.0 LANGUAGES CXX)`, C++20, `CMAKE_EXPORT_COMPILE_COMMANDS ON`,
   `CMAKE_FIND_FRAMEWORK LAST` retained.
+- Policy CMP0156 is set to NEW between `cmake_minimum_required` and
+  `project`. It de-duplicates libraries on the link line: `dl_elevation` and
+  `demdl_tests` name both `demdl` and `demdl_cli`, whose PUBLIC link to
+  `demdl` adds `libdemdl.a` a second time, and the Xcode 15 linker warns
+  about the duplicate. The block is guarded by `if(POLICY CMP0156)` because
+  the policy arrived in CMake 3.29 and the minimum version, 3.27, does not
+  know it.
 - Options `DL_ELEVATION_PREVIEW` (default `APPLE`) and `DL_ELEVATION_TESTS`
   (default ON). With the preview ON, `dl_elevation` links `demdl_preview` and
   is compiled with `DL_ELEVATION_HAVE_PREVIEW`; with it OFF, `--preview` is

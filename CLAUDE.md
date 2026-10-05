@@ -4,54 +4,69 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-executable C++20 scraper that pulls a Digital Elevation Model (DEM) off the City of Cape Town's public WMS server one pixel at a time (one `GetFeatureInfo` request per pixel), accumulates the heights into a 16-bit RGB TIFF on disk, and shows live progress in an OpenGL window. All logic is in `main.cpp`. macOS/Homebrew only in practice.
+`dl_elevation` scrapes a Digital Elevation Model (DEM) from a WMS server one pixel at a time, one `GetFeatureInfo` request per pixel, into a single-band float32 GeoTIFF, and resumes safely across runs. The default source is the City of Cape Town's public server. macOS is the primary platform; the headless build also targets Linux.
 
-## Build and run
+Design and plan: `docs/superpowers/specs/2026-10-04-cli-refactor-design.md` and `docs/superpowers/plans/2026-10-04-cli-refactor.md`.
 
-CMake + Ninja. CMake project `DownloadElevation`, single target `dl_elevation`. No tests, no linter.
+## Build, test, run
+
+CMake 3.27+ with Ninja. The first configure downloads the pinned dependencies and compiles Catch2, so allow a few minutes.
 
 ```bash
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B cmake-build-debug
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B build
 ```
 
 ```bash
-cmake --build cmake-build-debug --target dl_elevation
+cmake --build build
 ```
-
-The build directory must sit exactly one level below the repo root, and the binary must be run from inside it: the input/output TIFF and the CA bundle are opened via `../simonstown.tif` and `../ca-bundle.crt`.
 
 ```bash
-cd cmake-build-debug && ./dl_elevation
+ctest --test-dir build --output-on-failure
 ```
 
-Running the binary immediately opens 50 concurrent HTTPS connections to `cityimg.capetown.gov.za` and rewrites `../simonstown.tif` after every row. Do not launch it just to confirm that a build works.
+One unit's tests by Catch2 tag, for example `./build/demdl_tests "[downloader]"`. One case by name, for example `./build/demdl_tests "a stop request saves the partial row and goes no further"`.
 
-Homebrew packages needed: `pkg-config glfw glew glm assimp libtiff libgeotiff openssl@3`. `ctpl` is always fetched by `FetchContent`; `cpp-httplib` is taken from Homebrew's `cpp-httplib` package when installed and fetched otherwise, so the first configure needs network. assimp, GLEW and libgeotiff are demanded by the CMake files but referenced by no code; in particular the output is a plain RGB TIFF with no georeferencing tags.
+Options: `-DDL_ELEVATION_PREVIEW=OFF` drops the GLFW window and every OpenGL dependency (default ON on macOS, OFF elsewhere). `-DDL_ELEVATION_TESTS=OFF` skips Catch2.
 
-No paths are hardcoded: libtiff comes from CMake's bundled `FindTIFF`, assimp from its own config, glfw and GLEW from pkg-config, OpenSSL transitively through `httplib::httplib`, and GLM and libgeotiff from `find_path`/`find_library`. Do not reintroduce `/usr/local/Cellar/<formula>/<version>` paths; they go stale on the next `brew upgrade`. Note that Apple clang puts `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from an imported or FetchContent target. On a machine with the Homebrew `cpp-httplib` package, that package's `httplib.h` is what gets compiled even when FetchContent downloaded a copy.
+Homebrew packages: `pkg-config libtiff libgeotiff openssl@3`, plus `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
 
-Three things in the CMake files look odd but are deliberate:
+Running the tool makes real requests to a public server. Check a command line with `--dry-run`, and never start a live download just to see whether the build works:
 
-- `dl_elevation` links `httplib::httplib`, not `httplib`. Only the namespaced name exists when the Homebrew package is found; the bare name silently degrades to `-lhttplib`, loses `CPPHTTPLIB_OPENSSL_SUPPORT`, and the compile fails with "no type named 'SSLClient'".
-- GLM is located with `find_path`, not `find_package`. Homebrew GLM's config file declares a CMake minimum of 3.2, which CMake 4.x refuses to load.
-- `CMAKE_FIND_FRAMEWORK` is set to `LAST`. With the macOS default of `FIRST`, CMake globs every `*.framework/Headers` before looking in `/usr/local`, and `/Library/Frameworks/Mono.framework/Headers` ships a libtiff 4.0.9 `tiff.h` that would otherwise be chosen over Homebrew's 4.7.1 headers.
+```bash
+./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output simonstown.tif --dry-run
+```
 
-## How main.cpp works
+The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 run the whole program against 127.0.0.1 and need no network. Live requests to the City of Cape Town server are for the owner to start.
 
-Global state plus free functions; read it top to bottom.
+`./build/dl_elevation --help` lists every flag. Headless is the default; `--preview` opens the window.
 
-**All configuration is hardcoded.** Bounding box (`north/east/south/west` in `main()`, EPSG:4326), grid size (`gridSizeWidth`/`gridSizeHeight`, default 2048x1792), WMS layer name (`Elevation_CCT_GLM2019_5m_DEM`), host, elevation scale (`700.0` m maps to 65535), and the output filename, which appears twice (the `load_tiff` and `save_tiff` calls). Retargeting means editing all of these together.
+## Layout
 
-**The output TIFF is the checkpoint.** On startup `load_tiff` reads the existing file, then `main()` scans for the last row containing any nonzero sample and resumes downloading from the row after it. If the file is absent, a zeroed raster is allocated and work starts at row 0. To restart from scratch, delete or rename the TIFF. `load_tiff` takes `gridSizeWidth`/`gridSizeHeight` by reference and overwrites them with the file's dimensions, so a grid-size change in code is silently ignored while an old TIFF exists.
+- `src/demdl/` is the static library holding all logic: `BoundingBox`; `Config` (every option plus `validate()`); `WmsQuery` (URL building and body parsing, pure functions); `RetryPolicy`; `DemRaster` (float32 grid, GeoTIFF I/O, resume checks); `PixelFetcher` (one-method interface); `ElevationClient` (httplib); `Downloader` (row loop, pool, checkpoints, stop handling); `ProgressSink` with `ConsoleReporter`; `StopToken` (the shared stop flag, which keeps the first reason given).
+- `src/app/` is the executable: `Cli.cpp` turns argv into a `Config` with CLI11; `ExitCodes.h` maps a finished run to its exit code; `main.cpp` wires the components and handles signals.
+- `src/preview/` holds the optional GLFW/OpenGL sink, `PreviewWindow`, and its `Shader.h`. `Palette.h` there holds the preview's colours and includes no OpenGL header, so its tests build in every configuration.
+- `tests/` has one Catch2 file per unit, the doubles `FakeFetcher.h` and `RecordingSink.h`, and the helpers `TempDir.h` and `ExampleConfig.h`. Nothing touches the network except an in-process `httplib::Server` on loopback.
+- `tests/test_EndToEnd.cpp` spawns the built `dl_elevation` against a loopback WMS, so the test target depends on the executable.
+- Test names must not begin with `-`, because ctest passes each name to Catch2 as an argument.
 
-**Download pipeline.** One `downloadThread` walks rows from `startY`. Per row it pushes one job per column onto a 50-thread `ctpl::thread_pool`, waits on all of that row's futures, then `save_tiff` rewrites the whole file. Each job constructs its own `httplib::SSLClient` (certificate verification disabled), issues a WMS `GetFeatureInfo` with `I=x&J=y`, retries up to 500 times until it gets HTTP 200, and parses the five characters following `"BAND 0:"` in the plain-text body as metres. Negative values clamp to 0.
+## Behaviours to keep in mind
 
-**Pixel formats.** `raster` is 16 bits per sample, 3 samples per pixel, same scaled value in all three channels. `displayTexture` is a parallel RGB8 buffer that the main thread uploads to a GL texture every 500 ms. Its colours are a status map: blue = zero/no data, red = queued, green = request in flight, long-rainbow (`rainbow()`) = elevation.
+- **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server has no elevation there and is final. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
+- **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp` and renames it over the output.
+- **Stopping is one flag.** SIGINT, SIGTERM, closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
+- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C (or SIGTERM) kills the process by that signal's default action, so the shell reports 130 (143 for SIGTERM) and a calling script stops.
+- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. If the system trust store rejects the server's chain, `ca-bundle.crt` in the repository root, the CA bundle the old program used, is a candidate for `--ca-bundle`. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
+- **Threading:** worker threads write distinct raster cells and own one `ElevationClient` each; sinks guard their own state; nothing prints from a signal handler.
+- The old single-file `main.cpp` and the `include/` LearnOpenGL boilerplate are gone. Do not resurrect them.
 
-**Threading.** `raster`, `displayTexture` and `maxDisplayValue` are written by pool threads and read by the main thread with no synchronisation. The sole mutex (`g_i_mutex`) only serialises `std::cout`. This works because each job touches a distinct pixel; don't add shared mutable state assuming it is protected.
+## CMake notes
 
-**Rendering** is a fullscreen textured quad. The GLSL is embedded as raw string literals at the top of `main.cpp`. `include/shader.h` is the only header from `include/` in use; everything else there (mesh, model, animation, camera, the other shader variants, stb_image) is LearnOpenGL boilerplate carried over from another project and compiled by nothing.
+- Link `httplib::httplib`, never bare `httplib`. Only the namespaced target exists when Homebrew's package is found, and the bare name silently drops `CPPHTTPLIB_OPENSSL_SUPPORT`.
+- `CMAKE_FIND_FRAMEWORK` is `LAST` because `/Library/Frameworks/Mono.framework/Headers` ships a libtiff 4.0.9 `tiff.h` that otherwise wins over Homebrew's.
+- Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from a FetchContent target. Harmless today, worth knowing when bumping versions.
+- Policy CMP0156 is set to NEW so that `libdemdl.a` is linked once when a target names both `demdl` and `demdl_cli`, which links `demdl` itself. Without it, the Xcode 15 linker warns about a duplicate library. The block is guarded by `if(POLICY CMP0156)` because the minimum version, CMake 3.27, predates the policy, which arrived in 3.29.
+- Dependencies are pinned: cpp-httplib v0.46.1 (matches the Homebrew package), ctpl 437e135, CLI11 v2.7.2, Catch2 v3.16.0. Bump cpp-httplib together with the Homebrew package.
 
 ## Repository hygiene
 
-The `.tif` files in the repo root (`capetown.tif`, `simonstown.tif`, `new.tif` and copies) are 20-40 MB download outputs: untracked and not ignored. `.gitignore` only covers `cmake-build-debug*` and `output/new2.tif`. Never stage with `git add -A` or `git add .`.
+`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Never stage with `git add -A`.
