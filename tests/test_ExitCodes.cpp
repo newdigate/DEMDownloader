@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <csignal>
 #include <cstdint>
 #include <vector>
 
@@ -11,10 +12,9 @@ using demdl::RunSummary;
 using demdl::StopReason;
 using demdl::cli::exitCodeFor;
 using demdl::cli::kExitComplete;
+using demdl::cli::kExitError;
 using demdl::cli::kExitIncomplete;
-using demdl::cli::kExitSecondSignal;
 using demdl::cli::kExitStopped;
-using demdl::cli::kExitUsage;
 
 namespace {
 
@@ -54,9 +54,10 @@ TEST_CASE("a run that leaves no NaN pixel exits 0", "[exitcodes]") {
   CHECK(exitCodeFor(s) == kExitComplete);
 }
 
-TEST_CASE("a usage or configuration error is exit code 1, which no run summary maps to", "[exitcodes]") {
-  STATIC_REQUIRE(kExitUsage == 1);
-  for (const RunSummary& s : everySummaryShape()) CHECK(exitCodeFor(s) != kExitUsage);
+TEST_CASE("a usage, configuration, file or internal error is exit code 1, which no run summary maps to",
+          "[exitcodes]") {
+  STATIC_REQUIRE(kExitError == 1);
+  for (const RunSummary& s : everySummaryShape()) CHECK(exitCodeFor(s) != kExitError);
 }
 
 TEST_CASE("a run stopped early with pixels left exits 2 whatever stopped it", "[exitcodes]") {
@@ -82,9 +83,12 @@ TEST_CASE("a run that reaches the end with failed pixels exits 3", "[exitcodes]"
   CHECK(exitCodeFor(s) == kExitIncomplete);
 }
 
-TEST_CASE("a second interrupt is exit code 130, which no run summary maps to", "[exitcodes]") {
-  STATIC_REQUIRE(kExitSecondSignal == 130);
-  for (const RunSummary& s : everySummaryShape()) CHECK(exitCodeFor(s) != kExitSecondSignal);
+TEST_CASE("a second interrupt kills the process, so no run summary maps to 130 or 143", "[exitcodes]") {
+  // A shell reports 128 plus the number of the signal that killed a process.
+  for (const RunSummary& s : everySummaryShape()) {
+    CHECK(exitCodeFor(s) != 128 + SIGINT);
+    CHECK(exitCodeFor(s) != 128 + SIGTERM);
+  }
 }
 
 TEST_CASE("a failed checkpoint write exits 2 even when no NaN pixel is counted", "[exitcodes]") {

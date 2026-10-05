@@ -1,7 +1,9 @@
+#include <signal.h>
+#include <unistd.h>
+
 #include <atomic>
+#include <cerrno>
 #include <chrono>
-#include <csignal>
-#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <future>
@@ -9,6 +11,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "app/Cli.h"
@@ -37,21 +42,66 @@ static_assert(std::atomic<int>::is_always_lock_free);
 
 constexpr const char* kOverwriteHint = "use --overwrite to start fresh or choose another --output\n";
 
-// SIGINT and SIGTERM: the first requests a stop, the second exits at once. Nothing is printed here;
-// main announces the stop when it sees the token raised.
-void onSignal(int) {
-  if (g_signalCount.fetch_add(1) >= 1) std::_Exit(demdl::cli::kExitSecondSignal);
-  g_stopToken.request(demdl::StopReason::Signal);
+// SIGINT and SIGTERM. The first requests a stop, which main announces when it sees the token raised:
+// nothing may print here. A second ends the process by that signal's default action, so a calling shell
+// sees the signal, reports 130 or 143 and stops a script or loop running this program. Every call here is
+// async-signal-safe.
+void onSignal(int number) {
+  if (g_signalCount.fetch_add(1) == 0) {
+    g_stopToken.request(demdl::StopReason::Signal);
+    return;
+  }
+  struct sigaction defaultAction {};
+  defaultAction.sa_handler = SIG_DFL;
+  sigemptyset(&defaultAction.sa_mask);
+  sigaction(number, &defaultAction, nullptr);
+  // The signal is blocked while its own handler runs; unblocked, it is delivered before raise returns.
+  sigset_t self;
+  sigemptyset(&self);
+  sigaddset(&self, number);
+  pthread_sigmask(SIG_UNBLOCK, &self, nullptr);
+  raise(number);
 }
 
-void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, bool created) {
+// SIGINT and SIGTERM go to onSignal, each blocking both while it runs, and interrupted system calls
+// restart. SIGPIPE is ignored, which ElevationClient relies on: httplib's client does not suppress it.
+void installSignalHandlers() {
+  struct sigaction stop {};
+  stop.sa_handler = onSignal;
+  stop.sa_flags = SA_RESTART;
+  sigemptyset(&stop.sa_mask);
+  sigaddset(&stop.sa_mask, SIGINT);
+  sigaddset(&stop.sa_mask, SIGTERM);
+  sigaction(SIGINT, &stop, nullptr);
+  sigaction(SIGTERM, &stop, nullptr);
+  struct sigaction ignore {};
+  ignore.sa_handler = SIG_IGN;
+  sigemptyset(&ignore.sa_mask);
+  sigaction(SIGPIPE, &ignore, nullptr);
+}
+
+// Joins the thread when it goes out of scope, so that no way out of main leaves it running.
+class ThreadJoiner {
+ public:
+  explicit ThreadJoiner(std::thread& thread) : thread_(thread) {}
+  ~ThreadJoiner() {
+    if (thread_.joinable()) thread_.join();
+  }
+  ThreadJoiner(const ThreadJoiner&) = delete;
+  ThreadJoiner& operator=(const ThreadJoiner&) = delete;
+
+ private:
+  std::thread& thread_;
+};
+
+// `outputPlan` says what the run would do with the file, such as "exists, will be resumed".
+void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, const char* outputPlan) {
   using demdl::formatCoordinate;
   std::cout << "dry run\n"
             << "  box: north " << formatCoordinate(cfg.box.north) << ", south " << formatCoordinate(cfg.box.south)
             << ", east " << formatCoordinate(cfg.box.east) << ", west " << formatCoordinate(cfg.box.west) << "\n"
             << "  grid: " << cfg.width << " x " << cfg.height << "\n"
-            << "  output: " << cfg.output.string() << (created ? " (will be created)" : " (exists, will be resumed)")
-            << "\n"
+            << "  output: " << cfg.output.string() << " (" << outputPlan << ")\n"
             << "  wms: " << cfg.wmsUrl << "\n"
             << "  layer: " << cfg.layer << "\n"
             << "  threads: " << cfg.threads << ", max retries: " << cfg.maxRetries
@@ -91,6 +141,16 @@ std::optional<demdl::DemRaster> loadForResume(const demdl::Config& cfg) {
   return raster;
 }
 
+// Empty when the output's directory ("." when the path names none) exists and files can be created in it,
+// otherwise the problem.
+std::string outputDirectoryProblem(const std::filesystem::path& output) {
+  std::filesystem::path dir = output.parent_path();
+  if (dir.empty()) dir = ".";
+  if (access(dir.c_str(), W_OK | X_OK) == 0) return {};
+  const int error = errno;
+  return "cannot write to " + dir.string() + ": " + std::generic_category().message(error);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -105,15 +165,15 @@ int main(int argc, char** argv) {
 
   Config cfg;
   const cli::ParseOutcome parsed = cli::parseArgs(argc, argv, cfg, std::cout, std::cerr);
-  if (parsed.exitNow) return parsed.exitCode;  // 0 after --help or --version, cli::kExitUsage after an error
+  if (parsed.exitNow) return parsed.exitCode;  // 0 after --help or --version, cli::kExitError after an error
   if (const std::string err = cfg.validate(); !err.empty()) {
     std::cerr << "error: " << err << "\n";
-    return cli::kExitUsage;
+    return cli::kExitError;
   }
 #ifndef DL_ELEVATION_HAVE_PREVIEW
   if (cfg.preview) {
     std::cerr << "error: this build has no preview support; configure with -DDL_ELEVATION_PREVIEW=ON\n";
-    return cli::kExitUsage;
+    return cli::kExitError;
   }
 #endif
 
@@ -121,14 +181,26 @@ int main(int argc, char** argv) {
   policy.maxRetries = cfg.maxRetries;
 
   std::optional<DemRaster> raster;
-  bool created = false;
   try {
-    if (!cfg.overwrite && std::filesystem::exists(cfg.output)) {
+    const bool outputExists = std::filesystem::exists(cfg.output);
+    const char* outputPlan = "will be created";
+    if (outputExists && !cfg.overwrite) {
       raster = loadForResume(cfg);
-      if (!raster) return cli::kExitUsage;
+      if (!raster) return cli::kExitError;
+      outputPlan = "exists, will be resumed";
     } else {
       raster = DemRaster::create(cfg.width, cfg.height, cfg.box, RasterMetadata{cfg.layer, cfg.wmsUrl});
-      created = true;
+      if (outputExists) outputPlan = "exists, will be overwritten";
+    }
+    // A file with work left, new or resumed, is written before the first request, so that an unusable
+    // directory fails here, in a dry run as well, and a full disk at that first save; a new file can then be
+    // opened while it fills. A complete file is not rewritten, so its directory need not be writable.
+    const bool writesOutput = raster->countNaN() > 0;
+    if (writesOutput) {
+      if (const std::string problem = outputDirectoryProblem(cfg.output); !problem.empty()) {
+        std::cerr << "error: " << problem << "\n";
+        return cli::kExitError;
+      }
     }
     {
       // A probe, discarded at once: the constructor throws for a WMS URL or an HTTP client it cannot use,
@@ -136,21 +208,16 @@ int main(int argc, char** argv) {
       const ElevationClient probe(cfg, policy);
     }
     if (cfg.dryRun) {
-      printPlan(cfg, *raster, created);
+      printPlan(cfg, *raster, outputPlan);
       return cli::kExitComplete;
     }
-    // A new file, or one with work left, is written before the first request, so that an unwritable
-    // directory or a full disk fails here and a new file can be opened while it fills. A complete file is
-    // not rewritten.
-    if (raster->countNaN() > 0) raster->save(cfg.output);
+    if (writesOutput) raster->save(cfg.output);
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
-    return cli::kExitUsage;
+    return cli::kExitError;
   }
 
-  std::signal(SIGINT, onSignal);
-  std::signal(SIGTERM, onSignal);
-  std::signal(SIGPIPE, SIG_IGN);  // ElevationClient relies on it: httplib's client does not suppress SIGPIPE
+  installSignalHandlers();
 
   std::unique_ptr<ProgressSink> sink;
 #ifdef DL_ELEVATION_HAVE_PREVIEW
@@ -162,7 +229,7 @@ int main(int argc, char** argv) {
       sink = std::move(window);
     } catch (const std::exception& e) {
       std::cerr << "error: " << e.what() << "\n";
-      return cli::kExitUsage;
+      return cli::kExitError;
     }
   }
 #endif
@@ -172,15 +239,28 @@ int main(int argc, char** argv) {
     return std::make_unique<ElevationClient>(cfg, policy);
   };
   std::optional<Downloader> downloader;
-  std::future<RunSummary> result;
+  std::promise<RunSummary> promise;
+  std::future<RunSummary> result = promise.get_future();
+  std::thread runner;
+  // Declared after everything the run thread uses, so the thread is joined, on every way out of main, before
+  // any of that goes away. It must also have ended before exit() starts its cleanup: its end runs
+  // thread-local destructors, such as OpenSSL's per-thread state from the clients the factory made, and
+  // libc++'s std::async would detach it.
+  const ThreadJoiner joinRunner(runner);
   try {
     downloader.emplace(*raster, cfg.output, factory, *sink, g_stopToken,
                        DownloaderOptions{cfg.threads, cfg.maxConsecutiveFailures});
     // Off the main thread, which belongs to the preview window when there is one.
-    result = std::async(std::launch::async, [&downloader] { return downloader->run(); });
+    runner = std::thread([&downloader, &promise] {
+      try {
+        promise.set_value(downloader->run());
+      } catch (...) {
+        promise.set_exception(std::current_exception());
+      }
+    });
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
-    return cli::kExitUsage;
+    return cli::kExitError;
   }
 
   bool announced = false;
@@ -203,10 +283,10 @@ int main(int argc, char** argv) {
     summary = result.get();
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << "\n";
-    return cli::kExitUsage;
+    return cli::kExitError;
   } catch (...) {
     std::cerr << "error: unknown exception\n";
-    return cli::kExitUsage;
+    return cli::kExitError;
   }
 #ifdef DL_ELEVATION_HAVE_PREVIEW
   if (preview != nullptr) {
