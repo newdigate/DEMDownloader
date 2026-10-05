@@ -28,17 +28,23 @@ std::string formatCoordinate(double degrees);
 // Throws std::invalid_argument when cfg.wmsUrl does not parse.
 std::string featureInfoUrl(const Config& cfg, int x, int y);
 
-// Classifies the text/plain body of a GetFeatureInfo response.
-// "BAND 0:" anywhere in the body is a band, whatever else the body says. The number that starts the
-// rest of that line is the value, and it must be followed by whitespace, '<' or the end of the body:
-// trailing text such as " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError,
-// because a Value is stored for good while a ParseError is retried. The number must be on the
-// marker's own line. It is a Value only when finite and within float range (the raster stores
-// float32, so a Value always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
-// Without the marker the body is NoData only when it is not blank (empty or only whitespace), does
-// not contain "ServiceException" and does not start with markup ('<' as the first non-whitespace
-// character). NoData is stored as -32768 and never re-requested, so any other body, such as an
-// HTML error page or an OWS exception report, is ParseError and the caller retries it instead.
+// Classifies the text/plain body of a GetFeatureInfo response. A Value is stored for good, and so is
+// NoData (as -32768, never requested again), while a ParseError is retried. The rules follow two
+// answers recorded from the City of Cape Town server on 2026-10-05 (the fixtures in
+// tests/test_WmsQuery.cpp), which carry the height as "BAND 0: <number>" and a mask as
+// "BAND 1: <number>", each on a line of its own: 366.2 and 255 on land, 0 and 0 at sea.
+// - Without "BAND 0:" the body is ParseError, whatever else it says: empty, an HTML error page, an
+//   exception report or a line such as "Error: layer not found".
+// - "BAND 0:" may stand anywhere in the body. The number that starts the rest of its line is the
+//   height, and it must be followed by whitespace, '<' or the end of the body: trailing text such as
+//   " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError. The number must be
+//   on the marker's own line, finite and within float range (the raster stores float32, so a Value
+//   always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
+// - The first line that starts with "BAND 1:" (at the start of the body or right after a '\n') is the
+//   mask, and its number is read by the same rules: 0 is NoData, any other number gives the height as
+//   the Value, and a mask that does not parse is ParseError, because a false NoData is permanent while
+//   a ParseError is only retried. "BAND 1:" inside another line is ignored.
+// - Without a mask line the height is the Value, so layers and servers without a mask band still work.
 // Relies on the C locale for the decimal point; nothing in this program calls setlocale.
 ParseResult parseElevation(std::string_view body);
 

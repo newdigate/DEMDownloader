@@ -4,6 +4,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "ExampleConfig.h"
 #include "demdl/WmsQuery.h"
@@ -14,6 +15,40 @@ using demdl::featureInfoUrl;
 using demdl::formatCoordinate;
 using demdl::parseElevation;
 using demdl::percentEncode;
+
+namespace {
+
+// Two GetFeatureInfo responses recorded byte for byte from the City of Cape Town server on 2026-10-05,
+// for the default layer and the example box on its 2048 x 1792 grid: pixel I=2040 J=8 lies in False
+// Bay, and pixel I=1024 J=1500 on land, at the 366.2 m the old download also has. BAND 0 is the height
+// and BAND 1 the layer's mask, 255 where there is an elevation and 0 where there is none.
+constexpr std::string_view kRecordedSea =
+    "Results for Layer \"Elevation_CCT_GLM2019_5m_DEM\":\r\n"
+    "------------------------------------------------------------------------\r\n"
+    "RED: 255\r\n"
+    "GREEN: 255\r\n"
+    "BLUE: 255\r\n"
+    "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+    "Timestamp: 1661765030000\r\n"
+    "Point: 18.4623527386719,-34.1846837772321\r\n"
+    "BAND 0: 0\r\n"
+    "BAND 1: 0\r\n"
+    "------------------------------------------------------------------------\r\n";
+
+constexpr std::string_view kRecordedLand =
+    "Results for Layer \"Elevation_CCT_GLM2019_5m_DEM\":\r\n"
+    "------------------------------------------------------------------------\r\n"
+    "RED: 164\r\n"
+    "GREEN: 164\r\n"
+    "BLUE: 164\r\n"
+    "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+    "Timestamp: 1661765030000\r\n"
+    "Point: 18.44055175,-34.2111625310268\r\n"
+    "BAND 0: 366.2\r\n"
+    "BAND 1: 255\r\n"
+    "------------------------------------------------------------------------\r\n";
+
+}  // namespace
 
 TEST_CASE("the golden GetFeatureInfo URL for the example configuration", "[wmsquery]") {
   const std::string expected =
@@ -56,6 +91,60 @@ TEST_CASE("formatCoordinate uses nine fixed decimals", "[wmsquery]") {
   CHECK(formatCoordinate(18.0) == "18.000000000");
 }
 
+TEST_CASE("the recorded land response is its BAND 0 height", "[wmsquery]") {
+  const auto land = parseElevation(kRecordedLand);
+  REQUIRE(land.kind == ParseResult::Kind::Value);
+  CHECK_THAT(land.value, WithinAbs(366.2, 1e-12));
+}
+
+TEST_CASE("the recorded sea response is NoData, because its mask band is 0", "[wmsquery]") {
+  // Its BAND 0 reads 0, which as a Value would be stored for good as a real height of 0 m.
+  CHECK(parseElevation(kRecordedSea).kind == ParseResult::Kind::NoData);
+}
+
+TEST_CASE("a BAND 1 mask of 0 is NoData and any other mask keeps the BAND 0 value", "[wmsquery]") {
+  // A height of 0 under a mask of 255 is a real sea-level height.
+  const auto seaLevel = parseElevation("BAND 0: 0\r\nBAND 1: 255\r\n");
+  REQUIRE(seaLevel.kind == ParseResult::Kind::Value);
+  CHECK(seaLevel.value == 0.0);
+
+  CHECK(parseElevation("BAND 0: 12.5\r\nBAND 1: 0\r\n").kind == ParseResult::Kind::NoData);
+
+  const auto otherMask = parseElevation("BAND 0: 12.5\r\nBAND 1: 1\r\n");
+  REQUIRE(otherMask.kind == ParseResult::Kind::Value);
+  CHECK_THAT(otherMask.value, WithinAbs(12.5, 1e-12));
+
+  // Without a BAND 1 line the BAND 0 value stands, so layers and servers without a mask band keep
+  // working.
+  const auto unmasked = parseElevation("BAND 0: 12.5\r\n");
+  REQUIRE(unmasked.kind == ParseResult::Kind::Value);
+  CHECK_THAT(unmasked.value, WithinAbs(12.5, 1e-12));
+}
+
+TEST_CASE("a BAND 1 without a usable number is a parse error, not NoData", "[wmsquery]") {
+  // NoData is stored for good, while a parse error is retried. strtod would read "0abc" as 0.
+  for (const char* body : {"BAND 0: 12.5\r\nBAND 1: x\r\n", "BAND 0: 12.5\r\nBAND 1:\r\n",
+                           "BAND 0: 12.5\r\nBAND 1: nan\r\n", "BAND 0: 12.5\r\nBAND 1: 0abc\r\n"}) {
+    CAPTURE(body);
+    CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
+  }
+}
+
+TEST_CASE("BAND 1 counts only at the start of a line", "[wmsquery]") {
+  // Inside another line, a file name for instance, the text is not the mask and is ignored.
+  for (const char* body : {"FileName: BAND 1: 0\r\nBAND 0: 12.5\r\n", "BAND 0: 12.5 BAND 1: 0\r\n",
+                           "FileName: BAND 1: x\r\nBAND 0: 12.5\r\n"}) {
+    CAPTURE(body);
+    const auto parsed = parseElevation(body);
+    REQUIRE(parsed.kind == ParseResult::Kind::Value);
+    CHECK_THAT(parsed.value, WithinAbs(12.5, 1e-12));
+  }
+
+  // At the start of the body, or after a bare line feed, it is the mask.
+  CHECK(parseElevation("BAND 1: 0\nBAND 0: 12.5\n").kind == ParseResult::Kind::NoData);
+  CHECK(parseElevation("BAND 0: 12.5\nBAND 1: 0\n").kind == ParseResult::Kind::NoData);
+}
+
 TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsquery]") {
   const auto a = parseElevation("GetFeatureInfo results:\nBAND 0: 123.45\n");
   REQUIRE(a.kind == ParseResult::Kind::Value);
@@ -65,7 +154,7 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
   REQUIRE(b.kind == ParseResult::Kind::Value);
   CHECK_THAT(b.value, WithinAbs(-1.5, 1e-12));
 
-  const auto c = parseElevation("BAND 0: 1086.25\nBAND 1: 0\n");
+  const auto c = parseElevation("BAND 0: 1086.25\nBAND 1: 255\n");
   REQUIRE(c.kind == ParseResult::Kind::Value);
   CHECK_THAT(c.value, WithinAbs(1086.25, 1e-12));
 }
@@ -92,9 +181,18 @@ TEST_CASE("a number with other text glued to it is a parse error", "[wmsquery]")
   }
 }
 
-TEST_CASE("a plain body without the band marker is NoData", "[wmsquery]") {
-  CHECK(parseElevation("GetFeatureInfo results:\n").kind == ParseResult::Kind::NoData);
-  CHECK(parseElevation("GetFeatureInfo results:\nno bands\n").kind == ParseResult::Kind::NoData);
+TEST_CASE("a body without BAND 0 is a parse error, never NoData", "[wmsquery]") {
+  // The server sends BAND 0 on land and at sea alike, so a body without it is no answer: a parse error
+  // is retried, while NoData would be stored for good. A UTF-8 byte order mark may precede markup.
+  for (const char* body : {"GetFeatureInfo results:\n", "GetFeatureInfo results:\nno bands\n",
+                           "Error: layer not found",
+                           "\xEF\xBB\xBF<html><body>Service temporarily unavailable</body></html>"}) {
+    CAPTURE(body);
+    CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
+  }
+
+  // Not even a mask of 0 makes NoData without BAND 0.
+  CHECK(parseElevation("BAND 1: 0\r\n").kind == ParseResult::Kind::ParseError);
 }
 
 TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsquery]") {

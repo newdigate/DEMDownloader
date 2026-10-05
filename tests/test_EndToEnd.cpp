@@ -58,8 +58,27 @@ int parseIndex(const std::string& text) {
   return ec == std::errc() && ptr == end && value >= 0 ? value : -1;
 }
 
-// A WMS on a loopback port. GetFeatureInfo for pixel (I, J) answers "BAND 0: <I*10+J>", except at the
-// NoData pixel, which gets a plain body without a band, and at the failing pixel, which gets a 500.
+// A GetFeatureInfo body laid out as the City of Cape Town server's answers are (two were recorded on 2026-10-05;
+// see test_WmsQuery.cpp): CRLF line endings, the height in BAND 0 and the mask in BAND 1, 255 where there is an
+// elevation and 0 where there is none. The colour, file, timestamp and point lines are fixed; nothing reads them.
+std::string featureInfoBody(const std::string& layer, int height, int mask) {
+  const std::string rule(72, '-');
+  return "Results for Layer \"" + layer + "\":\r\n" +
+         rule + "\r\n"
+         "RED: 164\r\n"
+         "GREEN: 164\r\n"
+         "BLUE: 164\r\n"
+         "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+         "Timestamp: 1661765030000\r\n"
+         "Point: 18.44055175,-34.2111625310268\r\n"
+         "BAND 0: " + std::to_string(height) + "\r\n"
+         "BAND 1: " + std::to_string(mask) + "\r\n" +
+         rule + "\r\n";
+}
+
+// A WMS on a loopback port that answers in the real server's layout (featureInfoBody). GetFeatureInfo for pixel
+// (I, J) answers "BAND 0: <I*10+J>" with the mask "BAND 1: 255", except at the NoData pixel, which gets
+// "BAND 0: 0" with "BAND 1: 0", as the real server answers at sea, and at the failing pixel, which gets a 500.
 // Requests are counted as they arrive. Every request after the first `holdAfter` waits at `gate` until
 // the test releases it, which keeps requests in flight for as long as a test needs; once released, the
 // gate stays open.
@@ -94,14 +113,15 @@ struct LoopbackWms {
     if (hold >= 0 && arrived > hold) gate.wait();
     const int i = parseIndex(req.get_param_value("I"));
     const int j = parseIndex(req.get_param_value("J"));
+    const std::string layer = req.get_param_value("QUERY_LAYERS");
     if (i < 0 || j < 0) {
       res.status = 400;
     } else if (pixelKey(i, j) == failingPixel.load()) {
       res.status = 500;
     } else if (pixelKey(i, j) == noDataPixel.load()) {
-      res.set_content("GetFeatureInfo results:\n", "text/plain");
+      res.set_content(featureInfoBody(layer, 0, 0), "text/plain");
     } else {
-      res.set_content("GetFeatureInfo results:\nBAND 0: " + std::to_string(i * 10 + j) + "\n", "text/plain");
+      res.set_content(featureInfoBody(layer, i * 10 + j, 255), "text/plain");
     }
   }
 

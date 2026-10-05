@@ -803,6 +803,7 @@ Implements spec section 4.3 (WmsQuery) and the golden URL in section 11.
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "ExampleConfig.h"
 #include "demdl/WmsQuery.h"
@@ -813,6 +814,40 @@ using demdl::featureInfoUrl;
 using demdl::formatCoordinate;
 using demdl::parseElevation;
 using demdl::percentEncode;
+
+namespace {
+
+// Two GetFeatureInfo responses recorded byte for byte from the City of Cape Town server on 2026-10-05,
+// for the default layer and the example box on its 2048 x 1792 grid: pixel I=2040 J=8 lies in False
+// Bay, and pixel I=1024 J=1500 on land, at the 366.2 m the old download also has. BAND 0 is the height
+// and BAND 1 the layer's mask, 255 where there is an elevation and 0 where there is none.
+constexpr std::string_view kRecordedSea =
+    "Results for Layer \"Elevation_CCT_GLM2019_5m_DEM\":\r\n"
+    "------------------------------------------------------------------------\r\n"
+    "RED: 255\r\n"
+    "GREEN: 255\r\n"
+    "BLUE: 255\r\n"
+    "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+    "Timestamp: 1661765030000\r\n"
+    "Point: 18.4623527386719,-34.1846837772321\r\n"
+    "BAND 0: 0\r\n"
+    "BAND 1: 0\r\n"
+    "------------------------------------------------------------------------\r\n";
+
+constexpr std::string_view kRecordedLand =
+    "Results for Layer \"Elevation_CCT_GLM2019_5m_DEM\":\r\n"
+    "------------------------------------------------------------------------\r\n"
+    "RED: 164\r\n"
+    "GREEN: 164\r\n"
+    "BLUE: 164\r\n"
+    "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+    "Timestamp: 1661765030000\r\n"
+    "Point: 18.44055175,-34.2111625310268\r\n"
+    "BAND 0: 366.2\r\n"
+    "BAND 1: 255\r\n"
+    "------------------------------------------------------------------------\r\n";
+
+}  // namespace
 
 TEST_CASE("the golden GetFeatureInfo URL for the example configuration", "[wmsquery]") {
   const std::string expected =
@@ -855,6 +890,60 @@ TEST_CASE("formatCoordinate uses nine fixed decimals", "[wmsquery]") {
   CHECK(formatCoordinate(18.0) == "18.000000000");
 }
 
+TEST_CASE("the recorded land response is its BAND 0 height", "[wmsquery]") {
+  const auto land = parseElevation(kRecordedLand);
+  REQUIRE(land.kind == ParseResult::Kind::Value);
+  CHECK_THAT(land.value, WithinAbs(366.2, 1e-12));
+}
+
+TEST_CASE("the recorded sea response is NoData, because its mask band is 0", "[wmsquery]") {
+  // Its BAND 0 reads 0, which as a Value would be stored for good as a real height of 0 m.
+  CHECK(parseElevation(kRecordedSea).kind == ParseResult::Kind::NoData);
+}
+
+TEST_CASE("a BAND 1 mask of 0 is NoData and any other mask keeps the BAND 0 value", "[wmsquery]") {
+  // A height of 0 under a mask of 255 is a real sea-level height.
+  const auto seaLevel = parseElevation("BAND 0: 0\r\nBAND 1: 255\r\n");
+  REQUIRE(seaLevel.kind == ParseResult::Kind::Value);
+  CHECK(seaLevel.value == 0.0);
+
+  CHECK(parseElevation("BAND 0: 12.5\r\nBAND 1: 0\r\n").kind == ParseResult::Kind::NoData);
+
+  const auto otherMask = parseElevation("BAND 0: 12.5\r\nBAND 1: 1\r\n");
+  REQUIRE(otherMask.kind == ParseResult::Kind::Value);
+  CHECK_THAT(otherMask.value, WithinAbs(12.5, 1e-12));
+
+  // Without a BAND 1 line the BAND 0 value stands, so layers and servers without a mask band keep
+  // working.
+  const auto unmasked = parseElevation("BAND 0: 12.5\r\n");
+  REQUIRE(unmasked.kind == ParseResult::Kind::Value);
+  CHECK_THAT(unmasked.value, WithinAbs(12.5, 1e-12));
+}
+
+TEST_CASE("a BAND 1 without a usable number is a parse error, not NoData", "[wmsquery]") {
+  // NoData is stored for good, while a parse error is retried. strtod would read "0abc" as 0.
+  for (const char* body : {"BAND 0: 12.5\r\nBAND 1: x\r\n", "BAND 0: 12.5\r\nBAND 1:\r\n",
+                           "BAND 0: 12.5\r\nBAND 1: nan\r\n", "BAND 0: 12.5\r\nBAND 1: 0abc\r\n"}) {
+    CAPTURE(body);
+    CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
+  }
+}
+
+TEST_CASE("BAND 1 counts only at the start of a line", "[wmsquery]") {
+  // Inside another line, a file name for instance, the text is not the mask and is ignored.
+  for (const char* body : {"FileName: BAND 1: 0\r\nBAND 0: 12.5\r\n", "BAND 0: 12.5 BAND 1: 0\r\n",
+                           "FileName: BAND 1: x\r\nBAND 0: 12.5\r\n"}) {
+    CAPTURE(body);
+    const auto parsed = parseElevation(body);
+    REQUIRE(parsed.kind == ParseResult::Kind::Value);
+    CHECK_THAT(parsed.value, WithinAbs(12.5, 1e-12));
+  }
+
+  // At the start of the body, or after a bare line feed, it is the mask.
+  CHECK(parseElevation("BAND 1: 0\nBAND 0: 12.5\n").kind == ParseResult::Kind::NoData);
+  CHECK(parseElevation("BAND 0: 12.5\nBAND 1: 0\n").kind == ParseResult::Kind::NoData);
+}
+
 TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsquery]") {
   const auto a = parseElevation("GetFeatureInfo results:\nBAND 0: 123.45\n");
   REQUIRE(a.kind == ParseResult::Kind::Value);
@@ -864,7 +953,7 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
   REQUIRE(b.kind == ParseResult::Kind::Value);
   CHECK_THAT(b.value, WithinAbs(-1.5, 1e-12));
 
-  const auto c = parseElevation("BAND 0: 1086.25\nBAND 1: 0\n");
+  const auto c = parseElevation("BAND 0: 1086.25\nBAND 1: 255\n");
   REQUIRE(c.kind == ParseResult::Kind::Value);
   CHECK_THAT(c.value, WithinAbs(1086.25, 1e-12));
 }
@@ -891,9 +980,18 @@ TEST_CASE("a number with other text glued to it is a parse error", "[wmsquery]")
   }
 }
 
-TEST_CASE("a plain body without the band marker is NoData", "[wmsquery]") {
-  CHECK(parseElevation("GetFeatureInfo results:\n").kind == ParseResult::Kind::NoData);
-  CHECK(parseElevation("GetFeatureInfo results:\nno bands\n").kind == ParseResult::Kind::NoData);
+TEST_CASE("a body without BAND 0 is a parse error, never NoData", "[wmsquery]") {
+  // The server sends BAND 0 on land and at sea alike, so a body without it is no answer: a parse error
+  // is retried, while NoData would be stored for good. A UTF-8 byte order mark may precede markup.
+  for (const char* body : {"GetFeatureInfo results:\n", "GetFeatureInfo results:\nno bands\n",
+                           "Error: layer not found",
+                           "\xEF\xBB\xBF<html><body>Service temporarily unavailable</body></html>"}) {
+    CAPTURE(body);
+    CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
+  }
+
+  // Not even a mask of 0 makes NoData without BAND 0.
+  CHECK(parseElevation("BAND 1: 0\r\n").kind == ParseResult::Kind::ParseError);
 }
 
 TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsquery]") {
@@ -1006,17 +1104,23 @@ std::string formatCoordinate(double degrees);
 // Throws std::invalid_argument when cfg.wmsUrl does not parse.
 std::string featureInfoUrl(const Config& cfg, int x, int y);
 
-// Classifies the text/plain body of a GetFeatureInfo response.
-// "BAND 0:" anywhere in the body is a band, whatever else the body says. The number that starts the
-// rest of that line is the value, and it must be followed by whitespace, '<' or the end of the body:
-// trailing text such as " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError,
-// because a Value is stored for good while a ParseError is retried. The number must be on the
-// marker's own line. It is a Value only when finite and within float range (the raster stores
-// float32, so a Value always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
-// Without the marker the body is NoData only when it is not blank (empty or only whitespace), does
-// not contain "ServiceException" and does not start with markup ('<' as the first non-whitespace
-// character). NoData is stored as -32768 and never re-requested, so any other body, such as an
-// HTML error page or an OWS exception report, is ParseError and the caller retries it instead.
+// Classifies the text/plain body of a GetFeatureInfo response. A Value is stored for good, and so is
+// NoData (as -32768, never requested again), while a ParseError is retried. The rules follow two
+// answers recorded from the City of Cape Town server on 2026-10-05 (the fixtures in
+// tests/test_WmsQuery.cpp), which carry the height as "BAND 0: <number>" and a mask as
+// "BAND 1: <number>", each on a line of its own: 366.2 and 255 on land, 0 and 0 at sea.
+// - Without "BAND 0:" the body is ParseError, whatever else it says: empty, an HTML error page, an
+//   exception report or a line such as "Error: layer not found".
+// - "BAND 0:" may stand anywhere in the body. The number that starts the rest of its line is the
+//   height, and it must be followed by whitespace, '<' or the end of the body: trailing text such as
+//   " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError. The number must be
+//   on the marker's own line, finite and within float range (the raster stores float32, so a Value
+//   always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
+// - The first line that starts with "BAND 1:" (at the start of the body or right after a '\n') is the
+//   mask, and its number is read by the same rules: 0 is NoData, any other number gives the height as
+//   the Value, and a mask that does not parse is ParseError, because a false NoData is permanent while
+//   a ParseError is only retried. "BAND 1:" inside another line is ignored.
+// - Without a mask line the height is the Value, so layers and servers without a mask band still work.
 // Relies on the C locale for the decimal point; nothing in this program calls setlocale.
 ParseResult parseElevation(std::string_view body);
 
@@ -1032,6 +1136,7 @@ ParseResult parseElevation(std::string_view body);
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace demdl {
@@ -1048,6 +1153,40 @@ bool isUnreserved(unsigned char c) {
 // Whitespace as isspace defines it in the C locale, without consulting the locale.
 bool isWhitespace(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+// The number that starts `rest`, the text after a band marker, or nothing when there is no usable
+// one. Only the marker's own line counts.
+std::optional<double> leadingNumber(std::string_view rest) {
+  const auto lineEnd = rest.find_first_of("\r\n");
+  // strtod needs a null-terminated string; libc++ on AppleClang 15 has no floating-point from_chars.
+  const std::string token(rest.substr(0, lineEnd));
+  const char* begin = token.c_str();
+  char* end = nullptr;
+  const double value = std::strtod(begin, &end);
+  // The number must be followed by whitespace, '<' or the end of the body: no number contains '<', so
+  // markup such as "</pre>" may end one. strtod stops at the first character it cannot use, so "12,5",
+  // "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, and a mask of "0abc" NoData, all stored
+  // for good and never fetched again; as a parse error the pixel is retried.
+  const bool ended = end == begin + token.size() || isWhitespace(*end) || *end == '<';
+  // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
+  // unfetched pixel and be requested again on every run. The raster stores float32, so values
+  // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does
+  // not matter, because no elevation is anywhere near 1e38.
+  if (end == begin || !ended || !std::isfinite(value) ||
+      std::fabs(value) > std::numeric_limits<float>::max()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+// The text after the first `marker` that starts a line, at the start of the body or right after a
+// '\n', or nothing when no line starts with it.
+std::optional<std::string_view> afterLineStart(std::string_view body, std::string_view marker) {
+  for (auto pos = body.find(marker); pos != std::string_view::npos; pos = body.find(marker, pos + 1)) {
+    if (pos == 0 || body[pos - 1] == '\n') return body.substr(pos + marker.size());
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -1091,41 +1230,28 @@ std::string featureInfoUrl(const Config& cfg, int x, int y) {
 }
 
 ParseResult parseElevation(std::string_view body) {
-  static constexpr std::string_view marker = "BAND 0:";
-  const auto pos = body.find(marker);
-  if (pos == std::string_view::npos) {
-    // NoData is stored as -32768 and never re-requested, so a body that is not plainly "no band
-    // here" must be retried instead: an empty or blank one, markup (an HTML error page or an OWS
-    // exception report; text/plain was requested, so markup is never a valid answer) and anything
-    // that mentions a ServiceException (WMS servers report faults such as an unknown layer so).
-    const auto first = body.find_first_not_of(" \t\n\v\f\r");
-    if (first == std::string_view::npos || body[first] == '<' ||
-        body.find("ServiceException") != std::string_view::npos) {
-      return {ParseResult::Kind::ParseError, 0.0};
-    }
-    return {ParseResult::Kind::NoData, 0.0};
-  }
-  const std::string_view rest = body.substr(pos + marker.size());
-  const auto lineEnd = rest.find_first_of("\r\n");
-  // strtod needs a null-terminated string; libc++ on AppleClang 15 has no floating-point from_chars.
-  const std::string token(rest.substr(0, lineEnd));
-  const char* begin = token.c_str();
-  char* end = nullptr;
-  const double value = std::strtod(begin, &end);
-  // The number must be followed by whitespace, '<' or the end of the body: no number contains '<', so
-  // markup such as "</pre>" may end one. strtod stops at the first character it cannot use, so "12,5",
-  // "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for good and never fetched
-  // again; as a parse error the pixel is retried.
-  const bool ended = end == begin + token.size() || isWhitespace(*end) || *end == '<';
-  // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
-  // unfetched pixel and be requested again on every run. The raster stores float32, so values
-  // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does
-  // not matter, because no elevation is anywhere near 1e38.
-  if (end == begin || !ended || !std::isfinite(value) ||
-      std::fabs(value) > std::numeric_limits<float>::max()) {
-    return {ParseResult::Kind::ParseError, 0.0};
-  }
-  return {ParseResult::Kind::Value, value};
+  static constexpr std::string_view heightMarker = "BAND 0:";
+  static constexpr std::string_view maskMarker = "BAND 1:";
+  // The server sends BAND 0 on land and at sea alike (see the recorded responses in
+  // tests/test_WmsQuery.cpp), so a body without it is no answer: an empty one, an HTML error page, an
+  // exception report or a line such as "Error: layer not found". NoData is stored as -32768 and never
+  // requested again, so such a body is a parse error, and the pixel is retried.
+  const auto pos = body.find(heightMarker);
+  if (pos == std::string_view::npos) return {ParseResult::Kind::ParseError, 0.0};
+  const std::optional<double> height = leadingNumber(body.substr(pos + heightMarker.size()));
+  if (!height) return {ParseResult::Kind::ParseError, 0.0};
+  // BAND 1 is the layer's mask, 255 where there is an elevation and 0 where there is none. At sea the
+  // server answers "BAND 0: 0" with "BAND 1: 0", so the height alone would store a real 0 m for every
+  // sea pixel, for good. Only a line of its own counts, so the marker quoted inside another line cannot
+  // mark a pixel as no data, and a mask that does not parse is a parse error, retried, because a false
+  // NoData is permanent. Without a mask line the height stands, so layers and servers without a mask
+  // band keep working.
+  const std::optional<std::string_view> maskText = afterLineStart(body, maskMarker);
+  if (!maskText) return {ParseResult::Kind::Value, *height};
+  const std::optional<double> mask = leadingNumber(*maskText);
+  if (!mask) return {ParseResult::Kind::ParseError, 0.0};
+  if (*mask == 0.0) return {ParseResult::Kind::NoData, 0.0};
+  return {ParseResult::Kind::Value, *height};
 }
 
 }  // namespace demdl
@@ -1134,7 +1260,7 @@ ParseResult parseElevation(std::string_view body) {
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[wmsquery]"`
-Expected: `All tests passed (N assertions in 15 test cases)`.
+Expected: `All tests passed (N assertions in 20 test cases)`.
 
 - [ ] **Step 7: Commit**
 
@@ -3885,6 +4011,21 @@ constexpr const char* kServiceExceptionReport =
     R"(<ServiceException code="LayerNotDefined">no such layer</ServiceException>)"
     R"(</ServiceExceptionReport>)";
 
+// The City of Cape Town server's answer for a pixel in False Bay, recorded on 2026-10-05 (the sea fixture
+// in test_WmsQuery.cpp): BAND 0 reads 0, and the mask band BAND 1 is 0 because there is no elevation.
+constexpr const char* kSeaResponse =
+    "Results for Layer \"Elevation_CCT_GLM2019_5m_DEM\":\r\n"
+    "------------------------------------------------------------------------\r\n"
+    "RED: 255\r\n"
+    "GREEN: 255\r\n"
+    "BLUE: 255\r\n"
+    "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+    "Timestamp: 1661765030000\r\n"
+    "Point: 18.4623527386719,-34.1846837772321\r\n"
+    "BAND 0: 0\r\n"
+    "BAND 1: 0\r\n"
+    "------------------------------------------------------------------------\r\n";
+
 // What the server decoded from one request.
 struct SeenRequest {
   std::map<std::string, std::string> params;  // BBOX, LAYERS, QUERY_LAYERS, I and J
@@ -3892,9 +4033,10 @@ struct SeenRequest {
 };
 
 // Serves canned GetFeatureInfo bodies on loopback, over plain HTTP or, given a certificate, over TLS.
-// The pixel column I selects the behaviour: 0 a band value, 1 a plain body without a band, 2 a 500
-// and then a band value, 4 a 200 service exception report, any other column a 404. Hits are counted
-// per column; the remote port of every request and what the latest one carried are recorded.
+// The pixel column I selects the behaviour: 0 a band value, 1 the real server's answer at sea, 2 a 500
+// and then a band value, 4 a 200 service exception report, 5 a plain body without a band, any other
+// column a 404. Hits are counted per column; the remote port of every request and what the latest one
+// carried are recorded.
 // httplib re-encodes the query on the wire (%2C goes out as ','), so tests compare the decoded
 // parameters and never the raw request target.
 struct CannedServer {
@@ -3941,7 +4083,7 @@ struct CannedServer {
     if (column == 0) {
       res.set_content("GetFeatureInfo results:\nBAND 0: 12.5\n", "text/plain");
     } else if (column == 1) {
-      res.set_content("GetFeatureInfo results:\n", "text/plain");
+      res.set_content(kSeaResponse, "text/plain");
     } else if (column == 2) {
       if (hit == 1) {
         res.status = 500;
@@ -3950,6 +4092,8 @@ struct CannedServer {
       }
     } else if (column == 4) {
       res.set_content(kServiceExceptionReport, "application/vnd.ogc.se_xml");
+    } else if (column == 5) {
+      res.set_content("GetFeatureInfo results:\n", "text/plain");
     } else {
       res.status = 404;
     }
@@ -3978,7 +4122,7 @@ TEST_CASE("a band value is returned on the first attempt", "[elevationclient]") 
   CHECK(r.attempts == 1);
 }
 
-TEST_CASE("a plain 200 without a band is NoData", "[elevationclient]") {
+TEST_CASE("a 200 whose mask band marks no data is NoData", "[elevationclient]") {
   CannedServer srv;
   ElevationClient client(configFor(srv.url()), fastPolicy());
   std::atomic<bool> stop{false};
@@ -4018,6 +4162,17 @@ TEST_CASE("a 200 service exception is retried and then fails", "[elevationclient
   CHECK(r.attempts == 3);
   CHECK(r.error == "unparseable body");
   CHECK(srv.hits[4].load() == 3);
+}
+
+TEST_CASE("a plain 200 without a band is retried and then fails", "[elevationclient]") {
+  CannedServer srv;
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(5, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 3);
+  CHECK(r.error == "unparseable body");
+  CHECK(srv.hits[5].load() == 3);
 }
 
 TEST_CASE("a refused connection fails after the retries with a transport error", "[elevationclient]") {
@@ -4495,7 +4650,7 @@ Notes for the engineer: `httplib::Client` built from an `https://` origin is the
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[elevationclient]"`
-Expected: `All tests passed (N assertions in 20 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
+Expected: `All tests passed (N assertions in 21 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
 
 - [ ] **Step 7: Commit**
 
@@ -5891,8 +6046,27 @@ int parseIndex(const std::string& text) {
   return ec == std::errc() && ptr == end && value >= 0 ? value : -1;
 }
 
-// A WMS on a loopback port. GetFeatureInfo for pixel (I, J) answers "BAND 0: <I*10+J>", except at the
-// NoData pixel, which gets a plain body without a band, and at the failing pixel, which gets a 500.
+// A GetFeatureInfo body laid out as the City of Cape Town server's answers are (two were recorded on 2026-10-05;
+// see test_WmsQuery.cpp): CRLF line endings, the height in BAND 0 and the mask in BAND 1, 255 where there is an
+// elevation and 0 where there is none. The colour, file, timestamp and point lines are fixed; nothing reads them.
+std::string featureInfoBody(const std::string& layer, int height, int mask) {
+  const std::string rule(72, '-');
+  return "Results for Layer \"" + layer + "\":\r\n" +
+         rule + "\r\n"
+         "RED: 164\r\n"
+         "GREEN: 164\r\n"
+         "BLUE: 164\r\n"
+         "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+         "Timestamp: 1661765030000\r\n"
+         "Point: 18.44055175,-34.2111625310268\r\n"
+         "BAND 0: " + std::to_string(height) + "\r\n"
+         "BAND 1: " + std::to_string(mask) + "\r\n" +
+         rule + "\r\n";
+}
+
+// A WMS on a loopback port that answers in the real server's layout (featureInfoBody). GetFeatureInfo for pixel
+// (I, J) answers "BAND 0: <I*10+J>" with the mask "BAND 1: 255", except at the NoData pixel, which gets
+// "BAND 0: 0" with "BAND 1: 0", as the real server answers at sea, and at the failing pixel, which gets a 500.
 // Requests are counted as they arrive. Every request after the first `holdAfter` waits at `gate` until
 // the test releases it, which keeps requests in flight for as long as a test needs; once released, the
 // gate stays open.
@@ -5927,14 +6101,15 @@ struct LoopbackWms {
     if (hold >= 0 && arrived > hold) gate.wait();
     const int i = parseIndex(req.get_param_value("I"));
     const int j = parseIndex(req.get_param_value("J"));
+    const std::string layer = req.get_param_value("QUERY_LAYERS");
     if (i < 0 || j < 0) {
       res.status = 400;
     } else if (pixelKey(i, j) == failingPixel.load()) {
       res.status = 500;
     } else if (pixelKey(i, j) == noDataPixel.load()) {
-      res.set_content("GetFeatureInfo results:\n", "text/plain");
+      res.set_content(featureInfoBody(layer, 0, 0), "text/plain");
     } else {
-      res.set_content("GetFeatureInfo results:\nBAND 0: " + std::to_string(i * 10 + j) + "\n", "text/plain");
+      res.set_content(featureInfoBody(layer, i * 10 + j, 255), "text/plain");
     }
   }
 
@@ -6834,7 +7009,7 @@ Run: `./build/demdl_tests "[e2e]"`
 Expected: `All tests passed (N assertions in 13 test cases)` in about 3.5 seconds.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 152`.
+Expected: `100% tests passed out of 158`.
 
 - [ ] **Step 8: Smoke-test the dry run (no network)**
 
@@ -7556,7 +7731,7 @@ Run: `cmake --build build && ./build/demdl_tests "[palette]"`
 Expected: builds `demdl_preview`, relinks `dl_elevation` and rebuilds `demdl_tests` with no warnings, then `All tests passed (N assertions in 5 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 157`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
+Expected: `100% tests passed out of 163`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --preview --dry-run; echo "exit $?"`
 Expected: the dry-run plan and `exit 0`. The "no preview support" error from Task 12 is gone, which proves the define reached `main.cpp`. No window opens because a dry run returns before the sink is created.
@@ -7652,7 +7827,7 @@ Run: `grep -rn "opengl.cmake.in\|include/shader\|include/" CMakeLists.txt src te
 Expected: `no references`.
 
 Run: `cmake --build build && ctest --test-dir build --output-on-failure`
-Expected: builds and `100% tests passed out of 157`.
+Expected: builds and `100% tests passed out of 163`.
 
 - [ ] **Step 3: Replace `CLAUDE.md`**
 
@@ -7712,7 +7887,7 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 
 ## Behaviours to keep in mind
 
-- **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server has no elevation there and is final. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
+- **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server's mask band says there is no elevation there (`BAND 1: 0`, as at sea, where `BAND 0` reads 0) and is final; a body without `BAND 0:` is a parse error, retried, never NoData. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
 - **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp`, syncs it and renames it over the output, so every row with work rewrites 4 x width x height bytes: about 26 GB over a 2048 x 1792 run, and about 50 TB for a square grid near the 2^29-pixel limit, enough to wear an SSD noticeably. A save after the first request that fails, on a full disk for instance, stops the run with exit 2 and the last good checkpoint intact, and is reported on stderr as `error: checkpoint write failed: ...` (after another stop reason, `error: interrupted; checkpoint write failed: ...`) as well as in the summary on stdout. If the save before the first request fails, the run exits 1 with `error: ...` and makes no request.
 - **Stopping is one flag.** SIGINT, SIGTERM, SIGHUP (closing the terminal; left ignored when the tool is started under `nohup`), closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
 - **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143, and a second SIGHUP by SIGHUP, 129.

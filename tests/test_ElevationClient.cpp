@@ -120,6 +120,21 @@ constexpr const char* kServiceExceptionReport =
     R"(<ServiceException code="LayerNotDefined">no such layer</ServiceException>)"
     R"(</ServiceExceptionReport>)";
 
+// The City of Cape Town server's answer for a pixel in False Bay, recorded on 2026-10-05 (the sea fixture
+// in test_WmsQuery.cpp): BAND 0 reads 0, and the mask band BAND 1 is 0 because there is no elevation.
+constexpr const char* kSeaResponse =
+    "Results for Layer \"Elevation_CCT_GLM2019_5m_DEM\":\r\n"
+    "------------------------------------------------------------------------\r\n"
+    "RED: 255\r\n"
+    "GREEN: 255\r\n"
+    "BLUE: 255\r\n"
+    "FileName: CCT_GLM2019_5m_DEM_1D_v1.tif\r\n"
+    "Timestamp: 1661765030000\r\n"
+    "Point: 18.4623527386719,-34.1846837772321\r\n"
+    "BAND 0: 0\r\n"
+    "BAND 1: 0\r\n"
+    "------------------------------------------------------------------------\r\n";
+
 // What the server decoded from one request.
 struct SeenRequest {
   std::map<std::string, std::string> params;  // BBOX, LAYERS, QUERY_LAYERS, I and J
@@ -127,9 +142,10 @@ struct SeenRequest {
 };
 
 // Serves canned GetFeatureInfo bodies on loopback, over plain HTTP or, given a certificate, over TLS.
-// The pixel column I selects the behaviour: 0 a band value, 1 a plain body without a band, 2 a 500
-// and then a band value, 4 a 200 service exception report, any other column a 404. Hits are counted
-// per column; the remote port of every request and what the latest one carried are recorded.
+// The pixel column I selects the behaviour: 0 a band value, 1 the real server's answer at sea, 2 a 500
+// and then a band value, 4 a 200 service exception report, 5 a plain body without a band, any other
+// column a 404. Hits are counted per column; the remote port of every request and what the latest one
+// carried are recorded.
 // httplib re-encodes the query on the wire (%2C goes out as ','), so tests compare the decoded
 // parameters and never the raw request target.
 struct CannedServer {
@@ -176,7 +192,7 @@ struct CannedServer {
     if (column == 0) {
       res.set_content("GetFeatureInfo results:\nBAND 0: 12.5\n", "text/plain");
     } else if (column == 1) {
-      res.set_content("GetFeatureInfo results:\n", "text/plain");
+      res.set_content(kSeaResponse, "text/plain");
     } else if (column == 2) {
       if (hit == 1) {
         res.status = 500;
@@ -185,6 +201,8 @@ struct CannedServer {
       }
     } else if (column == 4) {
       res.set_content(kServiceExceptionReport, "application/vnd.ogc.se_xml");
+    } else if (column == 5) {
+      res.set_content("GetFeatureInfo results:\n", "text/plain");
     } else {
       res.status = 404;
     }
@@ -213,7 +231,7 @@ TEST_CASE("a band value is returned on the first attempt", "[elevationclient]") 
   CHECK(r.attempts == 1);
 }
 
-TEST_CASE("a plain 200 without a band is NoData", "[elevationclient]") {
+TEST_CASE("a 200 whose mask band marks no data is NoData", "[elevationclient]") {
   CannedServer srv;
   ElevationClient client(configFor(srv.url()), fastPolicy());
   std::atomic<bool> stop{false};
@@ -253,6 +271,17 @@ TEST_CASE("a 200 service exception is retried and then fails", "[elevationclient
   CHECK(r.attempts == 3);
   CHECK(r.error == "unparseable body");
   CHECK(srv.hits[4].load() == 3);
+}
+
+TEST_CASE("a plain 200 without a band is retried and then fails", "[elevationclient]") {
+  CannedServer srv;
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(5, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 3);
+  CHECK(r.error == "unparseable body");
+  CHECK(srv.hits[5].load() == 3);
 }
 
 TEST_CASE("a refused connection fails after the retries with a transport error", "[elevationclient]") {

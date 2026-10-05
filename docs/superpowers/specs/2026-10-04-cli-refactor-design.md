@@ -46,7 +46,7 @@ Non-goals for this iteration:
 |---|---|
 | Output format | Single-band float32 GeoTIFF in metres. Old RGB16 files are not resumable and are left untouched. |
 | TLS | Verify certificates by default using the system trust store. `--ca-bundle` replaces that store rather than adding to it; `--insecure` disables verification. |
-| Response parsing | Parse the whole number after `BAND 0:`, which must be followed by whitespace, `<` or the end of the body. A 200 body is NoData only when it lacks the marker and is plain (not blank, no `ServiceException`, not markup); anything else without a finite in-range number is a parse error. Parse errors and transport failures are retried, then left for the next run. |
+| Response parsing | Parse the whole number after `BAND 0:`, which must be followed by whitespace, `<` or the end of the body; a 200 body without `BAND 0:` is a parse error. A line that starts with `BAND 1:` is the layer's mask, read the same way: 0 makes the pixel NoData, any other value keeps the `BAND 0` number, and a mask that does not parse is a parse error; without that line the `BAND 0` number stands. Settled against two responses recorded from the real server on 2026-10-05 (section 4.3). Parse errors and transport failures are retried, then left for the next run. |
 | Concurrency | `--threads` default 8 (was 50). Exponential backoff between retries. `--max-retries` default 8 (was 500). |
 | Shutdown | SIGINT, SIGTERM and SIGHUP (unless ignored at startup, as under `nohup`) stop queueing, drain in-flight requests, save, exit. |
 | Preview | Off by default; `--preview` opens the window. |
@@ -159,23 +159,44 @@ fixed decimals, the form used in URLs and in reports alike.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
-`Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins over
-everything else in the body. The number at the start of the marker's line is
+`Value(double)`, `NoData`, or `ParseError`. A body without a `BAND 0:` marker
+is a `ParseError`, whatever else it says, and is retried: an empty body, an
+HTML page, an XML exception report or a plain line such as
+`Error: layer not found` is never stored, because NoData is stored as -32768
+and never re-requested; WMS servers often report a fault, such as a wrong
+layer name, as HTTP 200 with an XML exception report or an HTML page. The
+`BAND 0:` marker may stand anywhere in the body, and it wins over markup and
+`ServiceException`. The number at the start of the marker's line is
 parsed, and it must be followed by whitespace (space, tab, CR, LF, VT or FF),
 `<` or the end of the body, after which any text is ignored: `BAND 0: 12.5 m`
 is 12.5, and so is `<pre>BAND 0: 12.5</pre>`, because no number contains `<`;
 but text glued to the number, as in `1.#QNAN`, `12,5`, `12abc` or `12.5e`,
 makes a `ParseError`, because a stored value is final and never fetched again
 while a parse error is retried. A number on the next line does not count. The
-result is a `Value` only when the number is finite and within float range,
-because the raster stores float32; anything else (no number, `nan`, `inf`,
-`1e300`) is a `ParseError`. Without the marker the body
-is `NoData` only when it is not blank (empty or only whitespace), does not
-contain `ServiceException` and does not start with markup (`<` as the first
-non-whitespace character). Anything else is a `ParseError` and is retried,
-because NoData is stored as -32768 and never re-requested; WMS servers often
-report a fault, such as a wrong layer name, as HTTP 200 with an XML exception
-report or an HTML page. All four are pure.
+number must be finite and within float range, because the raster stores
+float32; anything else (no number, `nan`, `inf`, `1e300`) is a `ParseError`.
+The first line that starts with `BAND 1:` (at the start of the body or right
+after a line feed) is the mask band, and its number is read by the same rules:
+0 makes the result `NoData`, any other value gives the `BAND 0` number as the
+`Value`, and a mask that does not parse (`x`, nothing, `nan`, `0abc`) is a
+`ParseError`, because a false NoData is permanent while a parse error is only
+retried. `BAND 1:` inside another line is ignored. Without a mask line the
+`BAND 0` number is the `Value`. All four are pure.
+
+The parse rules were settled against two responses recorded from the real
+server on 2026-10-05 for the default layer: pixel (2040, 8) of the 2048 x 1792
+example grid, in False Bay, and pixel (1024, 1500), on land. Both are
+fixtures in `tests/test_WmsQuery.cpp`, byte for byte. Each is text/plain with
+CRLF line endings: `Results for Layer "Elevation_CCT_GLM2019_5m_DEM":`, a
+dashed line, `RED:`, `GREEN:`, `BLUE:`, `FileName:`, `Timestamp:`,
+`Point: <lon>,<lat>`, `BAND 0:`, `BAND 1:` and a dashed line. On land
+`BAND 0` is the height, 366.2 m as the old download has it, and `BAND 1` is
+255; at sea both read 0. `BAND 1` is therefore the default layer's 0/255 mask,
+and `BAND 0` alone would have stored every sea pixel as a real 0 m, for good.
+Other layers, or servers, without a mask band keep the `BAND 0` value. A
+server that signals no data by omitting the marker would now see those pixels
+fail after their retries, with a warning on stderr, and a stretch of them stop
+the run at the consecutive-failure limit, loudly, instead of being stored.
 
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
@@ -223,14 +244,13 @@ suppress it per socket. The constructor throws `std::invalid_argument` when
 the WMS URL does not parse or when the new client reports `is_valid()` false
 (httplib could not set it up, for example without a TLS context), because its
 methods could then dereference a null implementation. One instance per worker
-thread. `fetch` loops over attempts: HTTP 200 with a finite in-range band
-value is `Value`; HTTP 200 without the band marker is `NoData` only when the
-body is not blank, does not contain `ServiceException` and does not start with
-markup; any other status, a transport error, or `ParseError` (every other 200
-body) is a failure that sleeps `RetryPolicy::delayFor` in 100 ms slices while
-checking `stop`, then retries. Certificate errors are the exception: a CA
-bundle that cannot be loaded, a chain that does not verify and a certificate
-that does not cover the host (httplib's `SSLLoadingCerts`,
+thread. `fetch` loops over attempts: HTTP 200 is `Value` or `NoData` when
+`parseElevation` says so (`NoData` when the mask band is 0); any other status,
+a transport error, or a `ParseError` (a 200 body without `BAND 0:`, or with a
+band that does not parse) is a failure that sleeps `RetryPolicy::delayFor` in
+100 ms slices while checking `stop`, then retries. Certificate errors are the
+exception: a CA bundle that cannot be loaded, a chain that does not verify and
+a certificate that does not cover the host (httplib's `SSLLoadingCerts`,
 `SSLServerVerification` and `SSLServerHostnameVerification`) return `Failed`
 at once with the transport error, because only a configuration change cures
 them, and retrying would also hide the cause: httplib loads the bundle once
@@ -367,7 +387,7 @@ Pixel semantics:
 | Value | Meaning | On resume |
 |---|---|---|
 | finite float | elevation in metres as the server returned it, negatives kept | kept |
-| `-32768` | server answered 200 with no `BAND 0:` and a plain body (not blank, no `ServiceException`, not markup): no elevation here; any other body without a finite in-range value is a parse error, retried | kept, never re-requested |
+| `-32768` | the server's mask band says there is no elevation here: a 200 body whose `BAND 1:` line reads 0, as the recorded answer at sea does (its `BAND 0` reads 0 too); a body without `BAND 0:`, or with a band that does not parse, is a parse error, retried | kept, never re-requested |
 | NaN | never fetched, or failed after all retries | requested |
 
 Row 0 is the north edge and corresponds to `J = 0` in the WMS request; column
@@ -794,7 +814,9 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   1.3.0 requires for EPSG:4326); a layer name with spaces is percent-encoded,
   and so are non-ASCII bytes (`\xC3\xA9` gives `%C3%A9`) and `%` itself
   (`%25`); `featureInfoUrl` throws `std::invalid_argument` when the WMS URL
-  does not parse; parsing of `BAND 0: 123.45`, `BAND 0: -1.5` and
+  does not parse; the two responses recorded from the real server (section
+  4.3), byte for byte with CRLF line endings, are 366.2 on land and NoData
+  at sea; parsing of `BAND 0: 123.45`, `BAND 0: -1.5` and
   `BAND 0: 1086.25`; `BAND 0: 12.5 m`, `BAND 0: 12.5\tm`, `BAND 0: 12.5\r\n`
   and `BAND 0: 12.5` at the end of the body (all 12.5: whitespace or `<` and
   then any text may follow the number, or nothing); `BAND 0: abc`,
@@ -802,14 +824,21 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `BAND 0: inf`, `BAND 0: -inf`, `BAND 0: 1e300`, `BAND 0: -1e300`,
   `BAND 0: 3.5e38` and, with text glued to the number, `BAND 0: 1.#QNAN`,
   `BAND 0: 12,5`, `BAND 0: 12abc` and `BAND 0: 12.5e` (all ParseError), while
-  `BAND 0: 3.4028234663852886e38`, exactly `FLT_MAX`, is a Value; a body
-  without the marker is NoData when it is plain, such as
-  `GetFeatureInfo results:` or `GetFeatureInfo results:\nno bands\n`, but an
-  empty body, a whitespace-only body, an HTML page, an XML
-  `ows:ExceptionReport` after leading spaces and a `ServiceException` body are
-  ParseError, and the band marker wins over all of them when it is present
-  (`<pre>BAND 0: 42.5</pre>` and `<pre>BAND 0: 42.5\n</pre>` are 42.5); a
-  default-constructed `ParseResult` is a ParseError.
+  `BAND 0: 3.4028234663852886e38`, exactly `FLT_MAX`, is a Value; with CRLF
+  lines, `BAND 0: 0` and `BAND 1: 255` is a Value of 0 (a real sea-level
+  height), `BAND 0: 12.5` and `BAND 1: 0` is NoData, with `BAND 1: 1` it is
+  12.5, with a mask of `x`, nothing, `nan` or `0abc` a ParseError, and
+  `BAND 0: 12.5` alone is 12.5; `BAND 1:` counts at the start of the body and
+  after a bare LF, but inside another line (`FileName: BAND 1: 0`,
+  `FileName: BAND 1: x`, or after the height on the marker's line) it is
+  ignored; a body without `BAND 0:` is a ParseError, such as
+  `GetFeatureInfo results:`, `GetFeatureInfo results:\nno bands\n`,
+  `Error: layer not found`, a UTF-8 byte order mark before `<html>`,
+  `BAND 1: 0` alone, an empty body, a whitespace-only body, an HTML page, an
+  XML `ows:ExceptionReport` after leading spaces and a `ServiceException`
+  body, and the band marker wins over markup and `ServiceException` when it
+  is present (`<pre>BAND 0: 42.5</pre>` and `<pre>BAND 0: 42.5\n</pre>` are
+  42.5); a default-constructed `ParseResult` is a ParseError.
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp
@@ -854,10 +883,11 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   unchanged before any callback, and a null fetcher is refused the same way;
   summary counts match.
 - **ElevationClient**: an in-process `httplib::Server` on a loopback port
-  serves canned bodies, with a `RetryPolicy` of tiny delays: a value, a plain
-  NoData body, a 500 followed by a 200 to prove a retry, a 404 that never
-  recovers (three requests), and a 200 `ServiceExceptionReport` that is
-  retried and fails as `unparseable body` after three requests; a refused
+  serves canned bodies, with a `RetryPolicy` of tiny delays: a value, the
+  recorded sea response, NoData because its mask band is 0, a 500 followed by
+  a 200 to prove a retry, a 404 that never recovers (three requests), and a
+  200 `ServiceExceptionReport` and a plain 200 body without a band, each
+  retried and failing as `unparseable body` after three requests; a refused
   connection fails after the retries with a transport error, and a stop
   request cuts the 10 s backoff after a 404 short (one attempt, `stopped
   during backoff after: http 404`). Three fetches through one client arrive
@@ -967,9 +997,11 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `posix_spawn` (stdout and stderr to files; SIGINT, SIGTERM, SIGHUP and
   SIGPIPE at their defaults and unblocked, so that `main`'s own settings are
   what is tested; at most 20 s per child) against an `httplib::Server` on
-  127.0.0.1. The server answers GetFeatureInfo for pixel (I, J) with
-  `BAND 0: <I*10+J>`, a configurable NoData pixel with a plain body and a
-  configurable failing pixel with HTTP 500; it counts requests and can hold
+  127.0.0.1. The server answers in the real server's layout (section 4.3,
+  CRLF line endings): GetFeatureInfo for pixel (I, J) gets
+  `BAND 0: <I*10+J>` with `BAND 1: 255`, a configurable NoData pixel
+  `BAND 0: 0` with `BAND 1: 0`, as the real server answers at sea, and a
+  configurable failing pixel HTTP 500; it counts requests and can hold
   them at a gate until the test releases them, so the signal cases wait for
   the state they need instead of relying on timing. Every wait also watches
   the child, so one that ends early fails the test at once, with its stderr.
@@ -1094,9 +1126,10 @@ used.
 - Preview is off unless `--preview`.
 - 8 threads and 8 retries by default instead of 50 and 500; failures back off.
 - Certificates are verified.
-- A missing band is NoData, not 0 m, but only for a body that is not blank,
-  has no `ServiceException` and does not start with markup; anything else
-  without a finite in-range band value is retried, and a failed pixel stays
+- Where the server has no elevation, as at sea, the pixel is NoData, not 0 m:
+  the server's mask band says so with `BAND 1: 0` while `BAND 0` reads 0,
+  which the previous program stored as a height. A body without `BAND 0:`, or
+  with a band value that does not parse, is retried, and a failed pixel stays
   NaN for the next run. A band value must stand alone: text glued to it, as in
   `12,5`, makes the body a parse error rather than a stored 12.
 - Resume is per pixel, not "the row after the last non-zero sample".
