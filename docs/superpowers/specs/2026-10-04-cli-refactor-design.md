@@ -166,15 +166,26 @@ whenever `kind == Value`.
 **ElevationClient** implements `PixelFetcher` over one `httplib::Client`
 constructed from the WMS origin, with keep-alive on, connection timeout 10 s,
 read timeout 30 s, write timeout 10 s, certificate verification enabled unless
-`insecure`, and `set_ca_cert_path` when `caBundle` is set. One instance per
-worker thread. `fetch` loops over attempts: HTTP 200 with a finite in-range
-band value is `Value`; HTTP 200 without the band marker is `NoData` only when
-the body is not blank, does not contain `ServiceException` and does not start
-with markup; any other status, a transport error, or `ParseError` (every other
-200 body) is a failure that sleeps `RetryPolicy::delayFor` in 100 ms slices
-while checking `stop`, then retries. Exhausting retries returns `Failed`. The
-first `ParseError` body of the run is logged once to stderr, guarded by a
-`std::once_flag` shared by all workers.
+`insecure`, and `set_ca_cert_path` when `caBundle` is set. The constructor
+throws `std::invalid_argument` when the WMS URL does not parse or when the new
+client reports `is_valid()` false (httplib could not set it up, for example
+without a TLS context), because its methods could then dereference a null
+implementation. One instance per worker thread. `fetch` loops over attempts:
+HTTP 200 with a finite in-range band value is `Value`; HTTP 200 without the
+band marker is `NoData` only when the body is not blank, does not contain
+`ServiceException` and does not start with markup; any other status, a
+transport error, or `ParseError` (every other 200 body) is a failure that
+sleeps `RetryPolicy::delayFor` in 100 ms slices while checking `stop`, then
+retries. Exhausting retries returns `Failed`. Building the request target,
+the request and the parse run inside a `try`, so an exception becomes that
+attempt's error (`exception: <what>` or `unknown exception`) and is retried
+like any other failure; only an allocation failure while building the error
+text could still escape, which is why `fetch` is not `noexcept`. The first
+`ParseError` body of the run is logged once to stderr, never stdout, so it
+cannot mix with the progress lines, guarded by a `std::once_flag` shared by
+all workers. A blank body is logged as its byte count (`was N bytes of
+whitespace`), any other body as its first 200 bytes with ASCII control
+characters replaced by `.`.
 
 **DemRaster** holds `width`, `height`, `BoundingBox`, `RasterMetadata{layer,
 wmsUrl}` and `std::vector<float>` in row-major order, row 0 at the north edge.
@@ -518,9 +529,17 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   unchanged before any callback, and a null fetcher is refused the same way;
   summary counts match.
 - **ElevationClient**: an in-process `httplib::Server` on a loopback port
-  serves canned bodies: a value, a NoData body, a 500 followed by a 200 to
-  prove a retry, and a connection close to prove failure after retries, with
-  a `RetryPolicy` of tiny delays. Plain HTTP; TLS is not tested.
+  serves canned bodies, with a `RetryPolicy` of tiny delays: a value, a plain
+  NoData body, a 500 followed by a 200 to prove a retry, a 404 that never
+  recovers, and a 200 `ServiceExceptionReport` that is retried and fails as
+  `unparseable body` after three requests; a refused connection fails after
+  the retries with a transport error, and a stop request cuts a 10 s backoff
+  short. Three fetches through one client arrive from a single remote port,
+  proving keep-alive reuse, and the server receives the decoded `BBOX`,
+  `LAYERS`, `I` and `J` for pixel (2, 0) of the example box on a 4 x 1 grid.
+  Only decoded parameters are compared, never the raw request target, because
+  httplib re-encodes the query (`%2C` goes out as `,`). Plain HTTP; TLS is not
+  tested.
 - **Cli**: the example argv yields the expected Config; omitting `--north`
   fails; `--insecure` and `--ca-bundle` set their fields; `--threads 0`
   fails validation.

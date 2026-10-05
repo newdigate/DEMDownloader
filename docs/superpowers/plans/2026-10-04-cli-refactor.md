@@ -3610,9 +3610,14 @@ Implements spec section 4.3 (ElevationClient) and the in-process server test in 
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <map>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
+#include "ExampleConfig.h"
 #include "demdl/ElevationClient.h"
 
 using namespace std::chrono_literals;
@@ -3632,9 +3637,9 @@ RetryPolicy fastPolicy() {
   return p;
 }
 
+// The example configuration's box and layer on a 4 x 1 grid, requested from wmsUrl.
 Config configFor(const std::string& wmsUrl) {
-  Config c;
-  c.box = {-34.0, -34.3, 18.5, 18.1};
+  Config c = exampleConfig();
   c.width = 4;
   c.height = 1;
   c.output = "unused.tif";
@@ -3642,15 +3647,28 @@ Config configFor(const std::string& wmsUrl) {
   return c;
 }
 
-// Serves canned GetFeatureInfo bodies on loopback. The pixel column I selects the behaviour.
+// Serves canned GetFeatureInfo bodies on loopback. The pixel column I selects the behaviour: 0 a
+// band value, 1 a plain body without a band, 2 a 500 and then a band value, 4 a 200 service
+// exception report, any other column a 404. Every request's remote port and decoded parameters are
+// recorded. httplib re-encodes the query on the wire (%2C goes out as ','), so tests compare the
+// decoded parameters and never the raw request target.
 struct CannedServer {
   httplib::Server server;
   std::thread thread;
   std::atomic<int> hitsForColumn2{0};
+  std::atomic<int> hitsForColumn4{0};
+  std::mutex mutex;
+  std::set<int> remotePorts;                      // guarded by mutex; one port per connection
+  std::map<std::string, std::string> lastParams;  // guarded by mutex; BBOX, LAYERS, I and J
   int port = 0;
 
   CannedServer() {
     server.Get("/wms", [this](const httplib::Request& req, httplib::Response& res) {
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        remotePorts.insert(req.remote_port);
+        for (const char* key : {"BBOX", "LAYERS", "I", "J"}) lastParams[key] = req.get_param_value(key);
+      }
       const std::string column = req.get_param_value("I");
       if (column == "0") {
         res.set_content("GetFeatureInfo results:\nBAND 0: 12.5\n", "text/plain");
@@ -3662,6 +3680,12 @@ struct CannedServer {
         } else {
           res.set_content("BAND 0: 7\n", "text/plain");
         }
+      } else if (column == "4") {
+        ++hitsForColumn4;
+        res.set_content(R"(<?xml version="1.0"?><ServiceExceptionReport>)"
+                        R"(<ServiceException code="LayerNotDefined">no such layer</ServiceException>)"
+                        R"(</ServiceExceptionReport>)",
+                        "application/vnd.ogc.se_xml");
       } else {
         res.status = 404;
       }
@@ -3675,6 +3699,14 @@ struct CannedServer {
     thread.join();
   }
   std::string url() const { return "http://127.0.0.1:" + std::to_string(port) + "/wms"; }
+  std::size_t distinctRemotePorts() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return remotePorts.size();
+  }
+  std::map<std::string, std::string> latestParams() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return lastParams;
+  }
 };
 
 }  // namespace
@@ -3689,7 +3721,7 @@ TEST_CASE("a band value is returned on the first attempt", "[elevationclient]") 
   CHECK(r.attempts == 1);
 }
 
-TEST_CASE("a 200 without a band is NoData", "[elevationclient]") {
+TEST_CASE("a plain 200 without a band is NoData", "[elevationclient]") {
   CannedServer srv;
   ElevationClient client(configFor(srv.url()), fastPolicy());
   std::atomic<bool> stop{false};
@@ -3717,6 +3749,17 @@ TEST_CASE("a status that never recovers fails after the retries", "[elevationcli
   CHECK(r.kind == FetchResult::Kind::Failed);
   CHECK(r.attempts == 3);
   CHECK(r.error == "http 404");
+}
+
+TEST_CASE("a 200 service exception is retried and then fails", "[elevationclient]") {
+  CannedServer srv;
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(4, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 3);
+  CHECK(r.error == "unparseable body");
+  CHECK(srv.hitsForColumn4.load() == 3);
 }
 
 TEST_CASE("a refused connection fails after the retries with a transport error", "[elevationclient]") {
@@ -3747,6 +3790,32 @@ TEST_CASE("a stop request cuts the backoff short", "[elevationclient]") {
   CHECK(r.kind == FetchResult::Kind::Failed);
   CHECK(r.error.rfind("stopped during backoff", 0) == 0);
   CHECK(std::chrono::steady_clock::now() - start < 5s);
+}
+
+TEST_CASE("keep-alive reuses one connection for successive fetches", "[elevationclient]") {
+  CannedServer srv;
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  for (int i = 0; i < 3; ++i) {
+    const FetchResult r = client.fetch(0, 0, stop);
+    CHECK(r.kind == FetchResult::Kind::Value);
+  }
+  // Every new connection arrives from a new ephemeral port.
+  CHECK(srv.distinctRemotePorts() == 1);
+}
+
+TEST_CASE("the server receives the decoded BBOX, LAYERS, I and J", "[elevationclient]") {
+  CannedServer srv;
+  ElevationClient client(configFor(srv.url()), fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(2, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Value);
+  // South, west, north, east of the example box with nine decimals, as the server decodes them.
+  const std::map<std::string, std::string> params = srv.latestParams();
+  CHECK(params.at("BBOX") == "-34.216344700,18.418579100,-34.184541800,18.462524400");
+  CHECK(params.at("LAYERS") == "Elevation_CCT_GLM2019_5m_DEM");
+  CHECK(params.at("I") == "2");
+  CHECK(params.at("J") == "0");
 }
 ```
 
@@ -3805,16 +3874,20 @@ namespace demdl {
 // One instance per worker thread; instances are not thread-safe.
 class ElevationClient : public PixelFetcher {
  public:
-  // Throws std::invalid_argument when cfg.wmsUrl does not parse.
+  // Throws std::invalid_argument when cfg.wmsUrl does not parse, or when httplib cannot set up a
+  // client for its origin (is_valid() is false, for example without a TLS context).
   ElevationClient(const Config& cfg, RetryPolicy policy);
   ~ElevationClient() override;
 
-  FetchResult fetch(int x, int y, const std::atomic<bool>& stop) override;
+  // An exception during an attempt becomes that attempt's error ("exception: ..." or "unknown
+  // exception") and is retried like any other failure. Not noexcept: building error text allocates.
+  [[nodiscard]] FetchResult fetch(int x, int y, const std::atomic<bool>& stop) override;
 
  private:
   // Sleeps in 100 ms slices; returns false as soon as stop is set.
   static bool sleepUnlessStopped(std::chrono::milliseconds delay, const std::atomic<bool>& stop);
-  // Writes the first unparseable body of the process to stderr, once, across all instances.
+  // Writes the first unparseable body of the process to stderr, once across all instances: a blank
+  // body as its byte count, any other as its first 200 bytes with control characters shown as '.'.
   static void logUnparseableBodyOnce(const std::string& body);
 
   Config cfg_;
@@ -3835,6 +3908,7 @@ class ElevationClient : public PixelFetcher {
 #include <httplib.h>
 
 #include <algorithm>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -3849,6 +3923,9 @@ ElevationClient::ElevationClient(const Config& cfg, RetryPolicy policy)
   const auto endpoint = parseWmsUrl(cfg_.wmsUrl);
   if (!endpoint) throw std::invalid_argument("invalid WMS URL: " + cfg_.wmsUrl);
   client_ = std::make_unique<httplib::Client>(endpoint->origin);
+  // httplib reports a client it could not set up through is_valid(); the calls below could then
+  // dereference a null implementation.
+  if (!client_->is_valid()) throw std::invalid_argument("invalid WMS origin: " + endpoint->origin);
   client_->set_keep_alive(true);
   client_->set_connection_timeout(10, 0);
   client_->set_read_timeout(30, 0);
@@ -3860,29 +3937,36 @@ ElevationClient::ElevationClient(const Config& cfg, RetryPolicy policy)
 ElevationClient::~ElevationClient() = default;
 
 FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) {
-  const std::string target = featureInfoUrl(cfg_, x, y);
   FetchResult result;
   for (int attempt = 0;; ++attempt) {
     result.attempts = attempt + 1;
     std::string error;
-    const httplib::Result response = client_->Get(target);
-    if (!response) {
-      error = "transport: " + httplib::to_string(response.error());
-    } else if (response->status != 200) {
-      error = "http " + std::to_string(response->status);
-    } else {
-      const ParseResult parsed = parseElevation(response->body);
-      if (parsed.kind == ParseResult::Kind::Value) {
-        result.kind = FetchResult::Kind::Value;
-        result.value = static_cast<float>(parsed.value);
-        return result;
+    // fetch must not throw (see PixelFetcher), so building the target, the request and the parse
+    // run inside the try, and an exception is this attempt's error.
+    try {
+      const httplib::Result response = client_->Get(featureInfoUrl(cfg_, x, y));
+      if (!response) {
+        error = "transport: " + httplib::to_string(response.error());
+      } else if (response->status != 200) {
+        error = "http " + std::to_string(response->status);
+      } else {
+        const ParseResult parsed = parseElevation(response->body);
+        if (parsed.kind == ParseResult::Kind::Value) {
+          result.kind = FetchResult::Kind::Value;
+          result.value = static_cast<float>(parsed.value);
+          return result;
+        }
+        if (parsed.kind == ParseResult::Kind::NoData) {
+          result.kind = FetchResult::Kind::NoData;
+          return result;
+        }
+        error = "unparseable body";
+        logUnparseableBodyOnce(response->body);
       }
-      if (parsed.kind == ParseResult::Kind::NoData) {
-        result.kind = FetchResult::Kind::NoData;
-        return result;
-      }
-      error = "unparseable body";
-      logUnparseableBodyOnce(response->body);
+    } catch (const std::exception& e) {
+      error = std::string("exception: ") + e.what();
+    } catch (...) {
+      error = "unknown exception";
     }
     if (attempt >= policy_.maxRetries || stop.load()) {
       result.kind = FetchResult::Kind::Failed;
@@ -3912,7 +3996,22 @@ bool ElevationClient::sleepUnlessStopped(std::chrono::milliseconds delay, const 
 void ElevationClient::logUnparseableBodyOnce(const std::string& body) {
   static std::once_flag flag;
   std::call_once(flag, [&body] {
-    std::cerr << "warning: first unparseable response body (truncated): " << body.substr(0, 200) << "\n";
+    std::string line = "warning: first unparseable response body ";
+    if (body.find_first_not_of(" \t\n\v\f\r") == std::string::npos) {
+      // Printing blank text would show nothing, so give the size instead.
+      line += "was " + std::to_string(body.size()) + " bytes of whitespace";
+    } else {
+      // ASCII control characters (below 0x20, and DEL) become '.', so the warning stays on one line
+      // and cannot drive the terminal; bytes from 0x80 up pass through to keep UTF-8 readable.
+      std::string shown = body.substr(0, 200);
+      for (char& c : shown) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte < 0x20 || byte == 0x7F) c = '.';
+      }
+      line += "(" + std::to_string(body.size()) + " bytes, up to 200 shown): " + shown;
+    }
+    // stderr, so the warning never mixes with the progress lines on stdout.
+    std::cerr << line + "\n";
   });
 }
 
@@ -3924,7 +4023,7 @@ Notes for the engineer: `httplib::Client` built from an `https://` origin is the
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[elevationclient]"`
-Expected: `All tests passed (N assertions in 6 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
+Expected: `All tests passed (N assertions in 9 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
 
 - [ ] **Step 7: Commit**
 
