@@ -495,14 +495,32 @@ summary still says `stopped:`.
 resizable window titled `dl_elevation 34.0%`. It owns a per-pixel state byte
 array and a float value array under one mutex, updated by events. The main
 thread polls GLFW events, and every 500 ms rebuilds an RGB8 texture from those
-arrays and draws it on a fullscreen quad. Colours: to-do (NaN) dark grey
-(40, 40, 40); NoData blue (0, 0, 255); Queued red; InFlight green; Failed
-magenta (255, 0, 255); values use the existing `rainbow()` mapping over the
-minimum and maximum values seen so far, so the palette stays consistent as
-new maxima arrive instead of being pinned to 700 m. The fragment shader
-samples the texture unchanged, which removes the broken `maxValue` uniform.
-Closing the window requests a stop with reason `WindowClosed`. The window
-closes when the run finishes.
+arrays and draws it on a fullscreen quad. The colours live in the header-only
+`src/preview/Palette.h`, which includes no OpenGL or GLFW header, so the tests
+build it in every configuration: an `Rgb` struct with `==`; the status colours
+as named constants, to-do (NaN) dark grey (40, 40, 40), NoData blue
+(0, 0, 255), Queued red (255, 0, 0), InFlight green (0, 255, 0) and Failed
+magenta (255, 0, 255); and `valueColour(t)`, which maps t from 0 to 1 onto
+light blue (0, 128, 255), cyan, green, yellow and red (255, 0, 0), so that no
+value is drawn in the NoData blue, the Failed magenta or the to-do grey. NaN
+counts as 0, and t is clamped to [0, 1] first. Values are scaled over the
+minimum and maximum seen so far, so the palette stays consistent as new maxima
+arrive instead of being pinned to 700 m. The fragment shader samples the
+texture unchanged, which removes the broken `maxValue` uniform.
+
+The raster is uploaded as one texture, so once the window's context is
+current the constructor reads `GL_MAX_TEXTURE_SIZE` and refuses a raster
+wider or taller than that with `the raster is W x H, larger than this GPU's
+maximum texture size N; run without --preview`. `main` reports it like any
+other failure to open the window: `error: ...` and exit 1, before any
+request. The destructor does not run for a constructor that throws, so any
+failure after `glfwInit` succeeded (creating the window, GLEW on Linux, the
+texture-size check) destroys the window, if there is one, and calls
+`glfwTerminate` before the exception leaves the constructor. The first `pump`
+that finds the window closed requests a stop with reason `WindowClosed`,
+once, and hides the window at once, so the close takes effect visibly while
+in-flight requests drain; a hidden window is not drawn again. Otherwise the
+window closes when the run finishes and `main` destroys the sink.
 
 ## 9. Threads, signals and `main`
 
@@ -825,8 +843,24 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   the first has been announced, then kills the process by SIGINT.
   `--threads 0` exits 1 with `error: threads must be at least 1`, no request
   and no file.
+- **Palette** (`[palette]`), compiled into `demdl_tests` in every
+  configuration because `Palette.h` needs no OpenGL: the five status colours
+  have the values of section 8; `valueColour(0)` is (0, 128, 255) and
+  `valueColour(1)` is (255, 0, 0); -1 and negative infinity give the colour of
+  0, 2 and infinity that of 1, and NaN that of 0; and 10001 evenly spaced
+  samples of [0, 1] never give the NoData blue, the Failed magenta or the
+  to-do grey.
 
-`PreviewWindow` and the real server are not tested.
+`PreviewWindow` itself and the real server have no automated test. The
+window is checked by hand, in a desktop session, against a loopback WMS: a
+few lines of Python's `http.server` on 127.0.0.1 answering pixel (I, J) with
+`BAND 0: <I+J>` after a set delay. A 64 x 48 run with `--preview` and
+`--threads 4` against a 5 ms WMS shows the window for a few seconds, exits 0
+with the file complete and prints the finish lines on stdout. With 300 ms per
+request, Ctrl-C part-way prints the `stopping:` line on stderr and the finish
+lines, `stopped: interrupted` among them, on stdout, and exits 2, and a rerun
+completes the file; closing the window part-way hides it at once and exits 2.
+A 65536 x 1 raster exits 1 with the texture-size message before any request.
 
 ## 12. Build changes
 
@@ -834,7 +868,11 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   0.2.0 LANGUAGES CXX)`, C++20, `CMAKE_EXPORT_COMPILE_COMMANDS ON`,
   `CMAKE_FIND_FRAMEWORK LAST` retained.
 - Options `DL_ELEVATION_PREVIEW` (default `APPLE`) and `DL_ELEVATION_TESTS`
-  (default ON).
+  (default ON). With the preview ON, `dl_elevation` links `demdl_preview` and
+  is compiled with `DL_ELEVATION_HAVE_PREVIEW`; with it OFF, `--preview` is
+  refused with `error: this build has no preview support; configure with
+  -DDL_ELEVATION_PREVIEW=ON` and exit 1. The `[palette]` tests build either
+  way.
 - FetchContent pins: cpp-httplib `v0.46.1` (matches the Homebrew package in
   use; `FIND_PACKAGE_ARGS 0.46.1 NAMES httplib` so a system copy is preferred
   only when it is 0.46.x, otherwise the pinned copy is downloaded),

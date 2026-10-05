@@ -85,6 +85,25 @@ add_executable(dl_elevation src/app/main.cpp)
 target_link_libraries(dl_elevation PRIVATE demdl demdl_cli)
 target_compile_options(dl_elevation PRIVATE -Wall -Wextra)
 
+if(DL_ELEVATION_PREVIEW)
+  find_package(PkgConfig REQUIRED)
+  pkg_search_module(glfw REQUIRED IMPORTED_TARGET glfw3)
+  add_library(demdl_preview STATIC src/preview/PreviewWindow.cpp)
+  target_link_libraries(demdl_preview PUBLIC demdl PkgConfig::glfw)
+  target_compile_definitions(demdl_preview PRIVATE GL_SILENCE_DEPRECATION)
+  target_compile_options(demdl_preview PRIVATE -Wall -Wextra)
+  if(APPLE)
+    target_link_libraries(demdl_preview PUBLIC
+      "-framework OpenGL" "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
+  else()
+    find_package(OpenGL REQUIRED)
+    pkg_search_module(glew REQUIRED IMPORTED_TARGET glew)
+    target_link_libraries(demdl_preview PUBLIC OpenGL::GL PkgConfig::glew)
+  endif()
+  target_link_libraries(dl_elevation PRIVATE demdl_preview)
+  target_compile_definitions(dl_elevation PRIVATE DL_ELEVATION_HAVE_PREVIEW)
+endif()
+
 if(DL_ELEVATION_TESTS)
   enable_testing()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
@@ -101,7 +120,8 @@ if(DL_ELEVATION_TESTS)
     tests/test_ConsoleReporter.cpp
     tests/test_Cli.cpp
     tests/test_ExitCodes.cpp
-    tests/test_EndToEnd.cpp)
+    tests/test_EndToEnd.cpp
+    tests/test_Palette.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl demdl_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
   # The end-to-end tests run the executable itself, so it is built first and its path is compiled in.

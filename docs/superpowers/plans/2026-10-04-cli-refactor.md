@@ -55,6 +55,7 @@
 | `src/app/main.cpp` | wiring, signals, dry run, exit codes | 12 |
 | `src/app/ExitCodes.h` | exit codes and the run-summary mapping | 12 |
 | `src/preview/Shader.h` | trimmed GL shader helper | 13 |
+| `src/preview/Palette.h` | status colours and the value palette, no OpenGL | 13 |
 | `src/preview/PreviewWindow.h/.cpp` | GLFW sink | 13 |
 | `tests/ExampleConfig.h` | the Simon's Town Config used by several tests | 2 |
 | `tests/TempDir.h` | RAII temporary directory | 6 |
@@ -6668,15 +6669,76 @@ git commit -m "feat: dl_elevation executable with dry run, signal handling and e
 
 ### Task 13: Preview window
 
-Implements the `PreviewWindow` sink from spec section 8 and the `DL_ELEVATION_PREVIEW` option from section 12. Deviation 7 applies. There is no automated test; the compile and the `--preview --dry-run` probe are the checks, and a live run is optional and gated on the owner.
+Implements the `PreviewWindow` sink from spec section 8, the `[palette]` tests from section 11 and the `DL_ELEVATION_PREVIEW` option from section 12. Deviation 7 applies. The colours live in the header-only `src/preview/Palette.h`, which includes no OpenGL, so `[palette]` is compiled into `demdl_tests` in every configuration and is the preview's one automated test. The window refuses a raster larger than the GPU's maximum texture size, cleans up GLFW itself when its constructor throws, and hides as soon as it is closed while the run drains. It is checked by the compile, the `--preview --dry-run` probe and a run against a loopback WMS; a live run is optional and gated on the owner.
 
 **Files:**
+- Create: `tests/test_Palette.cpp`
+- Create: `src/preview/Palette.h`
 - Create: `src/preview/Shader.h`
 - Create: `src/preview/PreviewWindow.h`
 - Create: `src/preview/PreviewWindow.cpp`
-- Modify: `CMakeLists.txt` (preview target and define)
+- Modify: `CMakeLists.txt` (preview target and define; the palette test)
 
-- [ ] **Step 1: Add the preview target to CMake**
+- [ ] **Step 1: Write the failing test `tests/test_Palette.cpp`**
+
+```cpp
+#include <catch2/catch_test_macros.hpp>
+
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "preview/Palette.h"
+
+using demdl::Rgb;
+using demdl::valueColour;
+
+namespace Catch {
+
+// Shows a colour as (r, g, b) when a check fails.
+template <>
+struct StringMaker<Rgb> {
+  static std::string convert(const Rgb& c) {
+    return "(" + std::to_string(c.r) + ", " + std::to_string(c.g) + ", " + std::to_string(c.b) + ")";
+  }
+};
+
+}  // namespace Catch
+
+TEST_CASE("the status colours are the spec's", "[palette]") {
+  CHECK(demdl::kTodoColour == Rgb{40, 40, 40});
+  CHECK(demdl::kNoDataColour == Rgb{0, 0, 255});
+  CHECK(demdl::kQueuedColour == Rgb{255, 0, 0});
+  CHECK(demdl::kInFlightColour == Rgb{0, 255, 0});
+  CHECK(demdl::kFailedColour == Rgb{255, 0, 255});
+}
+
+TEST_CASE("values run from light blue at the minimum to red at the maximum", "[palette]") {
+  CHECK(valueColour(0.0f) == Rgb{0, 128, 255});
+  CHECK(valueColour(1.0f) == Rgb{255, 0, 0});
+}
+
+TEST_CASE("a value outside 0 to 1 is clamped and NaN counts as the minimum", "[palette]") {
+  CHECK(valueColour(-1.0f) == valueColour(0.0f));
+  CHECK(valueColour(2.0f) == valueColour(1.0f));
+  CHECK(valueColour(-std::numeric_limits<float>::infinity()) == valueColour(0.0f));
+  CHECK(valueColour(std::numeric_limits<float>::infinity()) == valueColour(1.0f));
+  CHECK(valueColour(std::numeric_limits<float>::quiet_NaN()) == valueColour(0.0f));
+}
+
+TEST_CASE("no value is drawn in the NoData, Failed or to-do colour", "[palette]") {
+  // 10001 evenly spaced samples of [0, 1], both ends included.
+  std::vector<float> clashes;
+  for (int i = 0; i <= 10000; ++i) {
+    const float t = static_cast<float>(i) / 10000.0f;
+    const Rgb c = valueColour(t);
+    if (c == demdl::kNoDataColour || c == demdl::kFailedColour || c == demdl::kTodoColour) clashes.push_back(t);
+  }
+  CHECK(clashes == std::vector<float>{});
+}
+```
+
+- [ ] **Step 2: Add the preview target and the test to CMake**
 
 Insert after the `dl_elevation` block and before `if(DL_ELEVATION_TESTS)`:
 
@@ -6701,12 +6763,74 @@ if(DL_ELEVATION_PREVIEW)
 endif()
 ```
 
-- [ ] **Step 2: Build to verify it fails**
+Then add the test at the end of the test target's sources. It needs no OpenGL, so it stays outside the `DL_ELEVATION_PREVIEW` block and builds in every configuration:
+
+```cmake
+  add_executable(demdl_tests
+    tests/test_BoundingBox.cpp
+    tests/test_Config.cpp
+    tests/test_WmsQuery.cpp
+    tests/test_RetryPolicy.cpp
+    tests/test_DemRaster.cpp
+    tests/test_StopToken.cpp
+    tests/test_Downloader.cpp
+    tests/test_ElevationClient.cpp
+    tests/test_ConsoleReporter.cpp
+    tests/test_Cli.cpp
+    tests/test_ExitCodes.cpp
+    tests/test_EndToEnd.cpp
+    tests/test_Palette.cpp)
+```
+
+- [ ] **Step 3: Build to verify it fails**
 
 Run: `cmake --build build`
-Expected: FAIL with `Cannot find source file: src/preview/PreviewWindow.cpp`.
+Expected: FAIL with `Cannot find source file: src/preview/PreviewWindow.cpp`. Compiled on its own, `tests/test_Palette.cpp` fails with `'preview/Palette.h' file not found`.
 
-- [ ] **Step 3: Write `src/preview/Shader.h`**
+- [ ] **Step 4: Write `src/preview/Palette.h`**
+
+```cpp
+#pragma once
+
+// The preview's colours. No OpenGL or GLFW here, so the tests build it in every configuration.
+
+#include <algorithm>
+#include <cmath>
+
+namespace demdl {
+
+struct Rgb {
+  unsigned char r, g, b;
+  bool operator==(const Rgb&) const = default;
+};
+
+// The status colours of spec section 8, one per pixel state that is not a value.
+inline constexpr Rgb kTodoColour{40, 40, 40};      // NaN: not fetched yet, or failed in an earlier run
+inline constexpr Rgb kNoDataColour{0, 0, 255};     // the server has no elevation there
+inline constexpr Rgb kQueuedColour{255, 0, 0};
+inline constexpr Rgb kInFlightColour{0, 255, 0};
+inline constexpr Rgb kFailedColour{255, 0, 255};
+
+// Maps t in [0, 1] (low to high) onto light blue (0, 128, 255), cyan, green, yellow and red (255, 0, 0).
+// Stops short of pure blue (NoData) and never reaches magenta (Failed) or the to-do grey. NaN counts as 0
+// and t is clamped to [0, 1] first, so every input has a colour.
+[[nodiscard]] inline Rgb valueColour(float t) noexcept {
+  const double clamped = std::isnan(t) ? 0.0 : std::clamp(static_cast<double>(t), 0.0, 1.0);
+  const double a = (1.0 - clamped) * 3.5;
+  const int x = static_cast<int>(std::floor(a));
+  const auto y = static_cast<unsigned char>(std::floor(255.0 * (a - x)));
+  switch (x) {
+    case 0: return {255, y, 0};
+    case 1: return {static_cast<unsigned char>(255 - y), 255, 0};
+    case 2: return {0, 255, y};
+    default: return {0, static_cast<unsigned char>(255 - y), 255};
+  }
+}
+
+}  // namespace demdl
+```
+
+- [ ] **Step 5: Write `src/preview/Shader.h`**
 
 ```cpp
 #pragma once
@@ -6770,7 +6894,7 @@ class Shader {
 }  // namespace demdl
 ```
 
-- [ ] **Step 4: Write `src/preview/PreviewWindow.h`**
+- [ ] **Step 6: Write `src/preview/PreviewWindow.h`**
 
 ```cpp
 #pragma once
@@ -6796,13 +6920,17 @@ class Shader;
 // thread; the sink methods may be called from any thread.
 class PreviewWindow : public ProgressSink {
  public:
-  // Throws std::runtime_error when GLFW cannot initialise or open a window.
+  // Throws std::runtime_error when GLFW cannot initialise or open a window, or when the raster is
+  // wider or taller than the GPU's maximum texture size. Before it throws, it destroys the window,
+  // if it opened one, and terminates GLFW.
   PreviewWindow(const DemRaster& raster, StopToken& stop);
   ~PreviewWindow() override;
   PreviewWindow(const PreviewWindow&) = delete;
   PreviewWindow& operator=(const PreviewWindow&) = delete;
 
-  // Polls events, redraws every 500 ms, requests StopReason::WindowClosed when the window closes.
+  // Polls events and redraws every 500 ms. The first pump that finds the window closed requests
+  // StopReason::WindowClosed and hides the window at once, so the close shows while in-flight
+  // requests drain; a hidden window is not drawn again.
   void pump();
 
   void onRunStarted(const RunPlan& plan) override;
@@ -6838,12 +6966,13 @@ class PreviewWindow : public ProgressSink {
   std::unique_ptr<Shader> shader_;
   std::vector<unsigned char> rgb_;
   std::chrono::steady_clock::time_point lastRedraw_;
+  bool closed_ = false;  // the window was closed: the stop is requested and the window hidden
 };
 
 }  // namespace demdl
 ```
 
-- [ ] **Step 5: Write `src/preview/PreviewWindow.cpp`**
+- [ ] **Step 7: Write `src/preview/PreviewWindow.cpp`**
 
 ```cpp
 #include "preview/PreviewWindow.h"
@@ -6862,7 +6991,9 @@ class PreviewWindow : public ProgressSink {
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
+#include "preview/Palette.h"
 #include "preview/Shader.h"
 
 namespace demdl {
@@ -6889,20 +7020,6 @@ void main() {
   FragColor = texture(texture1, TexCoord);
 }
 )glsl";
-
-// Maps t in [0, 1] (low to high) onto light blue, cyan, green, yellow, red. Stops short of pure
-// blue (NoData) and never reaches magenta (Failed).
-void valueColour(float t, unsigned char& r, unsigned char& g, unsigned char& b) {
-  const double a = (1.0 - std::clamp(static_cast<double>(t), 0.0, 1.0)) * 3.5;
-  const int x = static_cast<int>(std::floor(a));
-  const auto y = static_cast<unsigned char>(std::floor(255.0 * (a - x)));
-  switch (x) {
-    case 0: r = 255; g = y; b = 0; break;
-    case 1: r = static_cast<unsigned char>(255 - y); g = 255; b = 0; break;
-    case 2: r = 0; g = 255; b = y; break;
-    default: r = 0; g = static_cast<unsigned char>(255 - y); b = 255; break;
-  }
-}
 
 void onFramebufferResized(GLFWwindow*, int width, int height) { glViewport(0, 0, width, height); }
 
@@ -6934,7 +7051,17 @@ PreviewWindow::PreviewWindow(const DemRaster& raster, StopToken& stop)
   }
   const std::uint64_t done = raster.pixelCount() - raster.countNaN();
   percent_ = 100.0 * static_cast<double>(done) / static_cast<double>(raster.pixelCount());
-  initGl();
+  if (!glfwInit()) throw std::runtime_error("GLFW initialisation failed");
+  try {
+    initGl();
+  } catch (...) {
+    // The destructor does not run for a constructor that throws, so undo the setup here: the shader
+    // while its context is still current, then the window, then GLFW.
+    shader_.reset();
+    if (window_ != nullptr) glfwDestroyWindow(window_);
+    glfwTerminate();
+    throw;
+  }
   lastRedraw_ = std::chrono::steady_clock::now() - std::chrono::seconds(1);  // draw on the first pump
 }
 
@@ -6951,8 +7078,9 @@ PreviewWindow::~PreviewWindow() {
   glfwTerminate();
 }
 
+// Opens the window and creates the GL objects. GLFW is initialised; if this throws, the constructor
+// cleans up.
 void PreviewWindow::initGl() {
-  if (!glfwInit()) throw std::runtime_error("GLFW initialisation failed");
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -6960,16 +7088,22 @@ void PreviewWindow::initGl() {
   glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
   window_ = glfwCreateWindow(640, 480, "dl_elevation", nullptr, nullptr);
-  if (window_ == nullptr) {
-    glfwTerminate();
-    throw std::runtime_error("GLFW could not create a window; is a display available?");
-  }
+  if (window_ == nullptr) throw std::runtime_error("GLFW could not create a window; is a display available?");
   glfwMakeContextCurrent(window_);
   glfwSetFramebufferSizeCallback(window_, onFramebufferResized);
 #ifndef __APPLE__
   glewExperimental = GL_TRUE;
   if (glewInit() != GLEW_OK) throw std::runtime_error("GLEW initialisation failed");
 #endif
+
+  // The whole raster is uploaded as one texture.
+  int maxTextureSize = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+  if (width_ > maxTextureSize || height_ > maxTextureSize) {
+    throw std::runtime_error("the raster is " + std::to_string(width_) + " x " + std::to_string(height_) +
+                             ", larger than this GPU's maximum texture size " + std::to_string(maxTextureSize) +
+                             "; run without --preview");
+  }
 
   shader_ = std::make_unique<Shader>(kVertexShader, kFragmentShader);
 
@@ -7006,7 +7140,15 @@ void PreviewWindow::initGl() {
 
 void PreviewWindow::pump() {
   glfwPollEvents();
-  if (glfwWindowShouldClose(window_)) stop_.request(StopReason::WindowClosed);
+  if (closed_) return;
+  if (glfwWindowShouldClose(window_)) {
+    // The run still drains its in-flight requests and saves, so hide the window now rather than when
+    // it ends. The flag makes this happen once.
+    closed_ = true;
+    stop_.request(StopReason::WindowClosed);
+    glfwHideWindow(window_);
+    return;
+  }
   const auto now = std::chrono::steady_clock::now();
   if (now - lastRedraw_ >= std::chrono::milliseconds(500)) {
     redraw();
@@ -7021,20 +7163,18 @@ void PreviewWindow::redraw() {
     const float lo = minValue_;
     const float span = maxValue_ > lo ? maxValue_ - lo : 1.0f;
     for (std::size_t i = 0; i < cells_.size(); ++i) {
-      unsigned char r = 0;
-      unsigned char g = 0;
-      unsigned char b = 0;
+      Rgb c = kTodoColour;
       switch (cells_[i]) {
-        case kTodo: r = g = b = 40; break;
-        case kNoData: b = 255; break;
-        case kQueued: r = 255; break;
-        case kInFlight: g = 255; break;
-        case kFailed: r = 255; b = 255; break;
-        case kValue: valueColour((values_[i] - lo) / span, r, g, b); break;
+        case kTodo: break;
+        case kNoData: c = kNoDataColour; break;
+        case kQueued: c = kQueuedColour; break;
+        case kInFlight: c = kInFlightColour; break;
+        case kFailed: c = kFailedColour; break;
+        case kValue: c = valueColour((values_[i] - lo) / span); break;
       }
-      rgb_[3 * i] = r;
-      rgb_[3 * i + 1] = g;
-      rgb_[3 * i + 2] = b;
+      rgb_[3 * i] = c.r;
+      rgb_[3 * i + 1] = c.g;
+      rgb_[3 * i + 2] = c.b;
     }
     std::snprintf(title, sizeof title, "dl_elevation %.1f%%", percent_);
   }
@@ -7081,20 +7221,66 @@ void PreviewWindow::onRunFinished(const RunSummary&) {}
 }  // namespace demdl
 ```
 
-- [ ] **Step 6: Build and probe**
+- [ ] **Step 8: Build, test and probe**
 
-Run: `cmake --build build`
-Expected: builds `demdl_preview` and relinks `dl_elevation` with no errors.
+Run: `cmake --build build && ./build/demdl_tests "[palette]"`
+Expected: builds `demdl_preview`, relinks `dl_elevation` and rebuilds `demdl_tests` with no warnings, then `All tests passed (N assertions in 4 test cases)`.
+
+Run: `ctest --test-dir build --output-on-failure`
+Expected: `100% tests passed out of 152`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --preview --dry-run; echo "exit $?"`
 Expected: the dry-run plan and `exit 0`. The "no preview support" error from Task 12 is gone, which proves the define reached `main.cpp`. No window opens because a dry run returns before the sink is created.
 
-Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed`.
+Run: `ls x.tif`
+Expected: `No such file or directory`. A dry run writes nothing.
 
-- [ ] **Step 7: Optional live check, only with the owner's explicit go-ahead**
+- [ ] **Step 9: Run the window against a loopback WMS**
 
-This makes 128 real requests to the Cape Town server. Do not run it on your own initiative.
+This needs a desktop session but no network: every request goes to 127.0.0.1. Write a WMS that answers pixel (I, J) with `BAND 0: <I+J>` after the delay given as its argument, and start it with 5 ms:
+
+```bash
+cat > "${TMPDIR:-/tmp}/demdl-wms.py" <<'EOF'
+import sys, time, urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DELAY = float(sys.argv[1])
+
+class Wms(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive: each worker reuses one connection
+
+    def do_GET(self):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        time.sleep(DELAY)
+        body = f"GetFeatureInfo results:\nBAND 0: {int(query['I'][0]) + int(query['J'][0])}\n".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", 8765), Wms).serve_forever()
+EOF
+python3 "${TMPDIR:-/tmp}/demdl-wms.py" 0.005 &
+```
+
+Run: `./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 64 --height 48 --threads 4 --output "${TMPDIR:-/tmp}/demdl-loopback.tif" --wms-url http://127.0.0.1:8765/wms --preview; echo "exit $?"`
+Expected: the window opens, fills top to bottom for about six seconds and closes; stdout prints `done: 3072 values, 0 nodata, 0 failed, 48 rows saved, <time> elapsed`, stderr nothing, then `exit 0`.
+
+Restart the WMS with 300 ms per request (`kill %1; python3 "${TMPDIR:-/tmp}/demdl-wms.py" 0.3 &`), run the same command with `--output "${TMPDIR:-/tmp}/demdl-loopback-stop.tif"` and press Ctrl-C after a few seconds.
+Expected: `stopping: interrupted; waiting for N in-flight requests` on stderr; `done: ...`, `stopped: interrupted` and `rerun with the same arguments to resume the remaining N pixels` on stdout; `exit 2`. With the 5 ms WMS back, the same command completes the file and exits 0. Closing the window by hand during a run against the 300 ms WMS hides it at once and ends with `stopped: preview window closed` and `exit 2`.
+
+Run: the first command with `--width 65536 --height 1 --output "${TMPDIR:-/tmp}/demdl-wide.tif"`
+Expected: `error: the raster is 65536 x 1, larger than this GPU's maximum texture size 16384; run without --preview` (the last number is the GPU's) and `exit 1`, with no request.
+
+Stop the WMS with `kill %1`.
+
+- [ ] **Step 10: Optional live check, only with the owner's explicit go-ahead**
+
+This makes 128 real requests to the Cape Town server. Do not run it on your own initiative. Step 9 has already run the window, an interrupted run and its resume against a loopback WMS; this step adds only the real server's responses.
 
 ```bash
 ./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 16 --height 8 --output "${TMPDIR:-/tmp}/demdl-preview.tif" --preview --threads 2
@@ -7102,10 +7288,10 @@ This makes 128 real requests to the Cape Town server. Do not run it on your own 
 
 Expected: a 640x480 window titled `dl_elevation 0.0%`; pixels start dark grey, turn red when queued, green in flight, then a red-to-light-blue value colour or blue for NoData, rows filling top to bottom; the title percentage rises after each row; the process exits 0 when the last row is saved and the window closes. Closing the window mid-run prints `stopping: preview window closed; waiting for N in-flight requests`, saves, exits 2, and running the same command again resumes from the remaining NaN pixels.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add CMakeLists.txt src/preview/Shader.h src/preview/PreviewWindow.h src/preview/PreviewWindow.cpp
+git add CMakeLists.txt src/preview/Palette.h src/preview/Shader.h src/preview/PreviewWindow.h src/preview/PreviewWindow.cpp tests/test_Palette.cpp
 git commit -m "feat: optional GLFW preview window behind DL_ELEVATION_PREVIEW" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -7265,7 +7451,7 @@ Expected: the scratch build directories are gone; `build/` stays.
 
 - [ ] **Step 6: Report**
 
-Summarise for the owner: commit list since `refactor/cli` branched, test case count from `ctest`, the three configurations verified, and that no live request was made unless Task 13 Step 7 was explicitly approved and run.
+Summarise for the owner: commit list since `refactor/cli` branched, test case count from `ctest`, the three configurations verified, and that no live request was made unless Task 13 Step 10 was explicitly approved and run.
 
 
 ---
