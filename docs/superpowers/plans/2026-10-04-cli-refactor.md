@@ -1878,6 +1878,9 @@ TEST_CASE("oversized dimensions are rejected before allocation", "[demraster]") 
   CHECK_THROWS_WITH(DemRaster::load(claim("big.tif", 65536u, 65536u)),
                     ContainsSubstring("is too large: 65536 x 65536 pixels; width x height must be at most "
                                       "536870912 pixels"));
+  // Exactly that many is allowed: load gets past the size check and stops at the missing tiepoint.
+  CHECK_THROWS_WITH(DemRaster::load(claim("edge.tif", 32768u, 16384u)),
+                    ContainsSubstring("has no usable GeoTIFF tiepoint"));
 }
 
 TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {
@@ -7623,7 +7626,7 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 
 ## Repository hygiene
 
-`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Each is RGB16 with the same value in every channel and no georeferencing, and reads as metres = `value * S / 65535` with negative heights written as 0: S is 1100 for `capetown.tif` and its two byte-identical copies (grid and box in `e2bea3e:main.cpp`) and 700 for `simonstown.tif` (`fc7dcef:main.cpp`). Never stage with `git add -A`.
+`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Each is RGB16 with the same value in every channel and no georeferencing, and reads as metres = `value * S / 65535`: S is 1100 for `capetown.tif` and its two byte-identical copies (grid and box in `e2bea3e:main.cpp`) and 700 for `simonstown.tif` (`fc7dcef:main.cpp`). In those versions of `main.cpp` the variable `north` holds the southern edge's latitude and `south` the northern edge's. A 0 in these files is not only a negative height: it is also what the old program wrote for a response without `BAND 0:`, for a pixel whose 500 attempts all failed, and for a pixel it never fetched. `new.tif` (1980 x 1645) has no recorded scale or box. Never stage with `git add -A`.
 ````
 
 - [ ] **Step 4: Commit**

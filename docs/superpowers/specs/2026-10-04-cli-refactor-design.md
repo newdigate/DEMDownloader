@@ -787,7 +787,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   as an invalid bounding box, and one without the dl_elevation description
   as not written by dl_elevation; a file claiming a width above `INT_MAX`,
   and one claiming 65536 x 65536 pixels, more than `validate` allows, are
-  rejected before anything is allocated; a missing file's error carries
+  rejected before anything is allocated, while one claiming exactly 32768 x
+  16384 gets past the size check; a missing file's error carries
   libtiff's reason, and a `save` into a missing directory names the reason
   exactly once; after `save` no `.tmp` file remains; a `save` whose
   directory write fails (a file-size limit one byte short of a complete file)

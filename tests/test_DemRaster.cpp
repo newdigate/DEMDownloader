@@ -362,6 +362,9 @@ TEST_CASE("oversized dimensions are rejected before allocation", "[demraster]") 
   CHECK_THROWS_WITH(DemRaster::load(claim("big.tif", 65536u, 65536u)),
                     ContainsSubstring("is too large: 65536 x 65536 pixels; width x height must be at most "
                                       "536870912 pixels"));
+  // Exactly that many is allowed: load gets past the size check and stops at the missing tiepoint.
+  CHECK_THROWS_WITH(DemRaster::load(claim("edge.tif", 32768u, 16384u)),
+                    ContainsSubstring("has no usable GeoTIFF tiepoint"));
 }
 
 TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {
