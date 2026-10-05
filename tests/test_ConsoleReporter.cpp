@@ -85,11 +85,11 @@ TEST_CASE("a saved row prints progress, rate and ETA", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
   // The run set out to fetch 2424771 pixels; this row attempts 2051 of them, which leaves 2422720.
-  reporter.onRunStarted(RunPlan{3670016, 2424771, 981, 1792});
+  reporter.onRunStarted(RunPlan{3670016, 2424771, 1184, 1792});
   reporter.onRowSaved(RowReport{811, 1792, 2048, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
   const std::string text = out.str();
   CHECK_THAT(text,
-             ContainsSubstring("starting: 2424771 pixels in 981 rows remaining of 3670016 pixels in 1792 rows\n"));
+             ContainsSubstring("starting: 2424771 pixels in 1184 rows remaining of 3670016 pixels in 1792 rows\n"));
   CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed "
                                      "41.2s  49.8 px/s  eta 13h31m"));
 }
