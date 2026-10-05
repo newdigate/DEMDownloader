@@ -2868,13 +2868,16 @@ Implements spec section 7 (row loop, checkpoints, stop handling) and the Downloa
 
 ```cpp
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 #include "FakeFetcher.h"
@@ -2883,6 +2886,7 @@ Implements spec section 7 (row loop, checkpoints, stop handling) and the Downloa
 #include "demdl/Downloader.h"
 
 using namespace std::chrono_literals;
+using Catch::Matchers::ContainsSubstring;
 using demdl::BoundingBox;
 using demdl::DemRaster;
 using demdl::Downloader;
@@ -2905,6 +2909,7 @@ struct Fixture {
   RecordingSink sink;
   StopToken stop;
   std::atomic<int> calls{0};
+  std::atomic<int> sawStop{0};
   Gate gate;
 
   FetcherFactory factory(std::function<FetchResult(int, int)> behaviour, bool blocking = false) {
@@ -2912,6 +2917,7 @@ struct Fixture {
       auto f = std::make_unique<FakeFetcher>();
       f->behaviour = behaviour;
       f->calls = &calls;
+      f->sawStop = &sawStop;
       f->gate = blocking ? &gate : nullptr;
       return f;
     };
@@ -2939,10 +2945,11 @@ TEST_CASE("only NaN pixels are fetched and finished rows are skipped", "[downloa
   CHECK(summary.stopReason == StopReason::None);
   CHECK(summary.stopMessage == "finished");
   CHECK(f.calls.load() == 6);
-  CHECK(f.sink.plan.pixelsTotal == 12);
-  CHECK(f.sink.plan.pixelsTodo == 6);
-  CHECK(f.sink.plan.rowsTodo == 2);
-  CHECK(f.sink.plan.rowsTotal == 3);
+  REQUIRE(f.sink.plan.has_value());
+  CHECK(f.sink.plan->pixelsTotal == 12);
+  CHECK(f.sink.plan->pixelsTodo == 6);
+  CHECK(f.sink.plan->rowsTodo == 2);
+  CHECK(f.sink.plan->rowsTotal == 3);
   REQUIRE(f.sink.rows.size() == 2);
   CHECK(f.sink.rows[0].row == 0);
   CHECK(f.sink.rows[0].ok == 4);
@@ -2997,18 +3004,25 @@ TEST_CASE("a stop request saves the partial row and goes no further", "[download
                f.factory([](int x, int y) { return valueResult(expectedValue(x, y)); }, /*blocking=*/true),
                f.sink, f.stop, DownloaderOptions{2, 100});
 
-  std::thread runner([&d] { d.run(); });
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
-  while (f.gate.waiting.load() < 2 && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(f.gate.waiting.load() == 2);
+  std::thread runner([&d] { (void)d.run(); });
+  // Opens the gate and joins the runner however the test exits, so a failed REQUIRE cannot destroy
+  // a joinable std::thread, which would call std::terminate.
+  struct ReleaseAndJoin {
+    Gate& gate;
+    std::thread& runner;
+    ~ReleaseAndJoin() {
+      gate.release();
+      if (runner.joinable()) runner.join();
+    }
+  } guard{f.gate, runner};
+  REQUIRE(f.gate.awaitArrivals(2, 5s));
   CHECK(d.inFlight() == 2);
 
   f.stop.request(StopReason::Signal);
   f.gate.release();
   runner.join();
 
+  CHECK(f.sawStop.load() == 2);
   REQUIRE(f.sink.summary.has_value());
   CHECK(f.sink.summary->stopReason == StopReason::Signal);
   CHECK(f.sink.summary->stopMessage == "interrupted");
@@ -3058,10 +3072,33 @@ TEST_CASE("a complete raster makes no requests and writes nothing", "[downloader
   CHECK(f.calls.load() == 0);
   CHECK(summary.rowsSaved == 0);
   CHECK(summary.remainingNaN == 0);
-  CHECK(f.sink.plan.pixelsTodo == 0);
-  CHECK(f.sink.plan.rowsTodo == 0);
+  REQUIRE(f.sink.plan.has_value());
+  CHECK(f.sink.plan->pixelsTodo == 0);
+  CHECK(f.sink.plan->rowsTodo == 0);
   REQUIRE(f.sink.summary.has_value());
   CHECK_FALSE(std::filesystem::exists(f.output));
+}
+
+TEST_CASE("an exception inside a job is recorded as a failure, not propagated", "[downloader]") {
+  Fixture f;
+  auto raster = DemRaster::create(3, 1, kBox, {});
+  Downloader d(raster, f.output, f.factory([](int x, int y) {
+                 if (x == 1) throw std::runtime_error("boom");
+                 return valueResult(expectedValue(x, y));
+               }),
+               f.sink, f.stop, DownloaderOptions{1, 100});
+
+  const demdl::RunSummary summary = d.run();
+
+  CHECK(summary.failed == 1);
+  CHECK(summary.pixelsFetched == 2);
+  CHECK(summary.remainingNaN == 1);
+  CHECK(d.inFlight() == 0);
+  const auto failure = std::find_if(f.sink.pixels.begin(), f.sink.pixels.end(),
+                                    [](const demdl::PixelEvent& e) { return e.state == PixelState::Failed; });
+  REQUIRE(failure != f.sink.pixels.end());
+  CHECK(failure->x == 1);
+  CHECK_THAT(failure->error, ContainsSubstring("boom"));
 }
 ```
 
@@ -3119,16 +3156,23 @@ struct DownloaderOptions {
 };
 
 // Walks the rows that still contain NaN pixels, fetches those pixels through a thread pool,
-// saves the raster after each row and reports progress. One run() per instance.
+// saves the raster after each row and reports progress.
+//
+// Call run() exactly once. It blocks until the run ends, so when a preview window is active it must
+// not run on the main thread, which belongs to the GLFW event loop; main calls it under std::async.
+// Pixel callbacks reach the sink from the pool threads and from the thread calling run() (Queued);
+// row and run callbacks come only from the thread calling run(). A pool job catches every exception
+// and records its pixel as Failed, while an exception from the factory propagates out of run().
 class Downloader {
  public:
+  // Throws std::invalid_argument when threads or maxConsecutiveFailures is below 1.
   Downloader(DemRaster& raster, std::filesystem::path output, FetcherFactory factory, ProgressSink& sink,
              StopToken& stop, DownloaderOptions options);
 
-  RunSummary run();
+  [[nodiscard]] RunSummary run();
 
   // Pixels currently inside a fetch call. For the "stopping" message.
-  int inFlight() const { return inFlight_.load(); }
+  [[nodiscard]] int inFlight() const { return inFlight_.load(); }
 
  private:
   DemRaster& raster_;
@@ -3152,6 +3196,7 @@ class Downloader {
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <future>
 #include <stdexcept>
@@ -3199,10 +3244,10 @@ RunSummary Downloader::run() {
   std::string writeError;
 
   for (const int row : rows) {
-    if (stop_.stop.load()) break;
+    if (stop_.requested()) break;
     const auto rowStart = Clock::now();
     const std::vector<int> todo = raster_.todoInRow(row);
-    for (const int x : todo) sink_.onPixelState({x, row, PixelState::Queued, 0.0f, 0, {}});
+    for (const int x : todo) sink_.onPixelState(PixelEvent{.x = x, .y = row, .state = PixelState::Queued});
 
     std::atomic<int> rowOk{0};
     std::atomic<int> rowNoData{0};
@@ -3210,36 +3255,55 @@ RunSummary Downloader::run() {
     std::vector<std::future<void>> futures;
     futures.reserve(todo.size());
     for (const int x : todo) {
-      if (stop_.stop.load()) break;  // stop queueing immediately
+      if (stop_.requested()) break;  // stop queueing immediately
       futures.push_back(pool.push([&, x, row](int workerId) {
-        if (stop_.stop.load()) return;  // queued before the stop, never started
-        ++inFlight_;
-        sink_.onPixelState({x, row, PixelState::InFlight, 0.0f, 0, {}});
-        const FetchResult result = fetchers[static_cast<std::size_t>(workerId)]->fetch(x, row, stop_.stop);
-        --inFlight_;
-        switch (result.kind) {
-          case FetchResult::Kind::Value:
-            raster_.set(x, row, result.value);
-            consecutiveFailures.store(0);
-            ++rowOk;
-            ++fetched;
-            sink_.onPixelState({x, row, PixelState::Value, result.value, result.attempts, {}});
-            break;
-          case FetchResult::Kind::NoData:
-            raster_.set(x, row, DemRaster::kNoData);
-            consecutiveFailures.store(0);
-            ++rowNoData;
-            ++noData;
-            sink_.onPixelState({x, row, PixelState::NoData, 0.0f, result.attempts, {}});
-            break;
-          case FetchResult::Kind::Failed: {
-            ++rowFailed;
-            ++failed;
-            const int streak = ++consecutiveFailures;
-            sink_.onPixelState({x, row, PixelState::Failed, 0.0f, result.attempts, result.error});
-            if (streak >= options_.maxConsecutiveFailures) stop_.request(StopReason::ConsecutiveFailures);
-            break;
+        if (stop_.requested()) return;  // queued before the stop, never started
+        const auto recordFailure = [&](const std::string& error, int attempts) {
+          ++rowFailed;
+          ++failed;
+          const int streak = ++consecutiveFailures;
+          sink_.onPixelState(
+              PixelEvent{.x = x, .y = row, .state = PixelState::Failed, .attempts = attempts, .error = error});
+          if (streak >= options_.maxConsecutiveFailures) stop_.request(StopReason::ConsecutiveFailures);
+        };
+        // Fetchers and sinks must not throw. Should one do so anyway, the pixel is recorded as Failed:
+        // an exception leaving the job would make f.get() below rethrow while queued jobs still use
+        // this row's locals.
+        bool counted = false;  // inFlight_ includes this job
+        try {
+          ++inFlight_;
+          counted = true;
+          sink_.onPixelState(PixelEvent{.x = x, .y = row, .state = PixelState::InFlight});
+          const FetchResult result = fetchers[static_cast<std::size_t>(workerId)]->fetch(x, row, stop_.flag());
+          --inFlight_;
+          counted = false;
+          switch (result.kind) {
+            case FetchResult::Kind::Value:
+              raster_.set(x, row, result.value);
+              consecutiveFailures.store(0);
+              ++rowOk;
+              ++fetched;
+              sink_.onPixelState(PixelEvent{
+                  .x = x, .y = row, .state = PixelState::Value, .value = result.value, .attempts = result.attempts});
+              break;
+            case FetchResult::Kind::NoData:
+              raster_.set(x, row, DemRaster::kNoData);
+              consecutiveFailures.store(0);
+              ++rowNoData;
+              ++noData;
+              sink_.onPixelState(
+                  PixelEvent{.x = x, .y = row, .state = PixelState::NoData, .attempts = result.attempts});
+              break;
+            case FetchResult::Kind::Failed:
+              recordFailure(result.error, result.attempts);
+              break;
           }
+        } catch (const std::exception& e) {
+          if (counted) --inFlight_;
+          recordFailure(std::string("exception: ") + e.what(), 0);
+        } catch (...) {
+          if (counted) --inFlight_;
+          recordFailure("unknown exception", 0);
         }
       }));
     }
@@ -3293,12 +3357,12 @@ RunSummary Downloader::run() {
 }  // namespace demdl
 ```
 
-Notes for the engineer: every job writes a distinct raster cell and `save` runs only after `f.get()` has returned for the whole row, so the raster needs no lock. `ctpl::thread_pool` runs queued jobs in FIFO order, which is what makes the stop test deterministic: with two workers blocked on columns 0 and 1, columns 2 and 3 are still queued when the stop arrives and return at their first line. The pool's destructor waits for its queue to drain, which is empty by then.
+Notes for the engineer: every job writes a distinct raster cell and `save` runs only after `f.get()` has returned for the whole row, so the raster needs no lock. `ctpl::thread_pool` runs queued jobs in FIFO order, which is what makes the stop test deterministic: with two workers blocked on columns 0 and 1, columns 2 and 3 are still queued when the stop arrives and return at their first line. The pool's destructor waits for its queue to drain, which is empty by then, and `f.get()` has nothing to rethrow, because a job catches every exception and records a failure.
 
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[downloader]"`
-Expected: `All tests passed (N assertions in 5 test cases)`. The stop test takes well under a second.
+Expected: `All tests passed (N assertions in 6 test cases)`. The stop test takes well under a second.
 
 - [ ] **Step 7: Commit**
 

@@ -190,8 +190,10 @@ columns; `rowsWithWork()`; `countNaN()`;
 **Downloader** runs the row loop described in section 7. It is constructed
 with a `DemRaster&`, an output path, a fetcher factory
 `std::function<std::unique_ptr<PixelFetcher>(int workerId)>`, a
-`ProgressSink&`, a `std::atomic<bool>& stop`, the thread count and the
-consecutive-failure limit. `run()` returns a `RunSummary`.
+`ProgressSink&`, a `StopToken&`, the thread count and the
+consecutive-failure limit. `run()` returns a `RunSummary`. Each pool job
+catches every exception and records its pixel as `Failed`, so no exception
+crosses the future boundary.
 
 **ProgressSink** is the event interface in section 8. **ConsoleReporter** and
 **PreviewWindow** implement it.
@@ -316,8 +318,12 @@ emit onRunFinished(summary)
 `job(x, row)`: emit `InFlight`; `result = fetcher(workerId).fetch(x, row,
 stop)`; call `set(x, row, ...)` with the value or `kNoData`, or leave NaN;
 update the consecutive-failure counter (reset on `Value` or `NoData`,
-increment on `Failed`; reaching the limit sets `stop` with reason
-`ConsecutiveFailures`); emit the final state.
+increment on `Failed`; reaching the limit requests a stop with reason
+`ConsecutiveFailures`); emit the final state. The job body runs inside a
+catch-all: an exception from the fetcher or the sink is recorded as
+`Failed` with the error `exception: <what()>` (or `unknown exception` for a
+type not derived from `std::exception`), counted and reported exactly like
+a failed fetch, so no exception reaches the pool.
 
 Each job writes a distinct cell and the save runs only after that row's
 futures have returned, so the raster needs no lock.
@@ -381,8 +387,8 @@ magenta (255, 0, 255); values use the existing `rainbow()` mapping over the
 minimum and maximum values seen so far, so the palette stays consistent as
 new maxima arrive instead of being pinned to 700 m. The fragment shader
 samples the texture unchanged, which removes the broken `maxValue` uniform.
-Closing the window sets `stop` with reason `WindowClosed`. The window closes
-when the run finishes.
+Closing the window requests a stop with reason `WindowClosed`. The window
+closes when the run finishes.
 
 ## 9. Threads, signals and `main`
 
