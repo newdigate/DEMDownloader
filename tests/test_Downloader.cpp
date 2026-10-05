@@ -231,3 +231,23 @@ TEST_CASE("an exception inside a job is recorded as a failure, not propagated", 
   CHECK(failure->x == 1);
   CHECK_THAT(failure->error, ContainsSubstring("boom"));
 }
+
+TEST_CASE("a write failure after a stop request is still reported", "[downloader]") {
+  Fixture f;
+  REQUIRE(std::filesystem::create_directory(f.output));  // the checkpoint cannot replace a directory
+  auto raster = DemRaster::create(2, 1, kBox, {});
+  // A stop requested before run() would end the run before any save, so the first fetch requests it.
+  // The second pixel is then skipped, and the row's save fails after the stop.
+  Downloader d(raster, f.output, f.factory([&stop = f.stop](int x, int y) {
+                 stop.request(StopReason::Signal);
+                 return valueResult(expectedValue(x, y));
+               }),
+               f.sink, f.stop, DownloaderOptions{1, 100});
+
+  const demdl::RunSummary summary = d.run();
+
+  CHECK(summary.stopReason == StopReason::Signal);
+  CHECK_THAT(summary.stopMessage, ContainsSubstring("interrupted"));
+  CHECK_THAT(summary.stopMessage, ContainsSubstring("checkpoint write failed"));
+  CHECK(summary.rowsSaved == 0);
+}

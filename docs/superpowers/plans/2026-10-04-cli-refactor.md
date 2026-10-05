@@ -3100,6 +3100,26 @@ TEST_CASE("an exception inside a job is recorded as a failure, not propagated", 
   CHECK(failure->x == 1);
   CHECK_THAT(failure->error, ContainsSubstring("boom"));
 }
+
+TEST_CASE("a write failure after a stop request is still reported", "[downloader]") {
+  Fixture f;
+  REQUIRE(std::filesystem::create_directory(f.output));  // the checkpoint cannot replace a directory
+  auto raster = DemRaster::create(2, 1, kBox, {});
+  // A stop requested before run() would end the run before any save, so the first fetch requests it.
+  // The second pixel is then skipped, and the row's save fails after the stop.
+  Downloader d(raster, f.output, f.factory([&stop = f.stop](int x, int y) {
+                 stop.request(StopReason::Signal);
+                 return valueResult(expectedValue(x, y));
+               }),
+               f.sink, f.stop, DownloaderOptions{1, 100});
+
+  const demdl::RunSummary summary = d.run();
+
+  CHECK(summary.stopReason == StopReason::Signal);
+  CHECK_THAT(summary.stopMessage, ContainsSubstring("interrupted"));
+  CHECK_THAT(summary.stopMessage, ContainsSubstring("checkpoint write failed"));
+  CHECK(summary.rowsSaved == 0);
+}
 ```
 
 - [ ] **Step 2: Add the files to CMake**
@@ -3163,6 +3183,8 @@ struct DownloaderOptions {
 // Pixel callbacks reach the sink from the pool threads and from the thread calling run() (Queued);
 // row and run callbacks come only from the thread calling run(). A pool job catches every exception
 // and records its pixel as Failed, while an exception from the factory propagates out of run().
+// Jobs are noexcept, so an exception escaping even those handlers (recording a failure under memory
+// pressure, say) calls std::terminate instead of unwinding past the pool.
 class Downloader {
  public:
   // Throws std::invalid_argument when threads or maxConsecutiveFailures is below 1.
@@ -3256,7 +3278,7 @@ RunSummary Downloader::run() {
     futures.reserve(todo.size());
     for (const int x : todo) {
       if (stop_.requested()) break;  // stop queueing immediately
-      futures.push_back(pool.push([&, x, row](int workerId) {
+      futures.push_back(pool.push([&, x, row](int workerId) noexcept {
         if (stop_.requested()) return;  // queued before the stop, never started
         const auto recordFailure = [&](const std::string& error, int attempts) {
           ++rowFailed;
@@ -3266,9 +3288,9 @@ RunSummary Downloader::run() {
               PixelEvent{.x = x, .y = row, .state = PixelState::Failed, .attempts = attempts, .error = error});
           if (streak >= options_.maxConsecutiveFailures) stop_.request(StopReason::ConsecutiveFailures);
         };
-        // Fetchers and sinks must not throw. Should one do so anyway, the pixel is recorded as Failed:
-        // an exception leaving the job would make f.get() below rethrow while queued jobs still use
-        // this row's locals.
+        // Fetchers and sinks must not throw; should one do so anyway, the pixel is recorded as Failed.
+        // The job is noexcept, so an exception escaping these handlers terminates the process instead
+        // of making f.get() below rethrow while queued jobs still use this row's locals.
         bool counted = false;  // inFlight_ includes this job
         try {
           ++inFlight_;
@@ -3350,6 +3372,10 @@ RunSummary Downloader::run() {
       summary.stopMessage = describe(summary.stopReason);
       break;
   }
+  // A stop requested before the failed save keeps its reason, so the write error is reported with it.
+  if (!writeError.empty() && summary.stopReason != StopReason::WriteError) {
+    summary.stopMessage += "; checkpoint write failed: " + writeError;
+  }
   sink_.onRunFinished(summary);
   return summary;
 }
@@ -3357,12 +3383,12 @@ RunSummary Downloader::run() {
 }  // namespace demdl
 ```
 
-Notes for the engineer: every job writes a distinct raster cell and `save` runs only after `f.get()` has returned for the whole row, so the raster needs no lock. `ctpl::thread_pool` runs queued jobs in FIFO order, which is what makes the stop test deterministic: with two workers blocked on columns 0 and 1, columns 2 and 3 are still queued when the stop arrives and return at their first line. The pool's destructor waits for its queue to drain, which is empty by then, and `f.get()` has nothing to rethrow, because a job catches every exception and records a failure.
+Notes for the engineer: every job writes a distinct raster cell and `save` runs only after `f.get()` has returned for the whole row, so the raster needs no lock. `ctpl::thread_pool` runs queued jobs in FIFO order, which is what makes the stop test deterministic: with two workers blocked on columns 0 and 1, columns 2 and 3 are either skipped before submission, if the stop arrives before the run thread has pushed them, or return at their first line, with the same outcome. The pool's destructor waits for its queue to drain, which is empty by then, and `f.get()` has nothing to rethrow, because a job catches every exception and records a failure.
 
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[downloader]"`
-Expected: `All tests passed (N assertions in 6 test cases)`. The stop test takes well under a second.
+Expected: `All tests passed (N assertions in 7 test cases)`. The stop test takes well under a second.
 
 - [ ] **Step 7: Commit**
 

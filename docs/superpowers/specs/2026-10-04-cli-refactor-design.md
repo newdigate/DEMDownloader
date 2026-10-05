@@ -331,7 +331,9 @@ futures have returned, so the raster needs no lock.
 Atomic save: write to `<output>.tmp` in the same directory, flush and sync
 it, close, then `std::filesystem::rename` over the output. `DemRaster::save`
 throws on failure; `Downloader::run` catches it, records reason `WriteError`
-with the message, stops, and returns the summary normally. The previous
+with the message, stops, and returns the summary normally. If a stop was
+already requested with another reason, that reason stands and the summary's
+stop message gains `; checkpoint write failed: <message>`. The previous
 checkpoint is intact.
 
 `RunSummary` carries `pixelsFetched`, `noData`, `failed`, `rowsSaved`,
@@ -486,10 +488,13 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 - **Downloader**: with `FakeFetcher` (value is a function of x and y;
   configurable NoData and failure sets; optional latch to block mid-row) and
   `RecordingSink`: only NaN pixels are fetched; rows without work emit no
-  events; one save per worked row, verified by reloading the file; setting
-  `stop` while a row is blocked saves the partial row and processes no further
-  rows; the consecutive-failure limit stops the run with that reason; summary
-  counts match.
+  events; one save per worked row, verified by reloading the file; requesting
+  a stop while a row is blocked saves the partial row and processes no further
+  rows; the consecutive-failure limit stops the run with that reason; an
+  exception thrown inside a job is recorded as a failed pixel and does not
+  escape `run()`; a checkpoint write that fails after a stop request keeps
+  the stop's reason and still reports the write failure in the stop message;
+  summary counts match.
 - **ElevationClient**: an in-process `httplib::Server` on a loopback port
   serves canned bodies: a value, a NoData body, a 500 followed by a 200 to
   prove a retry, and a connection close to prove failure after retries, with

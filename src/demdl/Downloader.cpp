@@ -64,7 +64,7 @@ RunSummary Downloader::run() {
     futures.reserve(todo.size());
     for (const int x : todo) {
       if (stop_.requested()) break;  // stop queueing immediately
-      futures.push_back(pool.push([&, x, row](int workerId) {
+      futures.push_back(pool.push([&, x, row](int workerId) noexcept {
         if (stop_.requested()) return;  // queued before the stop, never started
         const auto recordFailure = [&](const std::string& error, int attempts) {
           ++rowFailed;
@@ -74,9 +74,9 @@ RunSummary Downloader::run() {
               PixelEvent{.x = x, .y = row, .state = PixelState::Failed, .attempts = attempts, .error = error});
           if (streak >= options_.maxConsecutiveFailures) stop_.request(StopReason::ConsecutiveFailures);
         };
-        // Fetchers and sinks must not throw. Should one do so anyway, the pixel is recorded as Failed:
-        // an exception leaving the job would make f.get() below rethrow while queued jobs still use
-        // this row's locals.
+        // Fetchers and sinks must not throw; should one do so anyway, the pixel is recorded as Failed.
+        // The job is noexcept, so an exception escaping these handlers terminates the process instead
+        // of making f.get() below rethrow while queued jobs still use this row's locals.
         bool counted = false;  // inFlight_ includes this job
         try {
           ++inFlight_;
@@ -157,6 +157,10 @@ RunSummary Downloader::run() {
     default:
       summary.stopMessage = describe(summary.stopReason);
       break;
+  }
+  // A stop requested before the failed save keeps its reason, so the write error is reported with it.
+  if (!writeError.empty() && summary.stopReason != StopReason::WriteError) {
+    summary.stopMessage += "; checkpoint write failed: " + writeError;
   }
   sink_.onRunFinished(summary);
   return summary;

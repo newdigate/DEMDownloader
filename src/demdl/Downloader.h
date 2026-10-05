@@ -28,6 +28,8 @@ struct DownloaderOptions {
 // Pixel callbacks reach the sink from the pool threads and from the thread calling run() (Queued);
 // row and run callbacks come only from the thread calling run(). A pool job catches every exception
 // and records its pixel as Failed, while an exception from the factory propagates out of run().
+// Jobs are noexcept, so an exception escaping even those handlers (recording a failure under memory
+// pressure, say) calls std::terminate instead of unwinding past the pool.
 class Downloader {
  public:
   // Throws std::invalid_argument when threads or maxConsecutiveFailures is below 1.
