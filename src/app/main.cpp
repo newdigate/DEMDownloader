@@ -42,10 +42,10 @@ static_assert(std::atomic<int>::is_always_lock_free);
 
 constexpr const char* kOverwriteHint = "use --overwrite to start fresh or choose another --output\n";
 
-// SIGINT and SIGTERM. The first requests a stop, which main announces when it sees the token raised:
-// nothing may print here. A second ends the process by that signal's default action, so a calling shell
-// sees the signal and reports 130 or 143; after a second Ctrl-C, which reaches the whole foreground job, a
-// script or loop running this program stops too. Every call here is async-signal-safe.
+// SIGINT, SIGTERM and SIGHUP. The first requests a stop, which main announces when it sees the token
+// raised: nothing may print here. A second ends the process by that signal's default action, so a calling
+// shell sees the signal and reports 130, 143 or 129; after a second Ctrl-C, which reaches the whole
+// foreground job, a script or loop running this program stops too. Every call here is async-signal-safe.
 void onSignal(int number) {
   if (g_signalCount.fetch_add(1) == 0) {
     g_stopToken.request(demdl::StopReason::Signal);
@@ -63,8 +63,10 @@ void onSignal(int number) {
   raise(number);
 }
 
-// SIGINT and SIGTERM go to onSignal, each blocking both while it runs, and interrupted system calls
-// restart. SIGPIPE is ignored, which ElevationClient relies on: httplib's client does not suppress it.
+// SIGINT, SIGTERM and SIGHUP go to onSignal, each blocking all three while it runs, and interrupted
+// system calls restart. Closing the terminal thus stops the run as Ctrl-C does, but a SIGHUP ignored at
+// startup, as under nohup, stays ignored, since that is what nohup asks for. SIGPIPE is ignored, which
+// ElevationClient relies on: httplib's client does not suppress it.
 void installSignalHandlers() {
   struct sigaction stop {};
   stop.sa_handler = onSignal;
@@ -72,8 +74,13 @@ void installSignalHandlers() {
   sigemptyset(&stop.sa_mask);
   sigaddset(&stop.sa_mask, SIGINT);
   sigaddset(&stop.sa_mask, SIGTERM);
+  sigaddset(&stop.sa_mask, SIGHUP);
   sigaction(SIGINT, &stop, nullptr);
   sigaction(SIGTERM, &stop, nullptr);
+  struct sigaction hangup {};
+  if (sigaction(SIGHUP, nullptr, &hangup) == 0 && hangup.sa_handler != SIG_IGN) {
+    sigaction(SIGHUP, &stop, nullptr);
+  }
   struct sigaction ignore {};
   ignore.sa_handler = SIG_IGN;
   sigemptyset(&ignore.sa_mask);
@@ -94,6 +101,14 @@ class ThreadJoiner {
   std::thread& thread_;
 };
 
+// How the requests would be secured, for the dry run.
+std::string tlsDescription(const demdl::Config& cfg) {
+  if (!cfg.wmsUrl.starts_with("https://")) return "none (plain http)";
+  if (cfg.insecure) return "certificate verification disabled (--insecure)";
+  if (!cfg.caBundle.empty()) return "verify with " + cfg.caBundle;
+  return "verify with the system trust store";
+}
+
 // `outputPlan` says what the run would do with the file, such as "exists, will be resumed".
 void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, const char* outputPlan) {
   using demdl::formatCoordinate;
@@ -103,6 +118,7 @@ void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, const c
             << "  grid: " << cfg.width << " x " << cfg.height << "\n"
             << "  output: " << cfg.output.string() << " (" << outputPlan << ")\n"
             << "  wms: " << cfg.wmsUrl << "\n"
+            << "  tls: " << tlsDescription(cfg) << "\n"
             << "  layer: " << cfg.layer << "\n"
             << "  threads: " << cfg.threads << ", max retries: " << cfg.maxRetries
             << ", max consecutive failures: " << cfg.maxConsecutiveFailures << "\n";
@@ -272,8 +288,10 @@ int main(int argc, char** argv) {
       announced = true;
       // One string in one insertion, on stderr: the reporter owns stdout and writes under its own mutex,
       // so a line written to stdout from here could land inside one of its lines.
+      const int inFlight = downloader->inFlight();
+      const char* const requests = inFlight == 1 ? " in-flight request\n" : " in-flight requests\n";
       const std::string line = std::string("stopping: ") + describe(g_stopToken.reason()) + "; waiting for " +
-                               std::to_string(downloader->inFlight()) + " in-flight requests\n";
+                               std::to_string(inFlight) + requests;
       std::cerr << line;
     }
   }
@@ -288,6 +306,9 @@ int main(int argc, char** argv) {
     std::cerr << "error: unknown exception\n";
     return cli::kExitError;
   }
+  // The finish lines go to stdout, which may be a log file, so a checkpoint that could not be written, on a
+  // full disk for instance, is reported on stderr as well, in one insertion as for the stopping line.
+  if (summary.checkpointWriteFailed) std::cerr << "error: " + summary.stopMessage + "\n";
 #ifdef DL_ELEVATION_HAVE_PREVIEW
   if (preview != nullptr) {
     writeSummary(std::cout, summary);  // the window prints nothing, so the finish lines come from here

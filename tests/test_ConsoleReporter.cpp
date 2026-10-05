@@ -84,14 +84,15 @@ TEST_CASE("the starting line gives what is left and the whole", "[consolereporte
 TEST_CASE("a saved row prints progress, rate and ETA", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
-  // The run set out to fetch 2424771 pixels; this row attempts 2051 of them, which leaves 2422720.
-  reporter.onRunStarted(RunPlan{3670016, 2424771, 1184, 1792});
-  reporter.onRowSaved(RowReport{811, 1792, 2048, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
+  // The run set out to fetch 2424768 pixels; this row attempts 2048 of them, which leaves 2422720. The rate
+  // is 2048 / 41.2 = 49.7 px/s, and the ETA 2422720 / 2048 * 41.2 = 48738 s.
+  reporter.onRunStarted(RunPlan{3670016, 2424768, 1184, 1792});
+  reporter.onRowSaved(RowReport{811, 1792, 2045, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
   const std::string text = out.str();
   CHECK_THAT(text,
-             ContainsSubstring("starting: 2424771 pixels in 1184 rows remaining of 3670016 pixels in 1792 rows\n"));
-  CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed "
-                                     "41.2s  49.8 px/s  eta 13h31m"));
+             ContainsSubstring("starting: 2424768 pixels in 1184 rows remaining of 3670016 pixels in 1792 rows\n"));
+  CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2045 ok 0 nodata 3 failed "
+                                     "41.2s  49.7 px/s  eta 13h32m"));
 }
 
 TEST_CASE("a row without elapsed time prints no ETA", "[consolereporter]") {
@@ -150,7 +151,7 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
   RunSummary s;
-  s.pixelsFetched = 3669980;
+  s.pixelsFetched = 3657979;
   s.noData = 12034;
   s.failed = 3;
   s.remainingNaN = 3;
@@ -158,7 +159,7 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
   s.elapsed = std::chrono::duration<double>(50520.0);
   reporter.onRunFinished(s);
   CHECK_THAT(out.str(),
-             ContainsSubstring("done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
+             ContainsSubstring("done: 3657979 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
   CHECK_THAT(out.str(), ContainsSubstring("rerun with the same arguments to retry the 3 failed pixels"));
   CHECK_THAT(out.str(), !ContainsSubstring("stopped:"));
 
@@ -222,7 +223,7 @@ TEST_CASE("writeSummary writes the lines onRunFinished prints", "[consolereporte
   s.rowsSaved = 3;
   s.elapsed = std::chrono::duration<double>(30.0);
   s.stopReason = StopReason::ConsecutiveFailures;
-  s.stopMessage = "server unreachable: 100 consecutive failures; last error: http 503";
+  s.stopMessage = "100 consecutive failures; last error: http 503";
   std::ostringstream direct;
   writeSummary(direct, s);
   std::ostringstream viaSink;

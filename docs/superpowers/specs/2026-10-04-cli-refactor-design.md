@@ -27,7 +27,8 @@ Goals, all confirmed with the owner:
 2. Maintainability and tests: units with clear boundaries, testable without
    network or a display.
 3. Unattended operation: headless by default, clean shutdown on signals,
-   meaningful exit codes, buildable on a Linux server without OpenGL.
+   meaningful exit codes, and a headless build meant for a Linux server
+   without OpenGL (untested: it has never been compiled on Linux).
 4. Groundwork: proper GeoTIFF tags now; room for other layers or hosts later.
 
 Non-goals for this iteration:
@@ -44,10 +45,10 @@ Non-goals for this iteration:
 | Topic | Decision |
 |---|---|
 | Output format | Single-band float32 GeoTIFF in metres. Old RGB16 files are not resumable and are left untouched. |
-| TLS | Verify certificates by default using the system trust store. `--ca-bundle` overrides, `--insecure` disables. |
-| Response parsing | Parse the whole number after `BAND 0:`. A 200 body is NoData only when it lacks the marker and is plain (not blank, no `ServiceException`, not markup); anything else without a finite in-range number is a parse error. Parse errors and transport failures are retried, then left for the next run. |
+| TLS | Verify certificates by default using the system trust store. `--ca-bundle` replaces that store rather than adding to it; `--insecure` disables verification. |
+| Response parsing | Parse the whole number after `BAND 0:`, which must end the line or be followed by whitespace. A 200 body is NoData only when it lacks the marker and is plain (not blank, no `ServiceException`, not markup); anything else without a finite in-range number is a parse error. Parse errors and transport failures are retried, then left for the next run. |
 | Concurrency | `--threads` default 8 (was 50). Exponential backoff between retries. `--max-retries` default 8 (was 500). |
-| Shutdown | SIGINT/SIGTERM stop queueing, drain in-flight requests, save, exit. |
+| Shutdown | SIGINT, SIGTERM and SIGHUP (unless ignored at startup, as under `nohup`) stop queueing, drain in-flight requests, save, exit. |
 | Preview | Off by default; `--preview` opens the window. |
 | Structure | Static library + thin CLI + optional preview + tests. No source or sink abstractions beyond a one-method fetch interface for testing. |
 | Dependencies | FetchContent pins cpp-httplib, CLI11 and Catch2 to release tags and ctpl to a commit hash. CLI11 for parsing, Catch2 v3 for tests. ctpl kept for the pool. |
@@ -113,7 +114,13 @@ tests/
 Deleted: root `main.cpp`, `opengl.cmake.in`, every file in `include/`
 (the shader is moved, the rest is unused LearnOpenGL boilerplate).
 `ca-bundle.crt` stays in the repository as an optional `--ca-bundle` fallback
-and is no longer referenced by default.
+and is no longer referenced by default. It holds Mozilla's root certificates
+of 2019-01-22 and nothing else, and `--ca-bundle` replaces the system trust
+store entirely, so the file cannot supply an intermediate certificate the
+server fails to send, and it breaks chains whose root is newer. If
+verification fails, build a PEM file with the server's intermediate
+certificate(s) and root and pass that instead; never use `--insecure` for a
+long run.
 
 ### 4.3 Units
 
@@ -153,11 +160,15 @@ fixed decimals, the form used in URLs and in reports alike.
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
 `Value(double)`, `NoData`, or `ParseError`. A `BAND 0:` marker wins over
-everything else in the body. The numeric prefix of the marker's line is parsed
-and trailing text is ignored, so `BAND 0: 12.5 m` is 12.5; a number on the next
-line does not count. The result is a `Value` only when the number is finite and
-within float range, because the raster stores float32; anything else (no
-number, `nan`, `inf`, `1e300`) is a `ParseError`. Without the marker the body
+everything else in the body. The number at the start of the marker's line is
+parsed, and it must end the line or be followed by whitespace (space, tab, CR,
+LF, VT or FF), after which any text is ignored: `BAND 0: 12.5 m` is 12.5, but
+text glued to the number, as in `1.#QNAN`, `12,5`, `12abc` or `12.5e`, makes
+a `ParseError`, because a stored value is final and never fetched again while
+a parse error is retried. A number on the next line does not count. The
+result is a `Value` only when the number is finite and within float range,
+because the raster stores float32; anything else (no number, `nan`, `inf`,
+`1e300`) is a `ParseError`. Without the marker the body
 is `NoData` only when it is not blank (empty or only whitespace), does not
 contain `ServiceException` and does not start with markup (`<` as the first
 non-whitespace character). Anything else is a `ParseError` and is retried,
@@ -314,11 +325,14 @@ dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18
 ```
 
 `--dry-run` prints: the resolved Config, whether the output will be created,
-resumed or (with `--overwrite`) overwritten, rows remaining, pixels remaining,
-and the URL for the first pending pixel. An existing output that does not
-match is still exit 1 with the mismatch listing, dry run or not, and so is an
-output whose directory does not exist or does not accept new files when the
-run would write it.
+resumed or (with `--overwrite`) overwritten, a `tls:` line after the WMS URL
+saying how requests would be secured (`none (plain http)`,
+`verify with the system trust store`, `verify with <bundle path>` or
+`certificate verification disabled (--insecure)`), rows remaining, pixels
+remaining, and the URL for the first pending pixel. An existing output that
+does not match is still exit 1 with the mismatch listing, dry run or not, and
+so is an output whose directory does not exist or does not accept new files
+when the run would write it.
 
 ## 6. Output file format
 
@@ -422,12 +436,16 @@ Each job writes a distinct cell and the save runs only after that row's
 futures have returned, so the raster needs no lock.
 
 Atomic save: write to `<output>.tmp` in the same directory, flush and sync
-it, close, then `std::filesystem::rename` over the output. `DemRaster::save`
-throws on failure; `Downloader::run` catches it, records reason `WriteError`
-with the message, stops, and returns the summary normally. If a stop was
-already requested with another reason, that reason stands and the summary's
-stop message gains `; checkpoint write failed: <message>`. The previous
-checkpoint is intact.
+it, close, then `std::filesystem::rename` over the output. Each save rewrites
+the whole file, 4 x width x height bytes, once before the first request and
+once per row with work: about 26 GB over a 2048 x 1792 run, and about 50 TB
+for a square grid near the 2^29-pixel limit, which wears an SSD noticeably.
+`DemRaster::save` throws on failure; `Downloader::run` catches it, records
+reason `WriteError` with the message, stops, and returns the summary
+normally. If a stop was already requested with another reason, that reason
+stands and the summary's stop message gains
+`; checkpoint write failed: <message>`. The previous checkpoint is intact,
+and `main` reports the failure on stderr as well (section 9).
 
 `RunSummary` carries `pixelsFetched`, `noData`, `failed`, `rowsSaved`,
 `remainingNaN`, `elapsed`, `stopReason` in
@@ -501,10 +519,13 @@ never make an incomplete file look complete. `checkpointWriteFailed` is set
 whenever a save threw. The stop message then reads `checkpoint write failed:
 <reason>`, or, when another stop reason came first and was kept, that reason's
 message followed by `; checkpoint write failed: <reason>`. A stop for the
-consecutive-failure limit reads `server unreachable: <limit> consecutive
-failures; last error: <error>`, where `<error>` is the error of the failure
-that reached the limit, for example `server unreachable: 100 consecutive
-failures; last error: transport: Could not establish connection`.
+consecutive-failure limit reads
+`<limit> consecutive failures; last error: <error>`, where `<error>` is the
+error of the failure that reached the limit, for example
+`100 consecutive failures; last error: transport: Could not establish connection`,
+which the reporter prints as `stopped: 100 consecutive failures; last error:
+...`. It does not say the server is unreachable: HTTP errors such as 500 or
+404, unparseable bodies and certificate errors reach the limit as well.
 
 Pixel events may arrive concurrently from worker threads and from the
 downloader thread (`Queued` comes from the downloader); row and run events come
@@ -516,7 +537,7 @@ throw, because pixel events are delivered inside pool jobs.
 and then prints, per saved row:
 
 ```
-row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.8 px/s  eta 13h31m
+row 812/1792  done 1247296/3670016 (34.0%)  row: 2045 ok 0 nodata 3 failed 41.2s  49.7 px/s  eta 13h32m
 ```
 
 The rate divides the pixels attempted (ok, nodata and failed) in the last ten
@@ -538,7 +559,7 @@ Every line is written whole under the reporter's mutex, so concurrent pixel
 lines never interleave. On finish:
 
 ```
-done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed
+done: 3657979 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed
 rerun with the same arguments to retry the 3 failed pixels
 ```
 
@@ -561,8 +582,9 @@ sink prints nothing. The starting line, each row line and the finish lines
 are flushed as they are written, so that with stdout redirected to a file
 each row reaches the log when it is saved; the frequent verbose pixel lines
 are not flushed. The line that announces a stop as it happens, for example
-`stopping: interrupted; waiting for 8 in-flight requests`, is written by
-`main`, not by the reporter, when it sees the stop token raised: `main` polls
+`stopping: interrupted; waiting for 8 in-flight requests` (or
+`waiting for 1 in-flight request`), is written by `main`, not by the
+reporter, when it sees the stop token raised: `main` polls
 the token every 100 ms, because nothing may print from inside a signal
 handler. It goes to stderr, built as one string and written with a single
 insertion, because the reporter owns stdout and writes under its own mutex,
@@ -607,9 +629,10 @@ and exits 1 with nothing written or requested. The destructor does not run
 for a constructor that throws, so any failure after `glfwInit` succeeded
 (creating the window, GLEW on Linux, the texture-size check, the shaders)
 destroys the window, if there is one, and calls `glfwTerminate` before the
-exception leaves the constructor. On Linux, `GLEW_ERROR_NO_GLX_DISPLAY` from
-`glewInit` is not a failure: GLEW 2.2 built for GLX returns it for an EGL
-context, as GLFW 3.4 makes them on Wayland. On macOS, GLFW is told not to
+exception leaves the constructor. On Linux (untested),
+`GLEW_ERROR_NO_GLX_DISPLAY` from `glewInit` is not a failure: GLEW 2.2 built
+for GLX returns it for an EGL context, as GLFW 3.4 makes them on Wayland. On
+macOS, GLFW is told not to
 change the working directory (`GLFW_COCOA_CHDIR_RESOURCES`), which it would
 otherwise do for an executable that macOS takes for a bundle (a `Resources`
 directory beside it, in a directory named after it), so a relative
@@ -646,7 +669,8 @@ window closes when the run finishes and `main` destroys the sink.
    only through the run's future. The probe sends no request. An error exits
    1, dry run or not.
 6. `--dry-run`: print the plan, which says whether the output will be
-   created, resumed or overwritten, and exit 0.
+   created, resumed or overwritten and how requests would be secured (the
+   `tls:` line of section 5), and exit 0.
 7. Choose the sink: `PreviewWindow` if `--preview`, else `ConsoleReporter`.
    It comes before the first write, so a window that cannot open (no
    display, a raster larger than the GPU's maximum texture size, shaders that
@@ -655,17 +679,21 @@ window closes when the run finishes and `main` destroys the sink.
 8. Write the file before the first request when it is new or, resumed, still
    has NaN pixels, so that a failing write, such as a full disk, exits 1
    before any request, and a new file can be opened while it fills.
-9. Install the handlers with `sigaction`, with `SA_RESTART`, SIGINT and
-   SIGTERM each blocking both while the handler runs. The first signal calls
+9. Install the handlers with `sigaction`, with `SA_RESTART`, SIGINT, SIGTERM
+   and SIGHUP each blocking all three while the handler runs. SIGHUP is
+   handled only when it is not ignored at startup: under `nohup` it stays
+   ignored, as `nohup` asks; otherwise closing the terminal stops the run
+   gracefully, as Ctrl-C does. The first signal calls
    `request(StopReason::Signal)` on the shared `StopToken`. A second one
    resets its signal to the default action, unblocks it and raises it, so the
-   process dies by that signal, which a shell reports as 130 for SIGINT and
-   143 for SIGTERM. Ctrl-C reaches the whole foreground job, so after a
-   second Ctrl-C a shell script or loop running the tool stops too, which an
-   ordinary exit, even with code 130, would not make it do. SIGPIPE is
-   ignored, also through `sigaction`. The handler touches nothing but a signal
-   counter and the token, both constant-initialised at namespace scope and
-   made of lock-free atomics, and makes only async-signal-safe calls.
+   process dies by that signal, which a shell reports as 130 for SIGINT, 143
+   for SIGTERM and 129 for SIGHUP. Ctrl-C reaches the whole foreground job,
+   so after a second Ctrl-C a shell script or loop running the tool stops
+   too, which an ordinary exit, even with code 130, would not make it do.
+   SIGPIPE is ignored, also through `sigaction`. The handler touches nothing
+   but a signal counter and the token, both constant-initialised at namespace
+   scope and made of lock-free atomics, and makes only async-signal-safe
+   calls.
 10. Construct the `Downloader`, whose constructor validates its options, and
     start `run()` on a `std::thread` of its own, which hands back the
     summary, or the exception that escaped, through a `std::promise`. A
@@ -679,9 +707,12 @@ window closes when the run finishes and `main` destroys the sink.
     raised writes the `stopping:` line of section 8.
 12. Collect the summary. An exception that escapes `run()` prints
     `error: <message>` (`error: unknown exception` for a type not derived
-    from `std::exception`) and exits 1. After a `--preview` run, whose sink
-    prints nothing, `main` prints the finish lines with `writeSummary`. Exit
-    with the code from section 10.
+    from `std::exception`) and exits 1. When `checkpointWriteFailed` is set,
+    `main` writes `error: <stop message>` to stderr, in one insertion: the
+    finish lines go to stdout, which may be a log file, and a full disk must
+    show on the terminal. After a `--preview` run, whose sink prints nothing,
+    `main` prints the finish lines with `writeSummary`. Exit with the code
+    from section 10.
 
 `StopToken` is the shared stop flag. `request(reason)` raises the flag and
 records the reason only if none is recorded yet, so the first reason wins;
@@ -703,15 +734,15 @@ one `ElevationClient` per worker id so each thread reuses its own connection.
 | 1 | usage, configuration or file error before any request, or an unexpected internal error during the run (message on stderr) |
 | 2 | stopped early (signal, window closed, consecutive failures, write error); checkpoint intact; rerun resumes |
 | 3 | ran to the end but `failed > 0`; rerun resumes |
-| 130 or 143 | killed by a second SIGINT (130) or SIGTERM (143), the signal's default action; Ctrl-C reaches the whole foreground job, so after a second Ctrl-C a calling shell script stops too |
+| 130, 143 or 129 | killed by a second SIGINT (130), SIGTERM (143) or SIGHUP (129), the signal's default action; Ctrl-C reaches the whole foreground job, so after a second Ctrl-C a calling shell script stops too |
 
 The codes are named in the header-only `src/app/ExitCodes.h` (namespace
 `demdl::cli`) as `kExitComplete`, `kExitError`, `kExitStopped` and
 `kExitIncomplete`. `main` returns them, and only `parseArgs`'s own 0 or 1
 after `--help`, `--version` or a usage error is passed on as it comes. A
-second signal has no code: the process dies by the signal, and 130 or 143 is
-how a shell reports that. The header's `exitCodeFor(const RunSummary&)` maps
-a finished run: `checkpointWriteFailed`
+second signal has no code: the process dies by the signal, and 130, 143 or
+129 is how a shell reports that. The header's
+`exitCodeFor(const RunSummary&)` maps a finished run: `checkpointWriteFailed`
 gives 2; otherwise `remainingNaN == 0` gives 0; otherwise
 `stopReason != None` gives 2; otherwise 3. Library code throws
 `std::runtime_error` for unrecoverable conditions before the run starts;
@@ -721,7 +752,8 @@ the only expected failure is a checkpoint write. It always sets
 the recorded one, and otherwise surfaces as `stopReason == WriteError`.
 Either way the run exits 2: the checkpoint rule comes first, and
 `remainingNaN` describes the last checkpoint written, where the failed row's
-pixels are still NaN. Jobs never throw across the future boundary; anything
+pixels are still NaN. `main` then also writes `error: <stop message>` to
+stderr. Jobs never throw across the future boundary; anything
 else that escapes `run()`, such as a fetcher factory failing for a later
 worker or an allocation failure, reaches `main` through the future and
 exits 1.
@@ -761,18 +793,23 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   1.3.0 requires for EPSG:4326); a layer name with spaces is percent-encoded,
   and so are non-ASCII bytes (`\xC3\xA9` gives `%C3%A9`) and `%` itself
   (`%25`); `featureInfoUrl` throws `std::invalid_argument` when the WMS URL
-  does not parse; parsing of `BAND 0: 123.45`, `BAND 0: -1.5`,
-  `BAND 0: 1086.25` and `BAND 0: 12.5 m` (12.5, trailing text is ignored);
-  `BAND 0: abc`, `BAND 0:`, `BAND 0:` followed by a newline and a number,
-  `BAND 0: nan`, `BAND 0: inf`, `BAND 0: -inf`, `BAND 0: 1e300`,
-  `BAND 0: -1e300` and `BAND 0: 3.5e38` (all ParseError), while
+  does not parse; parsing of `BAND 0: 123.45`, `BAND 0: -1.5` and
+  `BAND 0: 1086.25`; `BAND 0: 12.5 m`, `BAND 0: 12.5\tm`, `BAND 0: 12.5\r\n`
+  and `BAND 0: 12.5` at the end of the body (all 12.5: the number may end
+  the line or be followed by whitespace and any text); `BAND 0: abc`,
+  `BAND 0:`, `BAND 0:` followed by a newline and a number, `BAND 0: nan`,
+  `BAND 0: inf`, `BAND 0: -inf`, `BAND 0: 1e300`, `BAND 0: -1e300`,
+  `BAND 0: 3.5e38` and, with text glued to the number, `BAND 0: 1.#QNAN`,
+  `BAND 0: 12,5`, `BAND 0: 12abc`, `BAND 0: 12.5e` and
+  `<pre>BAND 0: 42.5</pre>` (all ParseError), while
   `BAND 0: 3.4028234663852886e38`, exactly `FLT_MAX`, is a Value; a body
   without the marker is NoData when it is plain, such as
   `GetFeatureInfo results:` or `GetFeatureInfo results:\nno bands\n`, but an
   empty body, a whitespace-only body, an HTML page, an XML
   `ows:ExceptionReport` after leading spaces and a `ServiceException` body are
-  ParseError, and the band marker wins over all of them when it is present; a
-  default-constructed `ParseResult` is a ParseError.
+  ParseError, and the band marker wins over all of them when it is present
+  (`<pre>BAND 0: 42.5\n</pre>` is 42.5); a default-constructed `ParseResult`
+  is a ParseError.
 - **RetryPolicy**: delays for attempts 0 to 7 with `unitRandom = 0.5` are
   0.5, 1, 2, 4, 8, 16, 30, 30 seconds; jitter bounds at 0 and 1.
 - **DemRaster**: create, set a value, NoData and NaN, save to a temp
@@ -806,7 +843,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   row is blocked saves the partial row and processes no further rows, and the
   two columns fetched are the first two submitted; the consecutive-failure
   limit stops the run with that reason and a message naming the error of the
-  failure that reached it, an intervening success resets the streak, and the
+  failure that reached it (`3 consecutive failures; last error: connection
+  refused`), an intervening success resets the streak, and the
   streak carries across rows; an exception thrown inside a
   job is recorded as a failed pixel and does not escape `run()`; a failed
   checkpoint stops the run before the next row, sets `checkpointWriteFailed`
@@ -852,10 +890,10 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `1h00m`; -1 and NaN give `0.0s`, and 1e300 and infinity give
   `1000000000h00m`. A resumed run's starting line reads exactly
   `starting: 2422720 pixels in 1100 rows remaining of 3670016 pixels in 1792 rows`.
-  Row 811 of 1792, saved with 2048 ok, 0 nodata and 3 failed in 41.2 s, with
+  Row 811 of 1792, saved with 2045 ok, 0 nodata and 3 failed in 41.2 s, with
   1247296 of 3670016 pixels done and 2422720 of the run's pixels unattempted,
   prints exactly
-  `row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.8 px/s  eta 13h31m`;
+  `row 812/1792  done 1247296/3670016 (34.0%)  row: 2045 ok 0 nodata 3 failed 41.2s  49.7 px/s  eta 13h32m`;
   a row saved with no elapsed time prints `0.0 px/s  eta --`; of eleven rows
   whose first took 1e6 s, the tenth line still prints `0.0 px/s`, and the
   eleventh, whose window has dropped that row, prints exactly
@@ -926,9 +964,9 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   without pixels left.
 - **End to end** (`[e2e]`), the only checks of the whole pipeline: the built
   `dl_elevation`, whose path is compiled into the tests, is started with
-  `posix_spawn` (stdout and stderr to files; SIGINT, SIGTERM and SIGPIPE at
-  their defaults and unblocked, so that `main`'s own settings are what is
-  tested; at most 20 s per child) against an `httplib::Server` on
+  `posix_spawn` (stdout and stderr to files; SIGINT, SIGTERM, SIGHUP and
+  SIGPIPE at their defaults and unblocked, so that `main`'s own settings are
+  what is tested; at most 20 s per child) against an `httplib::Server` on
   127.0.0.1. The server answers GetFeatureInfo for pixel (I, J) with
   `BAND 0: <I*10+J>`, a configurable NoData pixel with a plain body and a
   configurable failing pixel with HTTP 500; it counts requests and can hold
@@ -953,20 +991,29 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   exits 1 with `use --overwrite` exactly once, the load error's own, and no
   request; a complete file in a read-only directory exits 0 with no request
   and its bytes unchanged (skipped when running as root). A dry run
-  exits 0, prints the plan, starting with `dry run` and naming the loopback
-  URL in its first request, and neither requests nor writes anything; into a
+  exits 0, prints the plan, starting with `dry run`, with
+  `tls: none (plain http)` under the loopback `wms:` line and the loopback
+  URL in its first request, and neither requests nor writes anything; against
+  `https://127.0.0.1:1/wms`, which a dry run never contacts, the `tls:` line
+  reads `verify with the system trust store`, `verify with <bundle>` with
+  `--ca-bundle` and `certificate verification disabled (--insecure)` with
+  `--insecure`; into a
   directory that does not exist it exits 1 with
   `error: cannot write to <dir>: No such file or directory` and creates
-  nothing. On a 16 x 8 grid with `--threads 2`, SIGINT or SIGTERM sent while
-  the eleventh request is held prints
-  `stopping: interrupted; waiting for N in-flight requests` on stderr
+  nothing. On a 16 x 8 grid with `--threads 1`, SIGINT, SIGTERM or SIGHUP
+  sent while the eleventh request is held prints
+  `stopping: interrupted; waiting for 1 in-flight request` on stderr
   exactly once (the request stays held for 250 ms after the line appears,
   two more polls), then `stopped: interrupted` and
   `resume the remaining ...` on stdout, exits 2 and leaves a file with some
   pixels saved and some NaN, which a rerun completes with exit 0. With every
   request held, the file already exists with every pixel NaN, which only the
   save before the first request can have written; a second SIGINT, sent once
-  the first has been announced, then kills the process by SIGINT.
+  the first has been announced as `waiting for 2 in-flight requests`, then
+  kills the process by SIGINT. With the first row's requests held and the
+  output's directory then made read-only (skipped when running as root), the
+  run exits 2, writes `error: checkpoint write failed: ...` on stderr and
+  leaves the file byte-identical to the save before the first request.
   `--threads 0` exits 1 with `error: threads must be at least 1`, no request
   and no file.
 - **Palette** (`[palette]`), compiled into `demdl_tests` in every
@@ -1017,17 +1064,24 @@ written or requested, so with `--overwrite` an existing file keeps its bytes.
   (its two tags point at this commit), CLI11 `v2.7.2`, Catch2 `v3.16.0`.
 - libtiff via `find_package(TIFF REQUIRED)`; libgeotiff via `find_path` and
   `find_library` as in the previous build, now actually used.
+- No Homebrew Cellar path (`/usr/local/Cellar/<formula>/<version>`) appears
+  in `CMakeLists.txt`, because the next `brew upgrade` removes it. An
+  existing build tree can still hold such paths in its cache after
+  `brew upgrade` of `openssl@3`, `glfw` or `libtiff`: delete `build/` and
+  configure again.
 - Preview: glfw via pkg-config; on Apple link the OpenGL, Cocoa, IOKit and
-  CoreVideo frameworks; on Linux link GLEW and GL. All of them are PRIVATE to
-  `demdl_preview`, whose header includes none of theirs; as a static library
-  it still hands them on to the executable's link. No GLM, assimp, FreeType,
-  CoreAudio or AudioUnit.
+  CoreVideo frameworks; on Linux (untested) link GLEW and GL. All of them are
+  PRIVATE to `demdl_preview`, whose header includes none of theirs; as a
+  static library it still hands them on to the executable's link. No GLM,
+  assimp, FreeType, CoreAudio or AudioUnit.
 - `-Wall -Wextra` on every target of ours: `demdl`, `demdl_cli`,
   `dl_elevation`, `demdl_preview` and `demdl_tests`.
 - `.gitignore` adds `build*/`, `*.tif`, `*.tif.tmp`.
 - CLAUDE.md is rewritten for the new layout, commands, flags and test run.
 
-Toolchain requirement: AppleClang 15 on macOS, GCC 12 or Clang 15 on Linux.
+Toolchain requirement: AppleClang 15 on macOS. GCC 12 or Clang 15 are the
+intended compilers on Linux, but the Linux build is untested: it has never
+been compiled.
 `std::jthread` and `std::format` are unavailable on AppleClang 15 and are not
 used.
 
@@ -1043,9 +1097,11 @@ used.
 - A missing band is NoData, not 0 m, but only for a body that is not blank,
   has no `ServiceException` and does not start with markup; anything else
   without a finite in-range band value is retried, and a failed pixel stays
-  NaN for the next run.
+  NaN for the next run. A band value must stand alone: text glued to it, as in
+  `12,5`, makes the body a parse error rather than a stored 12.
 - Resume is per pixel, not "the row after the last non-zero sample".
-- Closing the window or pressing Ctrl-C saves and exits cleanly.
+- Closing the window, pressing Ctrl-C or closing the terminal saves and exits
+  cleanly.
 - Each worker reuses one connection instead of a new TLS handshake per pixel.
 
 ## 14. Future work (not in this iteration)

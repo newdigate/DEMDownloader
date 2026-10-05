@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dl_elevation` scrapes a Digital Elevation Model (DEM) from a WMS server one pixel at a time, one `GetFeatureInfo` request per pixel, into a single-band float32 GeoTIFF, and resumes safely across runs. The default source is the City of Cape Town's public server. macOS is the primary platform; the headless build also targets Linux.
+`dl_elevation` scrapes a Digital Elevation Model (DEM) from a WMS server one pixel at a time, one `GetFeatureInfo` request per pixel, into a single-band float32 GeoTIFF, and resumes safely across runs. The default source is the City of Cape Town's public server. macOS is the primary platform. The headless build is meant to work on Linux as well, but that is untested: it has never been compiled there.
 
 Design and plan: `docs/superpowers/specs/2026-10-04-cli-refactor-design.md` and `docs/superpowers/plans/2026-10-04-cli-refactor.md`.
 
@@ -28,9 +28,9 @@ One unit's tests by Catch2 tag, for example `./build/demdl_tests "[downloader]"`
 
 Options: `-DDL_ELEVATION_PREVIEW=OFF` drops the GLFW window and every OpenGL dependency (default ON on macOS, OFF elsewhere). `-DDL_ELEVATION_TESTS=OFF` skips Catch2.
 
-Homebrew packages: `libtiff libgeotiff openssl@3`, plus `pkg-config` and `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
+Homebrew packages: `libtiff libgeotiff openssl@3`, plus `pkg-config` and `glfw` for the preview (and `glew` on Linux, untested). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
 
-Running the tool makes real requests to a public server. Check a command line with `--dry-run`, and never start a live download just to see whether the build works:
+Running the tool makes real requests to a public server. Check a command line with `--dry-run`, which writes nothing and prints the plan, including a `tls:` line saying how requests would be secured, and never start a live download just to see whether the build works:
 
 ```bash
 ./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output "${TMPDIR:-/tmp}/simonstown.tif" --dry-run
@@ -54,10 +54,10 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 ## Behaviours to keep in mind
 
 - **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server has no elevation there and is final. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
-- **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp` and renames it over the output.
-- **Stopping is one flag.** SIGINT, SIGTERM, closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
-- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143.
-- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. `ca-bundle.crt` in the repository root is Mozilla's CA snapshot of 2019-01-22 and may be stale. The old program passed it to httplib but turned verification off, so it never verified anything. Try it with `--ca-bundle` only if the system trust store does not verify the server. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
+- **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp`, syncs it and renames it over the output, so every row with work rewrites 4 x width x height bytes: about 26 GB over a 2048 x 1792 run, and about 50 TB for a square grid near the 2^29-pixel limit, enough to wear an SSD noticeably. A save that fails, on a full disk for instance, stops the run with exit 2 and the last good checkpoint intact, and is reported on stderr as `error: checkpoint write failed: ...` as well as in the summary on stdout.
+- **Stopping is one flag.** SIGINT, SIGTERM, SIGHUP (closing the terminal; left ignored when the tool is started under `nohup`), closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
+- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143, and a second SIGHUP by SIGHUP, 129.
+- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. `ca-bundle.crt` in the repository root is Mozilla's CA snapshot of 2019-01-22, root certificates only. The old program passed it to httplib but turned verification off, so it never verified anything. `--ca-bundle` replaces the system trust store entirely rather than adding to it, so that file cannot supply an intermediate certificate the server fails to send, and it breaks chains whose root is newer than 2019. If verification fails, build a PEM file holding the server's intermediate certificate(s) and its root and pass that with `--ca-bundle`; never use `--insecure` for a long run. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
 - **Threading:** worker threads write distinct raster cells and own one `ElevationClient` each; sinks guard their own state; nothing prints from a signal handler.
 - The old single-file `main.cpp` and the `include/` LearnOpenGL boilerplate are gone. Do not resurrect them.
 
@@ -68,6 +68,7 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 - Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so it compiles `/usr/local/include/httplib.h` even when FetchContent supplies the pinned copy. After `brew upgrade cpp-httplib` moves past 0.46, the build silently compiles the newer header. Pin the formula with `brew pin cpp-httplib`, or bump the pin in `CMakeLists.txt` to match.
 - Policy CMP0156 is set to NEW so that `libdemdl.a` is linked once when a target names both `demdl` and `demdl_cli`, which links `demdl` itself. Without it, the Xcode 15 linker warns about a duplicate library. The block is guarded by `if(POLICY CMP0156)` because the minimum version, CMake 3.27, predates the policy, which arrived in 3.29.
 - Dependencies are pinned: cpp-httplib v0.46.1 (matches the Homebrew package), ctpl 437e135, CLI11 v2.7.2, Catch2 v3.16.0. Bump cpp-httplib together with the Homebrew package.
+- After `brew upgrade` of `openssl@3`, `glfw` or `libtiff`, an existing build tree may still point at Cellar paths that the upgrade removed: delete `build/` and configure again. Never hard-code `/usr/local/Cellar/<formula>/<version>` paths in `CMakeLists.txt`.
 
 ## Repository hygiene
 

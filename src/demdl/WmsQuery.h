@@ -29,10 +29,12 @@ std::string formatCoordinate(double degrees);
 std::string featureInfoUrl(const Config& cfg, int x, int y);
 
 // Classifies the text/plain body of a GetFeatureInfo response.
-// "BAND 0:" anywhere in the body is a band, whatever else the body says. The numeric prefix of the
-// rest of that line is the value: trailing text such as " m" is ignored, and the number must be on
-// the marker's own line. It is a Value only when finite and within float range (the raster stores
-// float32, so a Value always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
+// "BAND 0:" anywhere in the body is a band, whatever else the body says. The number that starts the
+// rest of that line is the value, and it must end the line or be followed by whitespace: trailing text
+// such as " m" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError, because a Value is stored
+// for good while a ParseError is retried. The number must be on the marker's own line. It is a Value
+// only when finite and within float range (the raster stores float32, so a Value always fits in a
+// float); no number, "nan", "inf" and 1e300 are ParseError.
 // Without the marker the body is NoData only when it is not blank (empty or only whitespace), does
 // not contain "ServiceException" and does not start with markup ('<' as the first non-whitespace
 // character). NoData is stored as -32768 and never re-requested, so any other body, such as an

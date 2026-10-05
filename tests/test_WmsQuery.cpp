@@ -70,14 +70,27 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
   CHECK_THAT(c.value, WithinAbs(1086.25, 1e-12));
 }
 
-TEST_CASE("the value is the numeric prefix of the marker's line", "[wmsquery]") {
-  // Text after the number is ignored.
-  const auto withUnit = parseElevation("BAND 0: 12.5 m");
-  REQUIRE(withUnit.kind == ParseResult::Kind::Value);
-  CHECK_THAT(withUnit.value, WithinAbs(12.5, 1e-12));
+TEST_CASE("the value is the number at the start of the marker's line", "[wmsquery]") {
+  // The number ends the body or the line, or whitespace follows it, and then any text may.
+  for (const char* body : {"BAND 0: 12.5 m", "BAND 0: 12.5\tm", "BAND 0: 12.5\r\n", "BAND 0: 12.5"}) {
+    CAPTURE(body);
+    const auto parsed = parseElevation(body);
+    REQUIRE(parsed.kind == ParseResult::Kind::Value);
+    CHECK_THAT(parsed.value, WithinAbs(12.5, 1e-12));
+  }
 
   // The number must be on the marker's own line.
   CHECK(parseElevation("BAND 0:\n5").kind == ParseResult::Kind::ParseError);
+}
+
+TEST_CASE("a number with other text glued to it is a parse error", "[wmsquery]") {
+  // strtod would read 1, 12, 12, 12.5 and 42.5 from these, and a stored value is never fetched again;
+  // a parse error is retried.
+  for (const char* body :
+       {"BAND 0: 1.#QNAN", "BAND 0: 12,5", "BAND 0: 12abc", "BAND 0: 12.5e", "<pre>BAND 0: 42.5</pre>"}) {
+    CAPTURE(body);
+    CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
+  }
 }
 
 TEST_CASE("a plain body without the band marker is NoData", "[wmsquery]") {
@@ -96,7 +109,7 @@ TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsqu
   CHECK(parseElevation(owsReport).kind == ParseResult::Kind::ParseError);
 
   // The band marker still wins over markup.
-  const auto wrapped = parseElevation("<pre>BAND 0: 42.5</pre>");
+  const auto wrapped = parseElevation("<pre>BAND 0: 42.5\n</pre>");
   REQUIRE(wrapped.kind == ParseResult::Kind::Value);
   CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
 }

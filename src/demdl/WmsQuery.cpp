@@ -17,6 +17,11 @@ bool isUnreserved(unsigned char c) {
          c == '.' || c == '_' || c == '~';
 }
 
+// Whitespace as isspace defines it in the C locale, without consulting the locale.
+bool isWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
 }  // namespace
 
 std::string percentEncode(std::string_view s) {
@@ -79,11 +84,16 @@ ParseResult parseElevation(std::string_view body) {
   const char* begin = token.c_str();
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
+  // The number must end the line or be followed by whitespace. strtod stops at the first character
+  // it cannot use, so "12,5", "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for
+  // good and never fetched again; as a parse error the pixel is retried.
+  const bool ended = end == begin + token.size() || isWhitespace(*end);
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
   // unfetched pixel and be requested again on every run. The raster stores float32, so values
   // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does
   // not matter, because no elevation is anywhere near 1e38.
-  if (end == begin || !std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
+  if (end == begin || !ended || !std::isfinite(value) ||
+      std::fabs(value) > std::numeric_limits<float>::max()) {
     return {ParseResult::Kind::ParseError, 0.0};
   }
   return {ParseResult::Kind::Value, value};

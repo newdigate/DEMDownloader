@@ -256,7 +256,7 @@ TEST_CASE("too many consecutive failures stop the run", "[downloader]") {
   const demdl::RunSummary summary = d.run();
 
   CHECK(summary.stopReason == StopReason::ConsecutiveFailures);
-  CHECK(summary.stopMessage == "server unreachable: 3 consecutive failures; last error: connection refused");
+  CHECK(summary.stopMessage == "3 consecutive failures; last error: connection refused");
   CHECK(summary.failed == 3);
   CHECK(f.calls.load() == 3);
   CHECK(summary.remainingNaN == 10);

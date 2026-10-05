@@ -126,8 +126,8 @@ RunSummary Downloader::run() {
   summary.stopReason = stop_.reason();
   summary.checkpointWriteFailed = checkpointWriteFailed;
   if (summary.stopReason == StopReason::ConsecutiveFailures) {
-    summary.stopMessage =
-        "server unreachable: " + std::to_string(options_.maxConsecutiveFailures) + " consecutive failures";
+    // Not "server unreachable": HTTP errors, unparseable bodies and certificate errors count as well.
+    summary.stopMessage = std::to_string(options_.maxConsecutiveFailures) + " consecutive failures";
     const std::lock_guard<std::mutex> lock(runTally.limitMutex);
     if (runTally.limitError) summary.stopMessage += "; last error: " + *runTally.limitError;
   } else {

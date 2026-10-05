@@ -166,10 +166,10 @@ struct Finished {
 };
 
 // dl_elevation started with `args`, stdin from /dev/null, stdout and stderr to files in `dir`. SIGINT,
-// SIGTERM and SIGPIPE start at their default actions and unblocked, whatever this process has (the
-// httplib::Server constructor ignores SIGPIPE here), so main's own settings are what the tests see. A
-// child still running when the object goes away is killed. Every wait fails at once, with the child's
-// stderr, when the child has ended before what it waits for.
+// SIGTERM, SIGHUP and SIGPIPE start at their default actions and unblocked, whatever this process has (the
+// httplib::Server constructor ignores SIGPIPE here, and nohup would ignore SIGHUP), so main's own settings
+// are what the tests see. A child still running when the object goes away is killed. Every wait fails at
+// once, with the child's stderr, when the child has ended before what it waits for.
 class Child {
  public:
   Child(const std::vector<std::string>& args, const std::filesystem::path& dir)
@@ -191,6 +191,7 @@ class Child {
     sigemptyset(&defaults);
     sigaddset(&defaults, SIGINT);
     sigaddset(&defaults, SIGTERM);
+    sigaddset(&defaults, SIGHUP);
     sigaddset(&defaults, SIGPIPE);
     sigset_t unblocked;
     sigemptyset(&unblocked);
@@ -293,14 +294,19 @@ Finished runToExit(const std::vector<std::string>& args, const std::filesystem::
   return child.wait();
 }
 
-// The example box on a width x height grid, fetched from `wms` into `output`, followed by `extra`.
-std::vector<std::string> commandLine(const LoopbackWms& wms, const std::filesystem::path& output, int width,
+// The example box on a width x height grid, fetched from `wmsUrl` into `output`, followed by `extra`.
+std::vector<std::string> commandLine(const std::string& wmsUrl, const std::filesystem::path& output, int width,
                                      int height, const std::vector<std::string>& extra) {
   std::vector<std::string> args{"--north", "-34.1845418", "--south", "-34.2163447", "--west", "18.4185791",
                                 "--east", "18.4625244", "--width", std::to_string(width), "--height",
-                                std::to_string(height), "--output", output.string(), "--wms-url", wms.url()};
+                                std::to_string(height), "--output", output.string(), "--wms-url", wmsUrl};
   args.insert(args.end(), extra.begin(), extra.end());
   return args;
+}
+
+std::vector<std::string> commandLine(const LoopbackWms& wms, const std::filesystem::path& output, int width,
+                                     int height, const std::vector<std::string>& extra) {
+  return commandLine(wms.url(), output, width, height, extra);
 }
 
 // Every pixel of the file holds I*10+J, except kNoData at `noData` and NaN at `failed` (pixelKeys, or -1).
@@ -463,9 +469,33 @@ TEST_CASE("a dry run prints the plan, makes no request and writes nothing", "[e2
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   CHECK(result.exitCode() == 0);
   CHECK_THAT(result.out, StartsWith("dry run"));
+  CHECK_THAT(result.out, ContainsSubstring("\n  wms: " + wms.url() + "\n  tls: none (plain http)\n"));
   CHECK_THAT(result.out, ContainsSubstring("  first request: " + wms.url() + "?SERVICE=WMS&"));
   CHECK(wms.requests.load() == 0);
   CHECK_FALSE(std::filesystem::exists(output));
+}
+
+TEST_CASE("the dry run names how https requests would be secured", "[e2e]") {
+  const std::string mode = GENERATE(as<std::string>{}, "trust store", "--ca-bundle", "--insecure");
+  CAPTURE(mode);
+  // A dry run sends nothing, so this https URL on a closed loopback port is never contacted.
+  const std::string url = "https://127.0.0.1:1/wms";
+  const TempDir dir;
+  const std::filesystem::path bundle = dir.path / "bundle.pem";
+  writeFile(bundle, "");  // --ca-bundle only requires that the file exists
+  std::vector<std::string> args = commandLine(url, dir.path / "dem.tif", 4, 3, {"--dry-run"});
+  std::string tls = "verify with the system trust store";
+  if (mode == "--ca-bundle") {
+    args.insert(args.end(), {"--ca-bundle", bundle.string()});
+    tls = "verify with " + bundle.string();
+  } else if (mode == "--insecure") {
+    args.push_back("--insecure");
+    tls = "certificate verification disabled (--insecure)";
+  }
+  const Finished result = runToExit(args, dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 0);
+  CHECK_THAT(result.out, ContainsSubstring("\n  wms: " + url + "\n  tls: " + tls + "\n"));
 }
 
 TEST_CASE("a dry run into a missing directory fails and creates nothing", "[e2e]") {
@@ -481,21 +511,23 @@ TEST_CASE("a dry run into a missing directory fails and creates nothing", "[e2e]
   CHECK_FALSE(std::filesystem::exists(missing));
 }
 
-TEST_CASE("a first SIGINT or SIGTERM stops after the requests in flight, and a rerun completes the file", "[e2e]") {
-  const int stopSignal = GENERATE(SIGINT, SIGTERM);
+TEST_CASE("a first SIGINT, SIGTERM or SIGHUP stops after the request in flight, and a rerun completes the file",
+          "[e2e]") {
+  const int stopSignal = GENERATE(SIGINT, SIGTERM, SIGHUP);
   CAPTURE(stopSignal);
   LoopbackWms wms;
   wms.holdAfter = 10;
   const TempDir dir;
   const std::filesystem::path output = dir.path / "dem.tif";
-  const std::vector<std::string> args = commandLine(wms, output, 16, 8, {"--threads", "2"});
+  const std::vector<std::string> args = commandLine(wms, output, 16, 8, {"--threads", "1"});
   {
     Child child(args, dir.path);
     // Ten requests are answered and the eleventh is held, so the run cannot end before main, which polls
-    // every 100 ms, has seen the stop and announced it. A fixed response delay would race that poll.
+    // every 100 ms, has seen the stop and announced it. A fixed response delay would race that poll. With
+    // one worker, exactly that request is in flight.
     child.awaitHeld(wms.gate, 1);
     child.sendSignal(stopSignal);
-    child.awaitStderr("stopping: interrupted; waiting for ");
+    child.awaitStderr("stopping: interrupted; waiting for 1 in-flight request\n");
     std::this_thread::sleep_for(250ms);  // at least two more polls with the token raised
     wms.gate.release();
     const Finished stopped = child.wait();
@@ -529,11 +561,32 @@ TEST_CASE("a second SIGINT ends the process by SIGINT, so a calling shell stops 
     CHECK(early.countNaN() == early.pixelCount());
   }
   child.sendSignal(SIGINT);
-  child.awaitStderr("stopping: interrupted");  // the first signal has been handled
+  child.awaitStderr("stopping: interrupted; waiting for 2 in-flight requests\n");  // the first was handled
   child.sendSignal(SIGINT);
   const Finished result = child.wait();
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   CHECK(result.termSignal() == SIGINT);
+}
+
+TEST_CASE("a checkpoint that cannot be written stops the run, says so on stderr and keeps the last save", "[e2e]") {
+  if (geteuid() == 0) SKIP("root ignores directory permissions");
+  LoopbackWms wms;
+  wms.holdAfter = 0;  // the first row's requests wait until the directory is read-only
+  const TempDir dir;
+  const std::filesystem::path sub = dir.path / "out";
+  REQUIRE(std::filesystem::create_directory(sub));
+  const std::filesystem::path output = sub / "dem.tif";
+  Child child(commandLine(wms, output, 4, 3, {"--threads", "2"}), dir.path);
+  child.awaitHeld(wms.gate, 2);
+  const std::string early = readFile(output);
+  REQUIRE_FALSE(early.empty());
+  const ReadOnlyDirectory readOnly(sub);  // stdout and stderr go to the writable TempDir
+  wms.gate.release();
+  const Finished result = child.wait();
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 2);
+  CHECK_THAT(result.err, ContainsSubstring("error: checkpoint write failed: "));
+  CHECK(fileHolds(output, early));
 }
 
 TEST_CASE("a usage error exits 1 before any request", "[e2e]") {

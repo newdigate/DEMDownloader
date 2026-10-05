@@ -869,14 +869,27 @@ TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsqu
   CHECK_THAT(c.value, WithinAbs(1086.25, 1e-12));
 }
 
-TEST_CASE("the value is the numeric prefix of the marker's line", "[wmsquery]") {
-  // Text after the number is ignored.
-  const auto withUnit = parseElevation("BAND 0: 12.5 m");
-  REQUIRE(withUnit.kind == ParseResult::Kind::Value);
-  CHECK_THAT(withUnit.value, WithinAbs(12.5, 1e-12));
+TEST_CASE("the value is the number at the start of the marker's line", "[wmsquery]") {
+  // The number ends the body or the line, or whitespace follows it, and then any text may.
+  for (const char* body : {"BAND 0: 12.5 m", "BAND 0: 12.5\tm", "BAND 0: 12.5\r\n", "BAND 0: 12.5"}) {
+    CAPTURE(body);
+    const auto parsed = parseElevation(body);
+    REQUIRE(parsed.kind == ParseResult::Kind::Value);
+    CHECK_THAT(parsed.value, WithinAbs(12.5, 1e-12));
+  }
 
   // The number must be on the marker's own line.
   CHECK(parseElevation("BAND 0:\n5").kind == ParseResult::Kind::ParseError);
+}
+
+TEST_CASE("a number with other text glued to it is a parse error", "[wmsquery]") {
+  // strtod would read 1, 12, 12, 12.5 and 42.5 from these, and a stored value is never fetched again;
+  // a parse error is retried.
+  for (const char* body :
+       {"BAND 0: 1.#QNAN", "BAND 0: 12,5", "BAND 0: 12abc", "BAND 0: 12.5e", "<pre>BAND 0: 42.5</pre>"}) {
+    CAPTURE(body);
+    CHECK(parseElevation(body).kind == ParseResult::Kind::ParseError);
+  }
 }
 
 TEST_CASE("a plain body without the band marker is NoData", "[wmsquery]") {
@@ -895,7 +908,7 @@ TEST_CASE("an empty, blank or markup body is a parse error, not NoData", "[wmsqu
   CHECK(parseElevation(owsReport).kind == ParseResult::Kind::ParseError);
 
   // The band marker still wins over markup.
-  const auto wrapped = parseElevation("<pre>BAND 0: 42.5</pre>");
+  const auto wrapped = parseElevation("<pre>BAND 0: 42.5\n</pre>");
   REQUIRE(wrapped.kind == ParseResult::Kind::Value);
   CHECK_THAT(wrapped.value, WithinAbs(42.5, 1e-12));
 }
@@ -992,10 +1005,12 @@ std::string formatCoordinate(double degrees);
 std::string featureInfoUrl(const Config& cfg, int x, int y);
 
 // Classifies the text/plain body of a GetFeatureInfo response.
-// "BAND 0:" anywhere in the body is a band, whatever else the body says. The numeric prefix of the
-// rest of that line is the value: trailing text such as " m" is ignored, and the number must be on
-// the marker's own line. It is a Value only when finite and within float range (the raster stores
-// float32, so a Value always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
+// "BAND 0:" anywhere in the body is a band, whatever else the body says. The number that starts the
+// rest of that line is the value, and it must end the line or be followed by whitespace: trailing text
+// such as " m" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError, because a Value is stored
+// for good while a ParseError is retried. The number must be on the marker's own line. It is a Value
+// only when finite and within float range (the raster stores float32, so a Value always fits in a
+// float); no number, "nan", "inf" and 1e300 are ParseError.
 // Without the marker the body is NoData only when it is not blank (empty or only whitespace), does
 // not contain "ServiceException" and does not start with markup ('<' as the first non-whitespace
 // character). NoData is stored as -32768 and never re-requested, so any other body, such as an
@@ -1026,6 +1041,11 @@ namespace {
 bool isUnreserved(unsigned char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
          c == '.' || c == '_' || c == '~';
+}
+
+// Whitespace as isspace defines it in the C locale, without consulting the locale.
+bool isWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
 }
 
 }  // namespace
@@ -1090,11 +1110,16 @@ ParseResult parseElevation(std::string_view body) {
   const char* begin = token.c_str();
   char* end = nullptr;
   const double value = std::strtod(begin, &end);
+  // The number must end the line or be followed by whitespace. strtod stops at the first character
+  // it cannot use, so "12,5", "1.#QNAN" and "12abc" would otherwise give 12, 1 and 12 m, stored for
+  // good and never fetched again; as a parse error the pixel is retried.
+  const bool ended = end == begin + token.size() || isWhitespace(*end);
   // strtod also accepts "nan" and "inf". Neither is an elevation, and a NaN would read as an
   // unfetched pixel and be requested again on every run. The raster stores float32, so values
   // above FLT_MAX are refused too. A handful just above would still round to FLT_MAX; that does
   // not matter, because no elevation is anywhere near 1e38.
-  if (end == begin || !std::isfinite(value) || std::fabs(value) > std::numeric_limits<float>::max()) {
+  if (end == begin || !ended || !std::isfinite(value) ||
+      std::fabs(value) > std::numeric_limits<float>::max()) {
     return {ParseResult::Kind::ParseError, 0.0};
   }
   return {ParseResult::Kind::Value, value};
@@ -1106,7 +1131,7 @@ ParseResult parseElevation(std::string_view body) {
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[wmsquery]"`
-Expected: `All tests passed (N assertions in 14 test cases)`.
+Expected: `All tests passed (N assertions in 15 test cases)`.
 
 - [ ] **Step 7: Commit**
 
@@ -3230,7 +3255,7 @@ TEST_CASE("too many consecutive failures stop the run", "[downloader]") {
   const demdl::RunSummary summary = d.run();
 
   CHECK(summary.stopReason == StopReason::ConsecutiveFailures);
-  CHECK(summary.stopMessage == "server unreachable: 3 consecutive failures; last error: connection refused");
+  CHECK(summary.stopMessage == "3 consecutive failures; last error: connection refused");
   CHECK(summary.failed == 3);
   CHECK(f.calls.load() == 3);
   CHECK(summary.remainingNaN == 10);
@@ -3634,8 +3659,8 @@ RunSummary Downloader::run() {
   summary.stopReason = stop_.reason();
   summary.checkpointWriteFailed = checkpointWriteFailed;
   if (summary.stopReason == StopReason::ConsecutiveFailures) {
-    summary.stopMessage =
-        "server unreachable: " + std::to_string(options_.maxConsecutiveFailures) + " consecutive failures";
+    // Not "server unreachable": HTTP errors, unparseable bodies and certificate errors count as well.
+    summary.stopMessage = std::to_string(options_.maxConsecutiveFailures) + " consecutive failures";
     const std::lock_guard<std::mutex> lock(runTally.limitMutex);
     if (runTally.limitError) summary.stopMessage += "; last error: " + *runTally.limitError;
   } else {
@@ -4577,14 +4602,15 @@ TEST_CASE("the starting line gives what is left and the whole", "[consolereporte
 TEST_CASE("a saved row prints progress, rate and ETA", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
-  // The run set out to fetch 2424771 pixels; this row attempts 2051 of them, which leaves 2422720.
-  reporter.onRunStarted(RunPlan{3670016, 2424771, 1184, 1792});
-  reporter.onRowSaved(RowReport{811, 1792, 2048, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
+  // The run set out to fetch 2424768 pixels; this row attempts 2048 of them, which leaves 2422720. The rate
+  // is 2048 / 41.2 = 49.7 px/s, and the ETA 2422720 / 2048 * 41.2 = 48738 s.
+  reporter.onRunStarted(RunPlan{3670016, 2424768, 1184, 1792});
+  reporter.onRowSaved(RowReport{811, 1792, 2045, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
   const std::string text = out.str();
   CHECK_THAT(text,
-             ContainsSubstring("starting: 2424771 pixels in 1184 rows remaining of 3670016 pixels in 1792 rows\n"));
-  CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed "
-                                     "41.2s  49.8 px/s  eta 13h31m"));
+             ContainsSubstring("starting: 2424768 pixels in 1184 rows remaining of 3670016 pixels in 1792 rows\n"));
+  CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2045 ok 0 nodata 3 failed "
+                                     "41.2s  49.7 px/s  eta 13h32m"));
 }
 
 TEST_CASE("a row without elapsed time prints no ETA", "[consolereporter]") {
@@ -4643,7 +4669,7 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
   RunSummary s;
-  s.pixelsFetched = 3669980;
+  s.pixelsFetched = 3657979;
   s.noData = 12034;
   s.failed = 3;
   s.remainingNaN = 3;
@@ -4651,7 +4677,7 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
   s.elapsed = std::chrono::duration<double>(50520.0);
   reporter.onRunFinished(s);
   CHECK_THAT(out.str(),
-             ContainsSubstring("done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
+             ContainsSubstring("done: 3657979 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
   CHECK_THAT(out.str(), ContainsSubstring("rerun with the same arguments to retry the 3 failed pixels"));
   CHECK_THAT(out.str(), !ContainsSubstring("stopped:"));
 
@@ -4715,7 +4741,7 @@ TEST_CASE("writeSummary writes the lines onRunFinished prints", "[consolereporte
   s.rowsSaved = 3;
   s.elapsed = std::chrono::duration<double>(30.0);
   s.stopReason = StopReason::ConsecutiveFailures;
-  s.stopMessage = "server unreachable: 100 consecutive failures; last error: http 503";
+  s.stopMessage = "100 consecutive failures; last error: http 503";
   std::ostringstream direct;
   writeSummary(direct, s);
   std::ostringstream viaSink;
@@ -5970,10 +5996,10 @@ struct Finished {
 };
 
 // dl_elevation started with `args`, stdin from /dev/null, stdout and stderr to files in `dir`. SIGINT,
-// SIGTERM and SIGPIPE start at their default actions and unblocked, whatever this process has (the
-// httplib::Server constructor ignores SIGPIPE here), so main's own settings are what the tests see. A
-// child still running when the object goes away is killed. Every wait fails at once, with the child's
-// stderr, when the child has ended before what it waits for.
+// SIGTERM, SIGHUP and SIGPIPE start at their default actions and unblocked, whatever this process has (the
+// httplib::Server constructor ignores SIGPIPE here, and nohup would ignore SIGHUP), so main's own settings
+// are what the tests see. A child still running when the object goes away is killed. Every wait fails at
+// once, with the child's stderr, when the child has ended before what it waits for.
 class Child {
  public:
   Child(const std::vector<std::string>& args, const std::filesystem::path& dir)
@@ -5995,6 +6021,7 @@ class Child {
     sigemptyset(&defaults);
     sigaddset(&defaults, SIGINT);
     sigaddset(&defaults, SIGTERM);
+    sigaddset(&defaults, SIGHUP);
     sigaddset(&defaults, SIGPIPE);
     sigset_t unblocked;
     sigemptyset(&unblocked);
@@ -6097,14 +6124,19 @@ Finished runToExit(const std::vector<std::string>& args, const std::filesystem::
   return child.wait();
 }
 
-// The example box on a width x height grid, fetched from `wms` into `output`, followed by `extra`.
-std::vector<std::string> commandLine(const LoopbackWms& wms, const std::filesystem::path& output, int width,
+// The example box on a width x height grid, fetched from `wmsUrl` into `output`, followed by `extra`.
+std::vector<std::string> commandLine(const std::string& wmsUrl, const std::filesystem::path& output, int width,
                                      int height, const std::vector<std::string>& extra) {
   std::vector<std::string> args{"--north", "-34.1845418", "--south", "-34.2163447", "--west", "18.4185791",
                                 "--east", "18.4625244", "--width", std::to_string(width), "--height",
-                                std::to_string(height), "--output", output.string(), "--wms-url", wms.url()};
+                                std::to_string(height), "--output", output.string(), "--wms-url", wmsUrl};
   args.insert(args.end(), extra.begin(), extra.end());
   return args;
+}
+
+std::vector<std::string> commandLine(const LoopbackWms& wms, const std::filesystem::path& output, int width,
+                                     int height, const std::vector<std::string>& extra) {
+  return commandLine(wms.url(), output, width, height, extra);
 }
 
 // Every pixel of the file holds I*10+J, except kNoData at `noData` and NaN at `failed` (pixelKeys, or -1).
@@ -6267,9 +6299,33 @@ TEST_CASE("a dry run prints the plan, makes no request and writes nothing", "[e2
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   CHECK(result.exitCode() == 0);
   CHECK_THAT(result.out, StartsWith("dry run"));
+  CHECK_THAT(result.out, ContainsSubstring("\n  wms: " + wms.url() + "\n  tls: none (plain http)\n"));
   CHECK_THAT(result.out, ContainsSubstring("  first request: " + wms.url() + "?SERVICE=WMS&"));
   CHECK(wms.requests.load() == 0);
   CHECK_FALSE(std::filesystem::exists(output));
+}
+
+TEST_CASE("the dry run names how https requests would be secured", "[e2e]") {
+  const std::string mode = GENERATE(as<std::string>{}, "trust store", "--ca-bundle", "--insecure");
+  CAPTURE(mode);
+  // A dry run sends nothing, so this https URL on a closed loopback port is never contacted.
+  const std::string url = "https://127.0.0.1:1/wms";
+  const TempDir dir;
+  const std::filesystem::path bundle = dir.path / "bundle.pem";
+  writeFile(bundle, "");  // --ca-bundle only requires that the file exists
+  std::vector<std::string> args = commandLine(url, dir.path / "dem.tif", 4, 3, {"--dry-run"});
+  std::string tls = "verify with the system trust store";
+  if (mode == "--ca-bundle") {
+    args.insert(args.end(), {"--ca-bundle", bundle.string()});
+    tls = "verify with " + bundle.string();
+  } else if (mode == "--insecure") {
+    args.push_back("--insecure");
+    tls = "certificate verification disabled (--insecure)";
+  }
+  const Finished result = runToExit(args, dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 0);
+  CHECK_THAT(result.out, ContainsSubstring("\n  wms: " + url + "\n  tls: " + tls + "\n"));
 }
 
 TEST_CASE("a dry run into a missing directory fails and creates nothing", "[e2e]") {
@@ -6285,21 +6341,23 @@ TEST_CASE("a dry run into a missing directory fails and creates nothing", "[e2e]
   CHECK_FALSE(std::filesystem::exists(missing));
 }
 
-TEST_CASE("a first SIGINT or SIGTERM stops after the requests in flight, and a rerun completes the file", "[e2e]") {
-  const int stopSignal = GENERATE(SIGINT, SIGTERM);
+TEST_CASE("a first SIGINT, SIGTERM or SIGHUP stops after the request in flight, and a rerun completes the file",
+          "[e2e]") {
+  const int stopSignal = GENERATE(SIGINT, SIGTERM, SIGHUP);
   CAPTURE(stopSignal);
   LoopbackWms wms;
   wms.holdAfter = 10;
   const TempDir dir;
   const std::filesystem::path output = dir.path / "dem.tif";
-  const std::vector<std::string> args = commandLine(wms, output, 16, 8, {"--threads", "2"});
+  const std::vector<std::string> args = commandLine(wms, output, 16, 8, {"--threads", "1"});
   {
     Child child(args, dir.path);
     // Ten requests are answered and the eleventh is held, so the run cannot end before main, which polls
-    // every 100 ms, has seen the stop and announced it. A fixed response delay would race that poll.
+    // every 100 ms, has seen the stop and announced it. A fixed response delay would race that poll. With
+    // one worker, exactly that request is in flight.
     child.awaitHeld(wms.gate, 1);
     child.sendSignal(stopSignal);
-    child.awaitStderr("stopping: interrupted; waiting for ");
+    child.awaitStderr("stopping: interrupted; waiting for 1 in-flight request\n");
     std::this_thread::sleep_for(250ms);  // at least two more polls with the token raised
     wms.gate.release();
     const Finished stopped = child.wait();
@@ -6333,11 +6391,32 @@ TEST_CASE("a second SIGINT ends the process by SIGINT, so a calling shell stops 
     CHECK(early.countNaN() == early.pixelCount());
   }
   child.sendSignal(SIGINT);
-  child.awaitStderr("stopping: interrupted");  // the first signal has been handled
+  child.awaitStderr("stopping: interrupted; waiting for 2 in-flight requests\n");  // the first was handled
   child.sendSignal(SIGINT);
   const Finished result = child.wait();
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   CHECK(result.termSignal() == SIGINT);
+}
+
+TEST_CASE("a checkpoint that cannot be written stops the run, says so on stderr and keeps the last save", "[e2e]") {
+  if (geteuid() == 0) SKIP("root ignores directory permissions");
+  LoopbackWms wms;
+  wms.holdAfter = 0;  // the first row's requests wait until the directory is read-only
+  const TempDir dir;
+  const std::filesystem::path sub = dir.path / "out";
+  REQUIRE(std::filesystem::create_directory(sub));
+  const std::filesystem::path output = sub / "dem.tif";
+  Child child(commandLine(wms, output, 4, 3, {"--threads", "2"}), dir.path);
+  child.awaitHeld(wms.gate, 2);
+  const std::string early = readFile(output);
+  REQUIRE_FALSE(early.empty());
+  const ReadOnlyDirectory readOnly(sub);  // stdout and stderr go to the writable TempDir
+  wms.gate.release();
+  const Finished result = child.wait();
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 2);
+  CHECK_THAT(result.err, ContainsSubstring("error: checkpoint write failed: "));
+  CHECK(fileHolds(output, early));
 }
 
 TEST_CASE("a usage error exits 1 before any request", "[e2e]") {
@@ -6466,10 +6545,10 @@ static_assert(std::atomic<int>::is_always_lock_free);
 
 constexpr const char* kOverwriteHint = "use --overwrite to start fresh or choose another --output\n";
 
-// SIGINT and SIGTERM. The first requests a stop, which main announces when it sees the token raised:
-// nothing may print here. A second ends the process by that signal's default action, so a calling shell
-// sees the signal and reports 130 or 143; after a second Ctrl-C, which reaches the whole foreground job, a
-// script or loop running this program stops too. Every call here is async-signal-safe.
+// SIGINT, SIGTERM and SIGHUP. The first requests a stop, which main announces when it sees the token
+// raised: nothing may print here. A second ends the process by that signal's default action, so a calling
+// shell sees the signal and reports 130, 143 or 129; after a second Ctrl-C, which reaches the whole
+// foreground job, a script or loop running this program stops too. Every call here is async-signal-safe.
 void onSignal(int number) {
   if (g_signalCount.fetch_add(1) == 0) {
     g_stopToken.request(demdl::StopReason::Signal);
@@ -6487,8 +6566,10 @@ void onSignal(int number) {
   raise(number);
 }
 
-// SIGINT and SIGTERM go to onSignal, each blocking both while it runs, and interrupted system calls
-// restart. SIGPIPE is ignored, which ElevationClient relies on: httplib's client does not suppress it.
+// SIGINT, SIGTERM and SIGHUP go to onSignal, each blocking all three while it runs, and interrupted
+// system calls restart. Closing the terminal thus stops the run as Ctrl-C does, but a SIGHUP ignored at
+// startup, as under nohup, stays ignored, since that is what nohup asks for. SIGPIPE is ignored, which
+// ElevationClient relies on: httplib's client does not suppress it.
 void installSignalHandlers() {
   struct sigaction stop {};
   stop.sa_handler = onSignal;
@@ -6496,8 +6577,13 @@ void installSignalHandlers() {
   sigemptyset(&stop.sa_mask);
   sigaddset(&stop.sa_mask, SIGINT);
   sigaddset(&stop.sa_mask, SIGTERM);
+  sigaddset(&stop.sa_mask, SIGHUP);
   sigaction(SIGINT, &stop, nullptr);
   sigaction(SIGTERM, &stop, nullptr);
+  struct sigaction hangup {};
+  if (sigaction(SIGHUP, nullptr, &hangup) == 0 && hangup.sa_handler != SIG_IGN) {
+    sigaction(SIGHUP, &stop, nullptr);
+  }
   struct sigaction ignore {};
   ignore.sa_handler = SIG_IGN;
   sigemptyset(&ignore.sa_mask);
@@ -6518,6 +6604,14 @@ class ThreadJoiner {
   std::thread& thread_;
 };
 
+// How the requests would be secured, for the dry run.
+std::string tlsDescription(const demdl::Config& cfg) {
+  if (!cfg.wmsUrl.starts_with("https://")) return "none (plain http)";
+  if (cfg.insecure) return "certificate verification disabled (--insecure)";
+  if (!cfg.caBundle.empty()) return "verify with " + cfg.caBundle;
+  return "verify with the system trust store";
+}
+
 // `outputPlan` says what the run would do with the file, such as "exists, will be resumed".
 void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, const char* outputPlan) {
   using demdl::formatCoordinate;
@@ -6527,6 +6621,7 @@ void printPlan(const demdl::Config& cfg, const demdl::DemRaster& raster, const c
             << "  grid: " << cfg.width << " x " << cfg.height << "\n"
             << "  output: " << cfg.output.string() << " (" << outputPlan << ")\n"
             << "  wms: " << cfg.wmsUrl << "\n"
+            << "  tls: " << tlsDescription(cfg) << "\n"
             << "  layer: " << cfg.layer << "\n"
             << "  threads: " << cfg.threads << ", max retries: " << cfg.maxRetries
             << ", max consecutive failures: " << cfg.maxConsecutiveFailures << "\n";
@@ -6696,8 +6791,10 @@ int main(int argc, char** argv) {
       announced = true;
       // One string in one insertion, on stderr: the reporter owns stdout and writes under its own mutex,
       // so a line written to stdout from here could land inside one of its lines.
+      const int inFlight = downloader->inFlight();
+      const char* const requests = inFlight == 1 ? " in-flight request\n" : " in-flight requests\n";
       const std::string line = std::string("stopping: ") + describe(g_stopToken.reason()) + "; waiting for " +
-                               std::to_string(downloader->inFlight()) + " in-flight requests\n";
+                               std::to_string(inFlight) + requests;
       std::cerr << line;
     }
   }
@@ -6712,6 +6809,9 @@ int main(int argc, char** argv) {
     std::cerr << "error: unknown exception\n";
     return cli::kExitError;
   }
+  // The finish lines go to stdout, which may be a log file, so a checkpoint that could not be written, on a
+  // full disk for instance, is reported on stderr as well, in one insertion as for the stopping line.
+  if (summary.checkpointWriteFailed) std::cerr << "error: " + summary.stopMessage + "\n";
 #ifdef DL_ELEVATION_HAVE_PREVIEW
   if (preview != nullptr) {
     writeSummary(std::cout, summary);  // the window prints nothing, so the finish lines come from here
@@ -6728,10 +6828,10 @@ Run: `cmake --build build && ./build/demdl_tests "[exitcodes]"`
 Expected: builds `dl_elevation` and `demdl_tests` with no warnings, then `All tests passed (N assertions in 7 test cases)`.
 
 Run: `./build/demdl_tests "[e2e]"`
-Expected: `All tests passed (N assertions in 11 test cases)` in about two seconds.
+Expected: `All tests passed (N assertions in 13 test cases)` in about 3.5 seconds.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 149`.
+Expected: `100% tests passed out of 152`.
 
 - [ ] **Step 8: Smoke-test the dry run (no network)**
 
@@ -6749,6 +6849,7 @@ dry run
   grid: 16 x 8
   output: /tmp/demdl-smoke.tif (will be created)
   wms: https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets
+  tls: verify with the system trust store
   layer: Elevation_CCT_GLM2019_5m_DEM
   threads: 8, max retries: 8, max consecutive failures: 100
   rows remaining: 8 of 8
@@ -7452,7 +7553,7 @@ Run: `cmake --build build && ./build/demdl_tests "[palette]"`
 Expected: builds `demdl_preview`, relinks `dl_elevation` and rebuilds `demdl_tests` with no warnings, then `All tests passed (N assertions in 5 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 154`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
+Expected: `100% tests passed out of 157`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --preview --dry-run; echo "exit $?"`
 Expected: the dry-run plan and `exit 0`. The "no preview support" error from Task 12 is gone, which proves the define reached `main.cpp`. No window opens because a dry run returns before the sink is created.
@@ -7548,7 +7649,7 @@ Run: `grep -rn "opengl.cmake.in\|include/shader\|include/" CMakeLists.txt src te
 Expected: `no references`.
 
 Run: `cmake --build build && ctest --test-dir build --output-on-failure`
-Expected: builds and `100% tests passed out of 154`.
+Expected: builds and `100% tests passed out of 157`.
 
 - [ ] **Step 3: Replace `CLAUDE.md`**
 
@@ -7559,7 +7660,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dl_elevation` scrapes a Digital Elevation Model (DEM) from a WMS server one pixel at a time, one `GetFeatureInfo` request per pixel, into a single-band float32 GeoTIFF, and resumes safely across runs. The default source is the City of Cape Town's public server. macOS is the primary platform; the headless build also targets Linux.
+`dl_elevation` scrapes a Digital Elevation Model (DEM) from a WMS server one pixel at a time, one `GetFeatureInfo` request per pixel, into a single-band float32 GeoTIFF, and resumes safely across runs. The default source is the City of Cape Town's public server. macOS is the primary platform. The headless build is meant to work on Linux as well, but that is untested: it has never been compiled there.
 
 Design and plan: `docs/superpowers/specs/2026-10-04-cli-refactor-design.md` and `docs/superpowers/plans/2026-10-04-cli-refactor.md`.
 
@@ -7583,9 +7684,9 @@ One unit's tests by Catch2 tag, for example `./build/demdl_tests "[downloader]"`
 
 Options: `-DDL_ELEVATION_PREVIEW=OFF` drops the GLFW window and every OpenGL dependency (default ON on macOS, OFF elsewhere). `-DDL_ELEVATION_TESTS=OFF` skips Catch2.
 
-Homebrew packages: `libtiff libgeotiff openssl@3`, plus `pkg-config` and `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
+Homebrew packages: `libtiff libgeotiff openssl@3`, plus `pkg-config` and `glfw` for the preview (and `glew` on Linux, untested). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
 
-Running the tool makes real requests to a public server. Check a command line with `--dry-run`, and never start a live download just to see whether the build works:
+Running the tool makes real requests to a public server. Check a command line with `--dry-run`, which writes nothing and prints the plan, including a `tls:` line saying how requests would be secured, and never start a live download just to see whether the build works:
 
 ```bash
 ./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output "${TMPDIR:-/tmp}/simonstown.tif" --dry-run
@@ -7609,10 +7710,10 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 ## Behaviours to keep in mind
 
 - **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server has no elevation there and is final. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
-- **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp` and renames it over the output.
-- **Stopping is one flag.** SIGINT, SIGTERM, closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
-- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143.
-- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. `ca-bundle.crt` in the repository root is Mozilla's CA snapshot of 2019-01-22 and may be stale. The old program passed it to httplib but turned verification off, so it never verified anything. Try it with `--ca-bundle` only if the system trust store does not verify the server. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
+- **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp`, syncs it and renames it over the output, so every row with work rewrites 4 x width x height bytes: about 26 GB over a 2048 x 1792 run, and about 50 TB for a square grid near the 2^29-pixel limit, enough to wear an SSD noticeably. A save that fails, on a full disk for instance, stops the run with exit 2 and the last good checkpoint intact, and is reported on stderr as `error: checkpoint write failed: ...` as well as in the summary on stdout.
+- **Stopping is one flag.** SIGINT, SIGTERM, SIGHUP (closing the terminal; left ignored when the tool is started under `nohup`), closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
+- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143, and a second SIGHUP by SIGHUP, 129.
+- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. `ca-bundle.crt` in the repository root is Mozilla's CA snapshot of 2019-01-22, root certificates only. The old program passed it to httplib but turned verification off, so it never verified anything. `--ca-bundle` replaces the system trust store entirely rather than adding to it, so that file cannot supply an intermediate certificate the server fails to send, and it breaks chains whose root is newer than 2019. If verification fails, build a PEM file holding the server's intermediate certificate(s) and its root and pass that with `--ca-bundle`; never use `--insecure` for a long run. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
 - **Threading:** worker threads write distinct raster cells and own one `ElevationClient` each; sinks guard their own state; nothing prints from a signal handler.
 - The old single-file `main.cpp` and the `include/` LearnOpenGL boilerplate are gone. Do not resurrect them.
 
@@ -7623,6 +7724,7 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 - Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so it compiles `/usr/local/include/httplib.h` even when FetchContent supplies the pinned copy. After `brew upgrade cpp-httplib` moves past 0.46, the build silently compiles the newer header. Pin the formula with `brew pin cpp-httplib`, or bump the pin in `CMakeLists.txt` to match.
 - Policy CMP0156 is set to NEW so that `libdemdl.a` is linked once when a target names both `demdl` and `demdl_cli`, which links `demdl` itself. Without it, the Xcode 15 linker warns about a duplicate library. The block is guarded by `if(POLICY CMP0156)` because the minimum version, CMake 3.27, predates the policy, which arrived in 3.29.
 - Dependencies are pinned: cpp-httplib v0.46.1 (matches the Homebrew package), ctpl 437e135, CLI11 v2.7.2, Catch2 v3.16.0. Bump cpp-httplib together with the Homebrew package.
+- After `brew upgrade` of `openssl@3`, `glfw` or `libtiff`, an existing build tree may still point at Cellar paths that the upgrade removed: delete `build/` and configure again. Never hard-code `/usr/local/Cellar/<formula>/<version>` paths in `CMakeLists.txt`.
 
 ## Repository hygiene
 
