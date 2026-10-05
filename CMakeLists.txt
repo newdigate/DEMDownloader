@@ -76,9 +76,9 @@ target_link_libraries(demdl PUBLIC httplib::httplib TIFF::TIFF ${GEOTIFF_LIBRARY
 target_compile_options(demdl PRIVATE -Wall -Wextra)
 target_compile_definitions(demdl PUBLIC DL_ELEVATION_VERSION="${PROJECT_VERSION}")
 
-# Cli.cpp is compiled once and shared by the executable and the tests.
+# Cli.cpp is compiled once and shared by the executable and the tests; only it includes CLI11.
 add_library(demdl_cli OBJECT src/app/Cli.cpp)
-target_link_libraries(demdl_cli PUBLIC demdl CLI11::CLI11)
+target_link_libraries(demdl_cli PUBLIC demdl PRIVATE CLI11::CLI11)
 target_compile_options(demdl_cli PRIVATE -Wall -Wextra)
 
 if(DL_ELEVATION_TESTS)

@@ -25,7 +25,7 @@
 
 ## Working conventions
 
-- Catch2 test names must not begin with `-`: ctest passes the name to the binary as an argument, and Catch2 reads it as an option, so such a case is skipped or fails with 'Unrecognised token'.
+- Catch2 test names must not begin with `-`: ctest passes the name to the binary as an argument, and Catch2 reads it as an option, so ctest reports such a case as passed without running it (a `--help` or `-h` prefix prints Catch2's usage and exits 0) or it fails with an option error such as 'Unrecognised token'.
 - Work on a branch: `git switch -c refactor/cli` before Task 1, or in a worktree per `superpowers:using-git-worktrees`.
 - Build directory is `build/`. Configure once with `cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B build`. Rebuild with `cmake --build build`. Run every test with `ctest --test-dir build --output-on-failure`. Run one unit's cases by tag, for example `./build/demdl_tests "[wmsquery]"`.
 - Headers start with `#pragma once`. Everything lives in `namespace demdl`; test helpers in `tests/` are in the global namespace.
@@ -4961,25 +4961,33 @@ Implements spec section 5 with CLI11 and the Cli tests in section 11.
 
 ```cpp
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "TempDir.h"
 #include "app/Cli.h"
 
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::StartsWith;
 using Catch::Matchers::WithinAbs;
 using demdl::Config;
 using demdl::cli::ParseOutcome;
 using demdl::cli::parseArgs;
 
 namespace {
+
+// argv[0] as the shell passes it when the program is run from the repository root.
+const char* const kArgv0 = "./build/dl_elevation";
 
 struct Parsed {
   Config config;
@@ -4989,7 +4997,7 @@ struct Parsed {
 };
 
 Parsed parse(std::vector<const char*> argv) {
-  argv.insert(argv.begin(), "dl_elevation");
+  argv.insert(argv.begin(), kArgv0);
   Parsed p;
   std::ostringstream out;
   std::ostringstream err;
@@ -5002,6 +5010,20 @@ Parsed parse(std::vector<const char*> argv) {
 const std::vector<const char*> kExample = {"--north", "-34.1845418", "--south",  "-34.2163447", "--west",
                                             "18.4185791", "--east", "18.4625244", "--width", "2048",
                                             "--height", "1792", "--output", "simonstown.tif"};
+
+// kExample with `flag` given `value`: the example's own value is replaced, or the pair is appended.
+std::vector<const char*> exampleWith(const char* flag, const char* value) {
+  std::vector<const char*> argv = kExample;
+  const auto it =
+      std::find_if(argv.begin(), argv.end(), [flag](const char* arg) { return std::string_view(arg) == flag; });
+  if (it == argv.end()) {
+    argv.push_back(flag);
+    argv.push_back(value);
+  } else {
+    *std::next(it) = value;
+  }
+  return argv;
+}
 
 // Creates an empty file and returns its path. The CLI checks only that a CA bundle exists.
 std::string createFile(const std::filesystem::path& path) {
@@ -5036,18 +5058,36 @@ TEST_CASE("the example command line fills the Config", "[cli]") {
   CHECK(p.config.validate().empty());
 }
 
+TEST_CASE("the -o short form sets the output", "[cli]") {
+  std::vector<const char*> argv = kExample;
+  const auto it = std::find(argv.begin(), argv.end(), std::string("--output"));
+  REQUIRE(it != argv.end());
+  *it = "-o";
+  const Parsed p = parse(argv);
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK(p.config.output == "simonstown.tif");
+}
+
 TEST_CASE("a missing required flag is a usage error", "[cli]") {
-  const std::vector<const char*> argv(kExample.begin() + 2, kExample.end());  // drop --north and its value
+  const std::string flag =
+      GENERATE(as<std::string>{}, "--north", "--south", "--west", "--east", "--width", "--height", "--output");
+  std::vector<const char*> argv = kExample;
+  const auto it = std::find(argv.begin(), argv.end(), flag);
+  REQUIRE(it != argv.end());
+  argv.erase(it, it + 2);  // the flag and its value
   const Parsed p = parse(argv);
   CHECK(p.outcome.exitNow);
   CHECK(p.outcome.exitCode == 1);
-  CHECK_THAT(p.err, ContainsSubstring("--north"));
+  CHECK_THAT(p.err, StartsWith("error: "));
+  CHECK_THAT(p.err, ContainsSubstring(flag + " is required"));
 }
 
 TEST_CASE("the --help flag prints usage and exits successfully", "[cli]") {
   const Parsed p = parse({"--help"});
   CHECK(p.outcome.exitNow);
   CHECK(p.outcome.exitCode == 0);
+  CHECK_THAT(p.out, ContainsSubstring("dl_elevation [OPTIONS]"));
+  CHECK_THAT(p.out, !ContainsSubstring(kArgv0));  // the program's name, not the path it was run as
   CHECK_THAT(p.out, ContainsSubstring("--wms-url"));
   CHECK_THAT(p.out, ContainsSubstring("--max-consecutive-failures"));
   CHECK_THAT(p.out, ContainsSubstring("(1..64)"));
@@ -5121,27 +5161,64 @@ TEST_CASE("the --insecure and --ca-bundle flags together are a usage error", "[c
 }
 
 TEST_CASE("a value that does not convert is a usage error", "[cli]") {
+  // A plain whole number passes the CLI's check, but this one does not fit an int, so CLI11's conversion fails.
+  const Parsed p = parse(exampleWith("--threads", "99999999999"));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring("Could not convert: --threads"));
+}
+
+TEST_CASE("integer flags take only plain whole numbers", "[cli]") {
+  // CLI11 alone would read these as 64, 16, 1000, 2048, 1 and 0.
+  const auto [flag, value] = GENERATE(table<const char*, const char*>({{"--width", "0100"},
+                                                                       {"--width", "0x10"},
+                                                                       {"--width", "1_000"},
+                                                                       {"--width", "20,48"},
+                                                                       {"--width", "true"},
+                                                                       {"--max-retries", ""}}));
+  const Parsed p = parse(exampleWith(flag, value));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(std::string(flag) +
+                                      ": must be a whole number without leading zeros, separators or prefixes"));
+}
+
+TEST_CASE("coordinates take only plain decimals", "[cli]") {
+  // CLI11 alone would read "" as 0, "1,5" as 15 and "-34,18" as -3418, and accept a hex float, nan and inf.
+  const std::string value = GENERATE(as<std::string>{}, "", "1,5", "-34,18", "0x1p3", "nan", "inf");
+  const Parsed p = parse(exampleWith("--north", value.c_str()));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(
+                        "--north: must be a decimal number such as -34.1845418 (use '.' as the decimal separator)"));
+}
+
+TEST_CASE("coordinates may have an exponent or a bare leading or trailing point", "[cli]") {
+  const auto [value, expected] =
+      GENERATE(table<const char*, double>({{"1e-3", 0.001}, {".5", 0.5}, {"-34.", -34.0}}));
+  const Parsed p = parse(exampleWith("--north", value));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK_THAT(p.config.box.north, WithinAbs(expected, 1e-12));
+}
+
+TEST_CASE("a value that looks like a flag is a usage error", "[cli]") {
+  // Unchecked, "--output --dry-run" would take "--dry-run" as the path and start a real run.
+  const auto [flag, value] =
+      GENERATE(table<const char*, const char*>({{"--output", "--dry-run"}, {"--layer", "--verbose"}}));
+  const Parsed p = parse(exampleWith(flag, value));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(std::string(flag) + ": looks like a flag; is the value missing?"));
+}
+
+TEST_CASE("an unknown flag or a positional argument is a usage error", "[cli]") {
+  const std::string extra = GENERATE(as<std::string>{}, "--bogus", "extra");
   std::vector<const char*> argv = kExample;
-  argv.push_back("--threads");
-  argv.push_back("abc");
+  argv.push_back(extra.c_str());
   const Parsed p = parse(argv);
   CHECK(p.outcome.exitNow);
   CHECK(p.outcome.exitCode == 1);
-  CHECK_THAT(p.err, ContainsSubstring("--threads"));
-}
-
-TEST_CASE("integer flags read a leading 0 as octal and 0x as hex", "[cli]") {
-  // Pins CLI11's std::strtoll(..., 0) conversion so that an upgrade that changes it is noticed.
-  std::vector<const char*> argv = kExample;
-  REQUIRE(argv[8] == std::string("--width"));
-  argv[9] = "0100";
-  const Parsed octal = parse(argv);
-  REQUIRE_FALSE(octal.outcome.exitNow);
-  CHECK(octal.config.width == 64);
-  argv[9] = "0x10";
-  const Parsed hex = parse(argv);
-  REQUIRE_FALSE(hex.outcome.exitNow);
-  CHECK(hex.config.width == 16);
+  CHECK_THAT(p.err, ContainsSubstring("not expected: " + extra));
 }
 
 TEST_CASE("values that parse but are invalid are caught by validate", "[cli]") {
@@ -5159,9 +5236,9 @@ TEST_CASE("values that parse but are invalid are caught by validate", "[cli]") {
 Insert this block after the `target_compile_definitions(demdl ...)` line and before `if(DL_ELEVATION_TESTS)`:
 
 ```cmake
-# Cli.cpp is compiled once and shared by the executable and the tests.
+# Cli.cpp is compiled once and shared by the executable and the tests; only it includes CLI11.
 add_library(demdl_cli OBJECT src/app/Cli.cpp)
-target_link_libraries(demdl_cli PUBLIC demdl CLI11::CLI11)
+target_link_libraries(demdl_cli PUBLIC demdl PRIVATE CLI11::CLI11)
 target_compile_options(demdl_cli PRIVATE -Wall -Wextra)
 ```
 
@@ -5229,45 +5306,124 @@ struct [[nodiscard]] ParseOutcome {
 
 #include <CLI/CLI.hpp>
 
+#include <cstddef>
 #include <ostream>
 #include <string>
 
 namespace demdl::cli {
 
-ParseOutcome parseArgs(int argc, const char* const* argv, Config& config, std::ostream& out, std::ostream& err) {
-  CLI::App app{"Download a digital elevation model from a WMS server one pixel at a time into a GeoTIFF"};
-  app.set_version_flag("--version", std::string(DL_ELEVATION_VERSION));
+namespace {
 
+// The character tests are ASCII only, so the result does not depend on the locale.
+bool isDigit(char c) { return c >= '0' && c <= '9'; }
+
+// Moves i past a run of digits and returns how many there were.
+std::size_t skipDigits(const std::string& text, std::size_t& i) {
+  const std::size_t start = i;
+  while (i < text.size() && isDigit(text[i])) ++i;
+  return i - start;
+}
+
+// An optional sign, digits with an optional fraction or a fraction alone, then an optional exponent:
+// 12, 12., .5, -34.1845418, 1e-3.
+bool isPlainDecimal(const std::string& text) {
+  std::size_t i = 0;
+  if (i < text.size() && (text[i] == '+' || text[i] == '-')) ++i;
+  std::size_t digits = skipDigits(text, i);
+  if (i < text.size() && text[i] == '.') {
+    ++i;
+    digits += skipDigits(text, i);
+  }
+  if (digits == 0) return false;
+  if (i < text.size() && (text[i] == 'e' || text[i] == 'E')) {
+    ++i;
+    if (i < text.size() && (text[i] == '+' || text[i] == '-')) ++i;
+    if (skipDigits(text, i) == 0) return false;
+  }
+  return i == text.size();
+}
+
+// An optional '-', then digits without a leading zero; "0" itself is allowed.
+bool isPlainInteger(const std::string& text) {
+  if (text == "0") return true;
+  const std::size_t first = text.starts_with('-') ? 1 : 0;
+  if (first == text.size() || text[first] == '0') return false;
+  for (std::size_t i = first; i < text.size(); ++i) {
+    if (!isDigit(text[i])) return false;
+  }
+  return true;
+}
+
+// The checks below return an empty string for an acceptable value, otherwise the problem.
+
+std::string checkDecimal(const std::string& text) {
+  if (isPlainDecimal(text)) return {};
+  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator)";
+}
+
+std::string checkWholeNumber(const std::string& text) {
+  if (isPlainInteger(text)) return {};
+  return "must be a whole number without leading zeros, separators or prefixes";
+}
+
+std::string checkNotFlagLike(const std::string& text) {
+  if (!text.starts_with("--")) return {};
+  return "looks like a flag; is the value missing?";
+}
+
+}  // namespace
+
+ParseOutcome parseArgs(int argc, const char* const* argv, Config& config, std::ostream& out, std::ostream& err) {
+  CLI::App app{"Download a digital elevation model from a WMS server one pixel at a time into a GeoTIFF",
+               "dl_elevation"};
+  app.set_version_flag("--version", std::string(DL_ELEVATION_VERSION));
+  app.failure_message(
+      [](const CLI::App* self, const CLI::Error& e) { return "error: " + CLI::FailureMessage::simple(self, e); });
+
+  // CLI11 2.7.2 runs these checks on the raw text before converting it. Without them it would read "" as 0,
+  // drop digit separators ('_', '\'' and the locale's thousands separator, ',' by default, so "1,5" is 15),
+  // take 0x, 0b, 0o, leading-zero octal and "true" as integers, and take hex floats, nan and inf as decimals.
+  const CLI::Validator decimal(checkDecimal, "");
+  const CLI::Validator wholeNumber(checkWholeNumber, "");
+  // A forgotten value would otherwise swallow the next flag: "--output --dry-run" would write to "--dry-run".
+  const CLI::Validator notFlagLike(checkNotFlagLike, "");
+
+  // Parsed into a local so that config.output stays untouched when parsing fails.
   std::string output;
-  app.add_option("--north", config.box.north, "northern edge, WGS84 decimal degrees")->required();
-  app.add_option("--south", config.box.south, "southern edge, WGS84 decimal degrees")->required();
-  app.add_option("--east", config.box.east, "eastern edge, WGS84 decimal degrees")->required();
-  app.add_option("--west", config.box.west, "western edge, WGS84 decimal degrees")->required();
-  // CLI11 2.7.2 converts every integer option with std::strtoll(..., 0): a leading 0 is octal
-  // (--width 0100 is 64) and 0x is hex. test_Cli.cpp pins this so that an upgrade that changes it is noticed.
-  app.add_option("--width", config.width, "grid width in pixels")->required();
-  app.add_option("--height", config.height, "grid height in pixels")->required();
-  app.add_option("-o,--output", output, "GeoTIFF to create or resume")->required();
-  app.add_option("--wms-url", config.wmsUrl, "WMS endpoint: scheme, host and path")->capture_default_str();
+  app.add_option("--north", config.box.north, "northern edge, WGS84 decimal degrees")->required()->check(decimal);
+  app.add_option("--south", config.box.south, "southern edge, WGS84 decimal degrees")->required()->check(decimal);
+  app.add_option("--east", config.box.east, "eastern edge, WGS84 decimal degrees")->required()->check(decimal);
+  app.add_option("--west", config.box.west, "western edge, WGS84 decimal degrees")->required()->check(decimal);
+  app.add_option("--width", config.width, "grid width in pixels")->required()->check(wholeNumber);
+  app.add_option("--height", config.height, "grid height in pixels")->required()->check(wholeNumber);
+  app.add_option("-o,--output", output, "GeoTIFF to create or resume")->required()->check(notFlagLike);
+  app.add_option("--wms-url", config.wmsUrl, "WMS endpoint: scheme, host and path")
+      ->capture_default_str()
+      ->check(notFlagLike);
   app.add_option("--layer", config.layer, "WMS layer name, taken unencoded; used for LAYERS and QUERY_LAYERS")
-      ->capture_default_str();
+      ->capture_default_str()
+      ->check(notFlagLike);
   // The ranges below are stated for the user; Config::validate alone enforces them.
   app.add_option("--threads", config.threads, "worker threads (1..64), one keep-alive connection each")
-      ->capture_default_str();
+      ->capture_default_str()
+      ->check(wholeNumber);
   app.add_option("--max-retries", config.maxRetries, "retries per pixel after the first attempt (0..100)")
-      ->capture_default_str();
+      ->capture_default_str()
+      ->check(wholeNumber);
   app.add_option("--max-consecutive-failures", config.maxConsecutiveFailures,
                  "stop after this many pixels fail in a row (at least 1)")
-      ->capture_default_str();
+      ->capture_default_str()
+      ->check(wholeNumber);
   CLI::Option* const caBundleOption =
       app.add_option("--ca-bundle", config.caBundle,
                      "PEM bundle for certificate verification (file must exist; excludes --insecure)")
+          ->check(notFlagLike)
           ->check(CLI::ExistingFile);
   app.add_flag("--insecure", config.insecure, "disable certificate verification (excludes --ca-bundle)")
       ->excludes(caBundleOption);
   app.add_flag("--preview", config.preview, "open the OpenGL preview window (fails if built without preview support)");
   app.add_flag("--overwrite", config.overwrite, "ignore an existing output and start fresh");
-  app.add_flag("--dry-run", config.dryRun, "validate and report the plan without making requests");
+  app.add_flag("--dry-run", config.dryRun, "validate and report the plan; make no requests and write nothing");
   app.add_flag("--verbose", config.verbose, "log every pixel, not just every row");
 
   try {
@@ -5286,7 +5442,7 @@ ParseOutcome parseArgs(int argc, const char* const* argv, Config& config, std::o
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[cli]"`
-Expected: `All tests passed (N assertions in 11 test cases)`.
+Expected: `All tests passed (N assertions in 16 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
 Expected: `100% tests passed` across every tag so far.
