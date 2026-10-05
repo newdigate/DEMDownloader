@@ -10,7 +10,7 @@ enum class PixelState { Queued, InFlight, Value, NoData, Failed };
 
 enum class StopReason { None, Signal, WindowClosed, ConsecutiveFailures, WriteError };
 
-[[nodiscard]] inline const char* describe(StopReason reason) {
+[[nodiscard]] constexpr const char* describe(StopReason reason) noexcept {
   switch (reason) {
     case StopReason::None: return "finished";
     case StopReason::Signal: return "interrupted";
@@ -32,9 +32,9 @@ struct PixelEvent {
   int x = 0;
   int y = 0;
   PixelState state = PixelState::Queued;
-  float value = 0.0f;  // valid when state == Value
+  float value = 0.0f;   // valid when state == Value
   int attempts = 0;
-  std::string error;   // set when state == Failed
+  std::string error{};  // set when state == Failed
 };
 
 struct RowReport {
@@ -56,11 +56,13 @@ struct RunSummary {
   int rowsSaved = 0;
   std::chrono::duration<double> elapsed{0.0};
   StopReason stopReason = StopReason::None;
-  std::string stopMessage;
+  std::string stopMessage{};
 };
 
-// Pixel events arrive from worker threads; row and run events from the downloader thread.
-// Implementations guard their own state.
+// Callbacks must not throw: pixel events are delivered inside pool jobs. Pixel events may arrive
+// concurrently from worker threads and from the downloader thread (Queued comes from the
+// downloader); row and run events come from the downloader thread. Implementations guard their
+// own state.
 class ProgressSink {
  public:
   virtual ~ProgressSink() = default;

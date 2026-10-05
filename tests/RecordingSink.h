@@ -9,8 +9,8 @@
 
 // Records every event. Reading the vectors is safe once the run has returned or been joined.
 struct RecordingSink : demdl::ProgressSink {
-  std::mutex m;
-  demdl::RunPlan plan;
+  mutable std::mutex m;
+  std::optional<demdl::RunPlan> plan;  // empty until onRunStarted
   std::vector<demdl::PixelEvent> pixels;
   std::vector<demdl::RowReport> rows;
   std::optional<demdl::RunSummary> summary;
@@ -32,7 +32,7 @@ struct RecordingSink : demdl::ProgressSink {
     summary = s;
   }
 
-  [[nodiscard]] int count(demdl::PixelState state) {
+  [[nodiscard]] int count(demdl::PixelState state) const {
     std::lock_guard<std::mutex> lock(m);
     return static_cast<int>(std::count_if(pixels.begin(), pixels.end(),
                                           [state](const demdl::PixelEvent& e) { return e.state == state; }));

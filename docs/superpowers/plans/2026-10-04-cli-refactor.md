@@ -2395,7 +2395,9 @@ Implements spec sections 4.3 (PixelFetcher), 8 (events and sink) and the stop fl
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "FakeFetcher.h"
 #include "RecordingSink.h"
@@ -2406,13 +2408,24 @@ using demdl::StopToken;
 
 TEST_CASE("a stop token keeps the first reason", "[stoptoken]") {
   StopToken t;
-  CHECK_FALSE(t.stop.load());
+  CHECK_FALSE(t.requested());
   CHECK(t.reason() == StopReason::None);
   t.request(StopReason::Signal);
-  CHECK(t.stop.load());
+  CHECK(t.requested());
   CHECK(t.reason() == StopReason::Signal);
   t.request(StopReason::WindowClosed);
+  CHECK(t.requested());
   CHECK(t.reason() == StopReason::Signal);
+}
+
+TEST_CASE("the flag handed to fetchers follows the token", "[stoptoken]") {
+  StopToken t;
+  const std::atomic<bool>& flag = t.flag();
+  CHECK_FALSE(flag.load());
+  CHECK(flag.load() == t.requested());
+  t.request(StopReason::WriteError);
+  CHECK(flag.load());
+  CHECK(flag.load() == t.requested());
 }
 
 TEST_CASE("describe names every reason", "[stoptoken]") {
@@ -2423,7 +2436,11 @@ TEST_CASE("describe names every reason", "[stoptoken]") {
   CHECK(std::string(demdl::describe(StopReason::WriteError)) == "checkpoint write failed");
 }
 
-TEST_CASE("the test doubles compile and behave", "[stoptoken]") {
+TEST_CASE("describe falls back for a value outside the enum", "[stoptoken]") {
+  CHECK(std::string(demdl::describe(static_cast<StopReason>(99))) == "unknown");
+}
+
+TEST_CASE("the test doubles compile and behave", "[doubles]") {
   FakeFetcher fetcher;
   std::atomic<int> calls{0};
   fetcher.calls = &calls;
@@ -2435,11 +2452,93 @@ TEST_CASE("the test doubles compile and behave", "[stoptoken]") {
   CHECK(calls.load() == 1);
 
   RecordingSink sink;
+  CHECK_FALSE(sink.plan.has_value());
+  sink.onRunStarted({100, 40, 2, 5});
+  REQUIRE(sink.plan.has_value());
+  CHECK(sink.plan->pixelsTodo == 40);
+  CHECK(sink.plan->rowsTotal == 5);
   sink.onPixelState({1, 2, demdl::PixelState::Failed, 0.0f, 2, "boom"});
   sink.onPixelState({1, 3, demdl::PixelState::Value, 4.5f, 1, {}});
   CHECK(sink.count(demdl::PixelState::Failed) == 1);
   CHECK(sink.count(demdl::PixelState::Value) == 1);
   CHECK(sink.pixels.size() == 2);
+  const RecordingSink& view = sink;
+  CHECK(view.count(demdl::PixelState::Failed) == 1);
+}
+
+TEST_CASE("a gate holds callers until released and reports arrivals", "[doubles]") {
+  Gate gate;
+  CHECK_FALSE(gate.awaitArrivals(1, std::chrono::milliseconds(10)));  // nobody has come yet
+
+  std::atomic<int> calls{0};
+  FakeFetcher first;
+  FakeFetcher second;
+  for (FakeFetcher* fetcher : {&first, &second}) {
+    fetcher->gate = &gate;
+    fetcher->calls = &calls;
+    fetcher->behaviour = [](int, int) { return noDataResult(); };
+  }
+  std::atomic<bool> stop{false};
+  demdl::FetchResult firstResult;
+  demdl::FetchResult secondResult;
+  std::thread a([&] { firstResult = first.fetch(1, 0, stop); });
+  std::thread b([&] { secondResult = second.fetch(2, 0, stop); });
+
+  const bool bothArrived = gate.awaitArrivals(2, std::chrono::seconds(5));
+  const bool atLeastOne = gate.awaitArrivals(1, std::chrono::milliseconds(10));
+  const bool thirdArrived = gate.awaitArrivals(3, std::chrono::milliseconds(10));
+  const int callsWhileGated = calls.load();
+  gate.release();
+  a.join();
+  b.join();
+
+  CHECK(bothArrived);
+  CHECK(atLeastOne);
+  CHECK_FALSE(thirdArrived);
+  CHECK(callsWhileGated == 0);
+  CHECK(calls.load() == 2);
+  CHECK(firstResult.kind == demdl::FetchResult::Kind::NoData);
+  CHECK(secondResult.kind == demdl::FetchResult::Kind::NoData);
+}
+
+TEST_CASE("a fake fetcher counts the calls that see the stop flag set", "[doubles]") {
+  StopToken token;
+  std::atomic<bool> otherFlag{false};
+  std::atomic<int> sawStop{0};
+  FakeFetcher fetcher;
+  fetcher.sawStop = &sawStop;
+  fetcher.behaviour = [](int, int) { return noDataResult(); };
+
+  CHECK(fetcher.fetch(0, 0, token.flag()).kind == demdl::FetchResult::Kind::NoData);
+  CHECK(sawStop.load() == 0);
+  token.request(StopReason::Signal);
+  CHECK(fetcher.fetch(1, 0, token.flag()).kind == demdl::FetchResult::Kind::NoData);
+  CHECK(sawStop.load() == 1);
+  // A fetcher handed some other flag does not see the stop, which is how a test notices a
+  // Downloader that passes the wrong one.
+  CHECK(fetcher.fetch(2, 0, otherFlag).kind == demdl::FetchResult::Kind::NoData);
+  CHECK(sawStop.load() == 1);
+}
+
+TEST_CASE("a fake fetcher reads the stop flag after the gate opens", "[doubles]") {
+  StopToken token;
+  Gate gate;
+  std::atomic<int> sawStop{0};
+  FakeFetcher fetcher;
+  fetcher.gate = &gate;
+  fetcher.sawStop = &sawStop;
+  fetcher.behaviour = [](int, int) { return noDataResult(); };
+
+  demdl::FetchResult result;
+  std::thread worker([&] { result = fetcher.fetch(0, 0, token.flag()); });
+  const bool arrived = gate.awaitArrivals(1, std::chrono::seconds(5));
+  token.request(StopReason::WindowClosed);  // raised while the fetcher is held at the gate
+  gate.release();
+  worker.join();
+
+  CHECK(arrived);
+  CHECK(sawStop.load() == 1);
+  CHECK(result.kind == demdl::FetchResult::Kind::NoData);
 }
 ```
 
@@ -2473,13 +2572,16 @@ namespace demdl {
 struct FetchResult {
   enum class Kind { Value, NoData, Failed };
   Kind kind = Kind::Failed;
-  float value = 0.0f;  // valid when kind == Value
-  int attempts = 0;    // attempts made, including the first
-  std::string error;   // last error when kind == Failed
+  float value = 0.0f;   // valid when kind == Value
+  int attempts = 0;     // attempts made, including the first
+  std::string error{};  // last error when kind == Failed
 };
 
-// Fetches one pixel. Implementations may block for retries but must return promptly once `stop`
-// is set. One instance serves one worker thread; instances need not be thread-safe.
+// Fetches one pixel. Implementations must not throw: fetch runs inside a pool job, so every
+// failure is reported through the result. They may block for retries, but once `stop` is set they
+// must neither start another attempt nor keep sleeping (a request already on the wire may run to
+// its timeout). `value` is finite when `kind == Value`. One instance serves one worker thread;
+// instances need not be thread-safe.
 class PixelFetcher {
  public:
   virtual ~PixelFetcher() = default;
@@ -2504,7 +2606,7 @@ enum class PixelState { Queued, InFlight, Value, NoData, Failed };
 
 enum class StopReason { None, Signal, WindowClosed, ConsecutiveFailures, WriteError };
 
-[[nodiscard]] inline const char* describe(StopReason reason) {
+[[nodiscard]] constexpr const char* describe(StopReason reason) noexcept {
   switch (reason) {
     case StopReason::None: return "finished";
     case StopReason::Signal: return "interrupted";
@@ -2526,9 +2628,9 @@ struct PixelEvent {
   int x = 0;
   int y = 0;
   PixelState state = PixelState::Queued;
-  float value = 0.0f;  // valid when state == Value
+  float value = 0.0f;   // valid when state == Value
   int attempts = 0;
-  std::string error;   // set when state == Failed
+  std::string error{};  // set when state == Failed
 };
 
 struct RowReport {
@@ -2550,11 +2652,13 @@ struct RunSummary {
   int rowsSaved = 0;
   std::chrono::duration<double> elapsed{0.0};
   StopReason stopReason = StopReason::None;
-  std::string stopMessage;
+  std::string stopMessage{};
 };
 
-// Pixel events arrive from worker threads; row and run events from the downloader thread.
-// Implementations guard their own state.
+// Callbacks must not throw: pixel events are delivered inside pool jobs. Pixel events may arrive
+// concurrently from worker threads and from the downloader thread (Queued comes from the
+// downloader); row and run events come from the downloader thread. Implementations guard their
+// own state.
 class ProgressSink {
  public:
   virtual ~ProgressSink() = default;
@@ -2573,27 +2677,36 @@ class ProgressSink {
 #pragma once
 
 #include <atomic>
+#include <cassert>
 
 #include "demdl/ProgressSink.h"
 
 namespace demdl {
 
-// Shared "please stop" flag plus the first reason given. request() always raises the flag but
-// keeps the first reason: later reasons are ignored. Both members are lock-free atomics and
-// request() touches nothing else, so a signal handler may call it.
+// Shared "please stop" flag plus the first reason given. request() raises the flag and keeps the
+// first reason: later reasons are ignored. Both members are lock-free atomics (see the
+// static_asserts) and request() touches nothing else, so a signal handler may call it.
 class StopToken {
  public:
-  std::atomic<bool> stop{false};
-
+  // Requires reason != StopReason::None (asserted in debug builds); None would raise the flag
+  // without saying why.
   void request(StopReason reason) noexcept {
+    assert(reason != StopReason::None);
     StopReason expected = StopReason::None;
+    // Reason first, then flag; both seq_cst, so a reader that observes the flag observes a reason.
     reason_.compare_exchange_strong(expected, reason);
-    stop.store(true);
+    stop_.store(true);
   }
+  [[nodiscard]] bool requested() const noexcept { return stop_.load(); }
   [[nodiscard]] StopReason reason() const noexcept { return reason_.load(); }
+  // The underlying flag, read-only, for handing to PixelFetcher::fetch.
+  [[nodiscard]] const std::atomic<bool>& flag() const noexcept { return stop_; }
 
  private:
+  std::atomic<bool> stop_{false};
   std::atomic<StopReason> reason_{StopReason::None};
+  static_assert(std::atomic<bool>::is_always_lock_free);
+  static_assert(std::atomic<StopReason>::is_always_lock_free);
 };
 
 }  // namespace demdl
@@ -2605,6 +2718,7 @@ class StopToken {
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -2613,7 +2727,8 @@ class StopToken {
 
 #include "demdl/PixelFetcher.h"
 
-// Blocks every caller of wait() until release() is called, and counts how many have arrived.
+// Blocks every caller of wait() until release() is called, and counts how many have arrived;
+// awaitArrivals() lets a test wait for that count without spinning.
 struct Gate {
   std::mutex m;
   std::condition_variable cv;
@@ -2621,8 +2736,9 @@ struct Gate {
   std::atomic<int> waiting{0};
 
   void wait() {
-    ++waiting;
     std::unique_lock<std::mutex> lock(m);
+    ++waiting;  // under the lock, so awaitArrivals() cannot miss the notification below
+    cv.notify_all();
     cv.wait(lock, [this] { return open; });
   }
   void release() {
@@ -2632,16 +2748,24 @@ struct Gate {
     }
     cv.notify_all();
   }
+  // True once at least n callers have reached wait(), false if the timeout passes first.
+  [[nodiscard]] bool awaitArrivals(int n, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(m);
+    return cv.wait_for(lock, timeout, [this, n] { return waiting.load() >= n; });
+  }
 };
 
-// Answers fetches from a lambda; optionally blocks on a Gate and counts calls.
+// Answers fetches from a lambda; optionally blocks on a Gate, counts calls, and counts the calls
+// that find `stop` set once the gate has opened.
 struct FakeFetcher : demdl::PixelFetcher {
   std::function<demdl::FetchResult(int x, int y)> behaviour;
   std::atomic<int>* calls = nullptr;
+  std::atomic<int>* sawStop = nullptr;
   Gate* gate = nullptr;
 
-  demdl::FetchResult fetch(int x, int y, const std::atomic<bool>&) override {
+  [[nodiscard]] demdl::FetchResult fetch(int x, int y, const std::atomic<bool>& stop) override {
     if (gate != nullptr) gate->wait();
+    if (sawStop != nullptr && stop.load()) ++*sawStop;
     if (calls != nullptr) ++*calls;
     return behaviour(x, y);
   }
@@ -2685,8 +2809,8 @@ struct FakeFetcher : demdl::PixelFetcher {
 
 // Records every event. Reading the vectors is safe once the run has returned or been joined.
 struct RecordingSink : demdl::ProgressSink {
-  std::mutex m;
-  demdl::RunPlan plan;
+  mutable std::mutex m;
+  std::optional<demdl::RunPlan> plan;  // empty until onRunStarted
   std::vector<demdl::PixelEvent> pixels;
   std::vector<demdl::RowReport> rows;
   std::optional<demdl::RunSummary> summary;
@@ -2708,7 +2832,7 @@ struct RecordingSink : demdl::ProgressSink {
     summary = s;
   }
 
-  [[nodiscard]] int count(demdl::PixelState state) {
+  [[nodiscard]] int count(demdl::PixelState state) const {
     std::lock_guard<std::mutex> lock(m);
     return static_cast<int>(std::count_if(pixels.begin(), pixels.end(),
                                           [state](const demdl::PixelEvent& e) { return e.state == state; }));
@@ -2718,8 +2842,8 @@ struct RecordingSink : demdl::ProgressSink {
 
 - [ ] **Step 9: Build and run the tests**
 
-Run: `cmake --build build && ./build/demdl_tests "[stoptoken]"`
-Expected: `All tests passed (N assertions in 3 test cases)`.
+Run: `cmake --build build && ./build/demdl_tests "[stoptoken],[doubles]"`
+Expected: `All tests passed (N assertions in 8 test cases)`.
 
 - [ ] **Step 10: Commit**
 

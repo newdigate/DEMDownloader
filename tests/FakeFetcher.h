@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -9,7 +10,8 @@
 
 #include "demdl/PixelFetcher.h"
 
-// Blocks every caller of wait() until release() is called, and counts how many have arrived.
+// Blocks every caller of wait() until release() is called, and counts how many have arrived;
+// awaitArrivals() lets a test wait for that count without spinning.
 struct Gate {
   std::mutex m;
   std::condition_variable cv;
@@ -17,8 +19,9 @@ struct Gate {
   std::atomic<int> waiting{0};
 
   void wait() {
-    ++waiting;
     std::unique_lock<std::mutex> lock(m);
+    ++waiting;  // under the lock, so awaitArrivals() cannot miss the notification below
+    cv.notify_all();
     cv.wait(lock, [this] { return open; });
   }
   void release() {
@@ -28,16 +31,24 @@ struct Gate {
     }
     cv.notify_all();
   }
+  // True once at least n callers have reached wait(), false if the timeout passes first.
+  [[nodiscard]] bool awaitArrivals(int n, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(m);
+    return cv.wait_for(lock, timeout, [this, n] { return waiting.load() >= n; });
+  }
 };
 
-// Answers fetches from a lambda; optionally blocks on a Gate and counts calls.
+// Answers fetches from a lambda; optionally blocks on a Gate, counts calls, and counts the calls
+// that find `stop` set once the gate has opened.
 struct FakeFetcher : demdl::PixelFetcher {
   std::function<demdl::FetchResult(int x, int y)> behaviour;
   std::atomic<int>* calls = nullptr;
+  std::atomic<int>* sawStop = nullptr;
   Gate* gate = nullptr;
 
-  demdl::FetchResult fetch(int x, int y, const std::atomic<bool>&) override {
+  [[nodiscard]] demdl::FetchResult fetch(int x, int y, const std::atomic<bool>& stop) override {
     if (gate != nullptr) gate->wait();
+    if (sawStop != nullptr && stop.load()) ++*sawStop;
     if (calls != nullptr) ++*calls;
     return behaviour(x, y);
   }

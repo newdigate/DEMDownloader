@@ -157,6 +157,12 @@ struct PixelFetcher {
 };
 ```
 
+`fetch` must not throw, because it runs inside a pool job: every failure is
+reported in the returned `FetchResult`. Once `stop` is set an implementation
+starts no further attempt and does not keep sleeping between attempts (a
+request already on the wire may run to its timeout), and `value` is finite
+whenever `kind == Value`.
+
 **ElevationClient** implements `PixelFetcher` over one `httplib::Client`
 constructed from the WMS origin, with keep-alive on, connection timeout 10 s,
 read timeout 30 s, write timeout 10 s, certificate verification enabled unless
@@ -341,8 +347,10 @@ struct ProgressSink {
 };
 ```
 
-Pixel events arrive from worker threads; row and run events from the
-downloader thread. Sinks guard their own state.
+Pixel events may arrive concurrently from worker threads and from the
+downloader thread (`Queued` comes from the downloader); row and run events come
+from the downloader thread. Sinks guard their own state. Callbacks must not
+throw, because pixel events are delivered inside pool jobs.
 
 **ConsoleReporter** writes to stdout. Per saved row:
 
@@ -384,14 +392,23 @@ when the run finishes.
 2. Load or create the `DemRaster` per section 7. Errors exit 1.
 3. `--dry-run`: print the plan, exit 0.
 4. Write the initial file if newly created.
-5. Install handlers: SIGINT and SIGTERM set the shared `std::atomic<bool>
-   stop` and record reason `Signal`; a second signal calls `_Exit(130)`.
-   SIGPIPE is set to `SIG_IGN`.
+5. Install handlers: SIGINT and SIGTERM call `request(StopReason::Signal)` on
+   the shared `StopToken`; a second signal calls `_Exit(130)`. SIGPIPE is set
+   to `SIG_IGN`.
 6. Choose the sink: `PreviewWindow` if `--preview`, else `ConsoleReporter`.
 7. Start the `Downloader` on its own thread.
 8. Headless: join the downloader. Preview: run the GLFW loop on the main
    thread until the run finishes or the window closes, then join.
 9. Print the summary and exit with the code from section 10.
+
+`StopToken` is the shared stop flag. `request(reason)` raises the flag and
+records the reason only if none is recorded yet, so the first reason wins;
+`reason` must not be `None`, and `request` touches only lock-free atomics, so a
+signal handler may call it. `requested()` says whether anyone has asked to
+stop, `reason()` returns the first reason given (`None` until then), and
+`flag()` returns the underlying `const std::atomic<bool>&`, which is what the
+`Downloader` passes to `PixelFetcher::fetch`. The flag itself is private, so
+nothing can raise it without giving a reason.
 
 The thread pool is ctpl with `--threads` workers. The fetcher factory creates
 one `ElevationClient` per worker id so each thread reuses its own connection.
