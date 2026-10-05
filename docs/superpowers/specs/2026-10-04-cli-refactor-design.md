@@ -191,9 +191,9 @@ columns; `rowsWithWork()`; `countNaN()`;
 with a `DemRaster&`, an output path, a fetcher factory
 `std::function<std::unique_ptr<PixelFetcher>(int workerId)>`, a
 `ProgressSink&`, a `StopToken&`, the thread count and the
-consecutive-failure limit. `run()` returns a `RunSummary`. Each pool job
-catches every exception and records its pixel as `Failed`, so no exception
-crosses the future boundary.
+consecutive-failure limit. `run()` returns a `RunSummary`. A pool job records
+an exception from the fetch or the sink's `InFlight` callback as a `Failed`
+pixel, and jobs are `noexcept`, so no exception crosses the future boundary.
 
 **ProgressSink** is the event interface in section 8. **ConsoleReporter** and
 **PreviewWindow** implement it.
@@ -319,11 +319,12 @@ emit onRunFinished(summary)
 stop)`; call `set(x, row, ...)` with the value or `kNoData`, or leave NaN;
 update the consecutive-failure counter (reset on `Value` or `NoData`,
 increment on `Failed`; reaching the limit requests a stop with reason
-`ConsecutiveFailures`); emit the final state. The job body runs inside a
-catch-all: an exception from the fetcher or the sink is recorded as
-`Failed` with the error `exception: <what()>` (or `unknown exception` for a
-type not derived from `std::exception`), counted and reported exactly like
-a failed fetch, so no exception reaches the pool.
+`ConsecutiveFailures`); emit the final state. The `InFlight` callback and the
+fetch run inside a catch-all that turns an exception into a `Failed` result
+with the error `exception: <what()>` (or `unknown exception` for a type not
+derived from `std::exception`), which is then counted and reported exactly
+like a failed fetch. The job is `noexcept`, so an exception anywhere else in
+it ends the process instead of reaching the pool.
 
 Each job writes a distinct cell and the save runs only after that row's
 futures have returned, so the raster needs no lock.
@@ -337,8 +338,9 @@ stop message gains `; checkpoint write failed: <message>`. The previous
 checkpoint is intact.
 
 `RunSummary` carries `pixelsFetched`, `noData`, `failed`, `rowsSaved`,
-`remainingNaN`, `elapsed` and `stopReason` in
-`{None, Signal, WindowClosed, ConsecutiveFailures, WriteError}`.
+`remainingNaN`, `elapsed`, `stopReason` in
+`{None, Signal, WindowClosed, ConsecutiveFailures, WriteError}`,
+`stopMessage` and `checkpointWriteFailed` (section 8).
 
 ## 8. Progress events and sinks
 
@@ -347,6 +349,9 @@ enum class PixelState { Queued, InFlight, Value, NoData, Failed };
 struct RunPlan   { uint64_t pixelsTotal, pixelsTodo; int rowsTodo; };
 struct RowReport { int row, ok, noData, failed; std::chrono::duration<double> elapsed;
                    uint64_t pixelsDoneTotal; };
+struct RunSummary { uint64_t pixelsFetched, noData, failed, remainingNaN; int rowsSaved;
+                    std::chrono::duration<double> elapsed; StopReason stopReason;
+                    std::string stopMessage; bool checkpointWriteFailed; };
 struct ProgressSink {
   virtual void onRunStarted(const RunPlan&) = 0;
   virtual void onPixelState(int x, int y, PixelState, float value) = 0;
@@ -354,6 +359,13 @@ struct ProgressSink {
   virtual void onRunFinished(const RunSummary&) = 0;
 };
 ```
+
+`remainingNaN` counts the NaN pixels in the last checkpoint written
+successfully, not those in memory, so a failed save can never make an
+incomplete file look complete. `checkpointWriteFailed` is set whenever a save
+threw. The stop message then reads `checkpoint write failed: <reason>`, or,
+when another stop reason came first and was kept, that reason's message
+followed by `; checkpoint write failed: <reason>`.
 
 Pixel events may arrive concurrently from worker threads and from the
 downloader thread (`Queued` comes from the downloader); row and run events come
@@ -435,8 +447,11 @@ Mapping: `remainingNaN == 0` gives 0; otherwise `stopReason != None` gives 2;
 otherwise 3. Library code throws `std::runtime_error` for unrecoverable
 conditions before the run starts; `main` catches at the top level, prints the
 message to stderr and exits 1. During the run the only expected failure is a
-checkpoint write, which surfaces as `stopReason == WriteError` and exits 2.
-Jobs never throw across the future boundary.
+checkpoint write. It always sets `checkpointWriteFailed`, even when another
+stop reason came first and stays the recorded one, and otherwise surfaces as
+`stopReason == WriteError`. Either way the run exits 2, because
+`remainingNaN` describes the last checkpoint written, where the failed row's
+pixels are still NaN. Jobs never throw across the future boundary.
 
 ## 11. Tests
 
@@ -488,12 +503,19 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 - **Downloader**: with `FakeFetcher` (value is a function of x and y;
   configurable NoData and failure sets; optional latch to block mid-row) and
   `RecordingSink`: only NaN pixels are fetched; rows without work emit no
-  events; one save per worked row, verified by reloading the file; requesting
-  a stop while a row is blocked saves the partial row and processes no further
-  rows; the consecutive-failure limit stops the run with that reason; an
-  exception thrown inside a job is recorded as a failed pixel and does not
-  escape `run()`; a checkpoint write that fails after a stop request keeps
-  the stop's reason and still reports the write failure in the stop message;
+  events; one save per worked row, verified by reloading the file; eight
+  workers on a 64 x 16 grid of mixed values, NoData and failures leave a file
+  that matches every cell and the summary counts; requesting a stop while a
+  row is blocked saves the partial row and processes no further rows, and the
+  two columns fetched are the first two submitted; the consecutive-failure
+  limit stops the run with that reason, an intervening success resets the
+  streak, and the streak carries across rows; an exception thrown inside a
+  job is recorded as a failed pixel and does not escape `run()`; a failed
+  checkpoint stops the run before the next row, sets `checkpointWriteFailed`
+  and leaves `remainingNaN` counting the file rather than memory, and one that
+  fails after a stop request keeps the stop's reason and still reports the
+  write failure; an exception from the fetcher factory leaves `run()`
+  unchanged before any callback, and a null fetcher is refused the same way;
   summary counts match.
 - **ElevationClient**: an in-process `httplib::Server` on a loopback port
   serves canned bodies: a value, a NoData body, a 500 followed by a 200 to

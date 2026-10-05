@@ -1,10 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_exception.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -18,6 +20,8 @@
 
 using namespace std::chrono_literals;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::Message;
+using Catch::Matchers::StartsWith;
 using demdl::BoundingBox;
 using demdl::DemRaster;
 using demdl::Downloader;
@@ -33,6 +37,11 @@ namespace {
 const BoundingBox kBox{-34.0, -34.3, 18.5, 18.1};
 
 float expectedValue(int x, int y) { return static_cast<float>(x * 10 + y); }
+
+// A type of its own, so a test can tell that an exception arrived unchanged.
+struct FactoryError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 struct Fixture {
   TempDir dir;
@@ -128,6 +137,63 @@ TEST_CASE("NoData and failures are recorded and counted", "[downloader]") {
   CHECK(f.sink.rows[0].pixelsDoneTotal == 3);
 }
 
+TEST_CASE("eight workers fill a mixed grid that matches the file and the summary", "[downloader]") {
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 16;
+  // Each pixel's outcome follows from its position.
+  const auto outcome = [](int x, int y) {
+    if ((x + 2 * y) % 7 == 0) return FetchResult::Kind::NoData;
+    if ((3 * x + y) % 11 == 0) return FetchResult::Kind::Failed;
+    return FetchResult::Kind::Value;
+  };
+  Fixture f;
+  auto raster = DemRaster::create(kWidth, kHeight, kBox, {});
+  Downloader d(raster, f.output, f.factory([outcome](int x, int y) {
+                 switch (outcome(x, y)) {
+                   case FetchResult::Kind::NoData: return noDataResult();
+                   case FetchResult::Kind::Failed: return failedResult("http 503");
+                   case FetchResult::Kind::Value: break;
+                 }
+                 return valueResult(expectedValue(x, y));
+               }),
+               f.sink, f.stop, DownloaderOptions{8, 100});
+
+  const demdl::RunSummary summary = d.run();
+
+  const auto onDisk = DemRaster::load(f.output);
+  std::uint64_t values = 0;
+  std::uint64_t noData = 0;
+  std::uint64_t failures = 0;
+  int mismatches = 0;
+  for (int y = 0; y < kHeight; ++y) {
+    for (int x = 0; x < kWidth; ++x) {
+      const float cell = onDisk.at(x, y);
+      switch (outcome(x, y)) {
+        case FetchResult::Kind::Value:
+          ++values;
+          if (cell != expectedValue(x, y)) ++mismatches;
+          break;
+        case FetchResult::Kind::NoData:
+          ++noData;
+          if (cell != DemRaster::kNoData) ++mismatches;
+          break;
+        case FetchResult::Kind::Failed:
+          ++failures;
+          if (!std::isnan(cell)) ++mismatches;
+          break;
+      }
+    }
+  }
+  CHECK(mismatches == 0);
+  CHECK(f.calls.load() == kWidth * kHeight);
+  CHECK(summary.stopReason == StopReason::None);
+  CHECK(summary.rowsSaved == kHeight);
+  CHECK(summary.pixelsFetched == values);
+  CHECK(summary.noData == noData);
+  CHECK(summary.failed == failures);
+  CHECK(summary.remainingNaN == failures);
+}
+
 TEST_CASE("a stop request saves the partial row and goes no further", "[downloader]") {
   Fixture f;
   auto raster = DemRaster::create(4, 2, kBox, {});
@@ -170,6 +236,11 @@ TEST_CASE("a stop request saves the partial row and goes no further", "[download
   CHECK(onDisk.countNaN() == 6);
   CHECK(onDisk.todoInRow(0).size() == 2);
   CHECK(onDisk.todoInRow(1).size() == 4);
+  // The pool takes jobs in submission order, so the two fetches were columns 0 and 1.
+  CHECK(onDisk.at(0, 0) == expectedValue(0, 0));
+  CHECK(onDisk.at(1, 0) == expectedValue(1, 0));
+  CHECK(std::isnan(onDisk.at(2, 0)));
+  CHECK(std::isnan(onDisk.at(3, 0)));
 }
 
 TEST_CASE("too many consecutive failures stop the run", "[downloader]") {
@@ -187,6 +258,38 @@ TEST_CASE("too many consecutive failures stop the run", "[downloader]") {
   CHECK(summary.remainingNaN == 10);
   CHECK(summary.rowsSaved == 1);
   CHECK(std::filesystem::exists(f.output));
+}
+
+TEST_CASE("an intervening success resets the failure streak", "[downloader]") {
+  Fixture f;
+  auto raster = DemRaster::create(6, 1, kBox, {});
+  // One worker takes the columns in order: failure, failure, value, failure, failure, failure.
+  Downloader d(raster, f.output, f.factory([](int x, int y) {
+                 if (x == 2) return valueResult(expectedValue(x, y));
+                 return failedResult("http 503");
+               }),
+               f.sink, f.stop, DownloaderOptions{1, 3});
+
+  const demdl::RunSummary summary = d.run();
+
+  CHECK(summary.stopReason == StopReason::ConsecutiveFailures);
+  CHECK(f.calls.load() == 6);  // without the reset the limit would trip on the fourth call
+  CHECK(summary.failed == 5);
+  CHECK(summary.pixelsFetched == 1);
+}
+
+TEST_CASE("the failure streak carries across rows", "[downloader]") {
+  Fixture f;
+  auto raster = DemRaster::create(2, 3, kBox, {});
+  Downloader d(raster, f.output, f.factory([](int, int) { return failedResult("connection refused"); }),
+               f.sink, f.stop, DownloaderOptions{1, 3});
+
+  const demdl::RunSummary summary = d.run();
+
+  CHECK(summary.stopReason == StopReason::ConsecutiveFailures);
+  CHECK(f.calls.load() == 3);  // both pixels of row 0, then the first of row 1
+  CHECK(summary.failed == 3);
+  CHECK(summary.rowsSaved == 2);
 }
 
 TEST_CASE("a complete raster makes no requests and writes nothing", "[downloader]") {
@@ -247,7 +350,48 @@ TEST_CASE("a write failure after a stop request is still reported", "[downloader
   const demdl::RunSummary summary = d.run();
 
   CHECK(summary.stopReason == StopReason::Signal);
-  CHECK_THAT(summary.stopMessage, ContainsSubstring("interrupted"));
-  CHECK_THAT(summary.stopMessage, ContainsSubstring("checkpoint write failed"));
+  CHECK(summary.checkpointWriteFailed);
+  CHECK_THAT(summary.stopMessage, StartsWith("interrupted; checkpoint write failed: "));
   CHECK(summary.rowsSaved == 0);
+}
+
+TEST_CASE("a failed checkpoint is reported and nothing after it runs", "[downloader]") {
+  Fixture f;
+  REQUIRE(std::filesystem::create_directory(f.output));  // the checkpoint cannot replace a directory
+  auto raster = DemRaster::create(3, 2, kBox, {});
+  Downloader d(raster, f.output, f.factory([](int x, int y) { return valueResult(expectedValue(x, y)); }),
+               f.sink, f.stop, DownloaderOptions{1, 100});
+
+  const demdl::RunSummary summary = d.run();
+
+  CHECK(summary.stopReason == StopReason::WriteError);
+  CHECK(summary.checkpointWriteFailed);
+  CHECK_THAT(summary.stopMessage, StartsWith("checkpoint write failed: "));
+  CHECK_THAT(summary.stopMessage, ContainsSubstring("cannot rename"));
+  CHECK(f.calls.load() == 3);  // row 1 is never fetched
+  CHECK(f.sink.rows.empty());
+  CHECK(summary.rowsSaved == 0);
+  CHECK(summary.remainingNaN == 6);  // row 0's values never reached the file
+}
+
+TEST_CASE("an exception from the fetcher factory escapes run() unchanged", "[downloader]") {
+  Fixture f;
+  auto raster = DemRaster::create(2, 1, kBox, {});
+  Downloader d(raster, f.output,
+               [](int) -> std::unique_ptr<demdl::PixelFetcher> { throw FactoryError("cannot create a client"); },
+               f.sink, f.stop, DownloaderOptions{2, 100});
+
+  CHECK_THROWS_AS(d.run(), FactoryError);
+  CHECK_FALSE(f.sink.plan.has_value());     // the fetchers are made before onRunStarted
+  CHECK_FALSE(f.sink.summary.has_value());  // and onRunFinished never comes
+}
+
+TEST_CASE("a null fetcher from the factory is refused before the run starts", "[downloader]") {
+  Fixture f;
+  auto raster = DemRaster::create(2, 1, kBox, {});
+  Downloader d(raster, f.output, [](int) { return std::unique_ptr<demdl::PixelFetcher>(); }, f.sink, f.stop,
+               DownloaderOptions{2, 100});
+
+  CHECK_THROWS_MATCHES(d.run(), std::invalid_argument, Message("fetcher factory returned null"));
+  CHECK_FALSE(f.sink.plan.has_value());
 }

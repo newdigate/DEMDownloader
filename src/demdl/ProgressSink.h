@@ -52,11 +52,12 @@ struct RunSummary {
   std::uint64_t pixelsFetched = 0;
   std::uint64_t noData = 0;
   std::uint64_t failed = 0;
-  std::uint64_t remainingNaN = 0;
+  std::uint64_t remainingNaN = 0;  // NaN pixels in the last successfully written file
   int rowsSaved = 0;
   std::chrono::duration<double> elapsed{0.0};
   StopReason stopReason = StopReason::None;
   std::string stopMessage{};
+  bool checkpointWriteFailed = false;  // a save threw, even if stopReason names an earlier reason
 };
 
 // Callbacks must not throw: pixel events are delivered inside pool jobs. Pixel events may arrive
