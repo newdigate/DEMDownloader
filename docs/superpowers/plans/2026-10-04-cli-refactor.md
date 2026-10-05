@@ -3581,7 +3581,7 @@ void Downloader::fetchPixel(PixelFetcher& fetcher, int x, int row, RowTally& row
       if (streak >= options_.maxConsecutiveFailures) {
         {
           const std::lock_guard<std::mutex> lock(runTally.limitMutex);
-          if (!runTally.limitError) runTally.limitError = result.error;  // the first to reach the limit
+          if (!runTally.limitError) runTally.limitError = std::move(result.error);  // the first to reach it
         }
         stop_.request(StopReason::ConsecutiveFailures);
       }
@@ -4016,6 +4016,42 @@ TEST_CASE("a missing CA bundle fails without retrying", "[elevationclient]") {
   CHECK(srv.hits[0].load() == 0);  // loading the bundle fails before any request is sent
 }
 
+TEST_CASE("a CA bundle that failed to load keeps failing with the same error", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  const TempDir dir;
+  CannedServer srv(certificate);
+  Config cfg = configFor(srv.url());
+  cfg.caBundle = (dir.path / "missing.pem").string();
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  // httplib loads the bundle once per client, so a second request would fail verification instead.
+  for (int fetch = 0; fetch < 2; ++fetch) {
+    const FetchResult r = client.fetch(0, 0, stop);
+    CHECK(r.kind == FetchResult::Kind::Failed);
+    CHECK(r.attempts == 1);
+    CHECK(r.error == "transport: " + httplib::to_string(httplib::Error::SSLLoadingCerts));
+  }
+  CHECK(srv.hits[0].load() == 0);
+}
+
+TEST_CASE("a certificate that does not cover the host name fails without retrying", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  const TempDir dir;
+  const std::filesystem::path bundle = dir.path / "bundle.pem";
+  certificate.writePem(bundle);
+  CannedServer srv(certificate);
+  // The certificate's only subjectAltName is IP:127.0.0.1, which the name localhost does not match.
+  Config cfg = configFor("https://localhost:" + std::to_string(srv.port) + "/wms");
+  cfg.caBundle = bundle.string();
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 1);
+  CHECK(r.error == "transport: " + httplib::to_string(httplib::Error::SSLServerHostnameVerification));
+  CHECK(srv.hits[0].load() == 0);  // the host name is checked before any request is sent
+}
+
 TEST_CASE("a blank unparseable body is described by its size", "[elevationclient]") {
   CHECK(describeUnparseableBody("") == "warning: first unparseable response body was 0 bytes of whitespace");
   CHECK(describeUnparseableBody(" \t\r\n") ==
@@ -4077,6 +4113,7 @@ Expected: FAIL with `Cannot find source file: src/demdl/ElevationClient.cpp`.
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -4096,10 +4133,12 @@ namespace demdl {
 //
 // Requests identify themselves as "dl_elevation/<version>". Timeouts: 10 s to connect, 10 s per
 // write, 30 s per read and 60 s overall per request, so a server trickling its answer cannot hold a
-// worker indefinitely. A stop cannot interrupt a request already on the wire, which ends within the
-// connection timeout plus the overall cap (70 s). The client relies on the process ignoring SIGPIPE,
-// as main arranges: httplib's client sets neither SO_NOSIGPIPE nor MSG_NOSIGNAL. Two warnings go to
-// stderr, each once per process across all instances: the error of the first failed attempt, and
+// worker indefinitely. A stop cannot interrupt a request already on the wire. Once connected, a
+// request ends within the 60 s overall cap, which counts from the start of the request; resolving,
+// connecting (per address) and each TLS handshake wait are bounded separately by the 10 s connection
+// timeout. The client relies on the process ignoring SIGPIPE, as main arranges: httplib's client
+// sets neither SO_NOSIGPIPE nor MSG_NOSIGNAL. Two warnings go to stderr, each once per process across
+// all instances: the error of the first failed attempt, marked "(retrying)" or "(not retried)", and
 // the first unparseable body.
 class ElevationClient : public PixelFetcher {
  public:
@@ -4113,9 +4152,11 @@ class ElevationClient : public PixelFetcher {
 
   // Failed attempts are retried per the policy, except certificate errors (a CA bundle that cannot
   // be loaded, a chain that does not verify, a certificate that does not cover the host): those fail
-  // at once, because only a configuration change cures them. An exception during an attempt becomes
-  // that attempt's error ("exception: ..." or "unknown exception") and is retried like any other
-  // failure. Not noexcept: building error text allocates.
+  // at once, because only a configuration change cures them. A CA bundle that failed to load stays
+  // failed: httplib loads it once per client, so every later fetch returns the same error, with
+  // attempts == 1, without sending a request. An exception during an attempt becomes that attempt's
+  // error ("exception: ..." or "unknown exception") and is retried like any other failure. Not
+  // noexcept: building error text allocates.
   [[nodiscard]] FetchResult fetch(int x, int y, const std::atomic<bool>& stop) override;
 
  private:
@@ -4124,6 +4165,7 @@ class ElevationClient : public PixelFetcher {
   std::unique_ptr<httplib::Client> client_;
   std::mt19937 rng_;
   std::uniform_real_distribution<double> unit_{0.0, 1.0};
+  std::optional<std::string> caBundleFailure_;  // the error of a failed CA-bundle load, once one failed
 };
 
 // The warning line for the first unparseable response body, without a trailing newline. A blank body
@@ -4180,11 +4222,15 @@ bool sleepUnlessStopped(std::chrono::milliseconds delay, const std::atomic<bool>
 
 // Writes the error of the first failed attempt in the process, once across all instances, so that a
 // wrong path, a bad CA bundle or an unverifiable chain shows within seconds even without --verbose.
-void logFirstFailureOnce(const std::string& error) noexcept {
+// The suffix says whether fetch retries, so that a transient failure does not look alarming.
+void logFirstFailureOnce(const std::string& error, bool retrying) noexcept {
   static std::once_flag flag;
   try {
     // stderr, so it cannot corrupt the progress lines on stdout.
-    std::call_once(flag, [&error] { std::cerr << "warning: first failed request: " + error + "\n"; });
+    std::call_once(flag, [&error, retrying] {
+      const char* const suffix = retrying ? " (retrying)" : " (not retried)";
+      std::cerr << "warning: first failed request: " + error + suffix + "\n";
+    });
   } catch (...) {
     // A warning must never become a failure of its own.
   }
@@ -4243,6 +4289,14 @@ ElevationClient::~ElevationClient() = default;
 
 FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) {
   FetchResult result;
+  if (caBundleFailure_) {
+    // httplib loads the CA bundle once per client, so a new request would fail verification instead
+    // and hide the cause. Report the load failure again without sending anything.
+    result.kind = FetchResult::Kind::Failed;
+    result.attempts = 1;
+    result.error = *caBundleFailure_;
+    return result;
+  }
   for (int attempt = 0;; ++attempt) {
     result.attempts = attempt + 1;
     std::string error;
@@ -4254,6 +4308,7 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
       if (!response) {
         error = "transport: " + httplib::to_string(response.error());
         retryable = !needsConfigurationChange(response.error());
+        if (response.error() == httplib::Error::SSLLoadingCerts) caBundleFailure_ = error;
       } else if (response->status != 200) {
         error = "http " + std::to_string(response->status);
       } else {
@@ -4275,8 +4330,9 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
     } catch (...) {
       error = "unknown exception";
     }
-    logFirstFailureOnce(error);
-    if (!retryable || attempt >= policy_.maxRetries || stop.load()) {
+    const bool retrying = retryable && attempt < policy_.maxRetries && !stop.load();
+    logFirstFailureOnce(error, retrying);
+    if (!retrying) {
       result.kind = FetchResult::Kind::Failed;
       result.error = std::move(error);
       return result;
@@ -4298,7 +4354,7 @@ Notes for the engineer: `httplib::Client` built from an `https://` origin is the
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[elevationclient]"`
-Expected: `All tests passed (N assertions in 18 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
+Expected: `All tests passed (N assertions in 20 test cases)`. The stop test takes about 0.2 s; the refused-connection tests are instant.
 
 - [ ] **Step 7: Commit**
 

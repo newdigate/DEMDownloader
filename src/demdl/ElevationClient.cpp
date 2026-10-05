@@ -40,11 +40,15 @@ bool sleepUnlessStopped(std::chrono::milliseconds delay, const std::atomic<bool>
 
 // Writes the error of the first failed attempt in the process, once across all instances, so that a
 // wrong path, a bad CA bundle or an unverifiable chain shows within seconds even without --verbose.
-void logFirstFailureOnce(const std::string& error) noexcept {
+// The suffix says whether fetch retries, so that a transient failure does not look alarming.
+void logFirstFailureOnce(const std::string& error, bool retrying) noexcept {
   static std::once_flag flag;
   try {
     // stderr, so it cannot corrupt the progress lines on stdout.
-    std::call_once(flag, [&error] { std::cerr << "warning: first failed request: " + error + "\n"; });
+    std::call_once(flag, [&error, retrying] {
+      const char* const suffix = retrying ? " (retrying)" : " (not retried)";
+      std::cerr << "warning: first failed request: " + error + suffix + "\n";
+    });
   } catch (...) {
     // A warning must never become a failure of its own.
   }
@@ -103,6 +107,14 @@ ElevationClient::~ElevationClient() = default;
 
 FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) {
   FetchResult result;
+  if (caBundleFailure_) {
+    // httplib loads the CA bundle once per client, so a new request would fail verification instead
+    // and hide the cause. Report the load failure again without sending anything.
+    result.kind = FetchResult::Kind::Failed;
+    result.attempts = 1;
+    result.error = *caBundleFailure_;
+    return result;
+  }
   for (int attempt = 0;; ++attempt) {
     result.attempts = attempt + 1;
     std::string error;
@@ -114,6 +126,7 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
       if (!response) {
         error = "transport: " + httplib::to_string(response.error());
         retryable = !needsConfigurationChange(response.error());
+        if (response.error() == httplib::Error::SSLLoadingCerts) caBundleFailure_ = error;
       } else if (response->status != 200) {
         error = "http " + std::to_string(response->status);
       } else {
@@ -135,8 +148,9 @@ FetchResult ElevationClient::fetch(int x, int y, const std::atomic<bool>& stop) 
     } catch (...) {
       error = "unknown exception";
     }
-    logFirstFailureOnce(error);
-    if (!retryable || attempt >= policy_.maxRetries || stop.load()) {
+    const bool retrying = retryable && attempt < policy_.maxRetries && !stop.load();
+    logFirstFailureOnce(error, retrying);
+    if (!retrying) {
       result.kind = FetchResult::Kind::Failed;
       result.error = std::move(error);
       return result;

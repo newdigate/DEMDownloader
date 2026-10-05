@@ -169,42 +169,50 @@ read timeout 30 s, write timeout 10 s, an overall cap of 60 s per request
 (`set_max_timeout`, so a server trickling its answer cannot hold a worker
 indefinitely), the User-Agent `dl_elevation/<version>`, certificate
 verification enabled unless `insecure`, and `set_ca_cert_path` when `caBundle`
-is set. A stop cannot interrupt a request already on the wire, which ends
-within the connection timeout plus the overall cap (70 s). The client relies
-on the process ignoring SIGPIPE (section 9), because httplib's client does
-not suppress it per socket. The constructor throws `std::invalid_argument`
-when the WMS URL does not parse or when the new client reports `is_valid()`
-false (httplib could not set it up, for example without a TLS context),
-because its methods could then dereference a null implementation. One
-instance per worker thread. `fetch` loops over attempts: HTTP 200 with a
-finite in-range band value is `Value`; HTTP 200 without the band marker is
-`NoData` only when the body is not blank, does not contain `ServiceException`
-and does not start with markup; any other status, a transport error, or
-`ParseError` (every other 200 body) is a failure that sleeps
-`RetryPolicy::delayFor` in 100 ms slices while checking `stop`, then retries.
-Certificate errors are the exception: a CA bundle that cannot be loaded, a
-chain that does not verify and a certificate that does not cover the host
-(httplib's `SSLLoadingCerts`, `SSLServerVerification` and
-`SSLServerHostnameVerification`) return `Failed` at once with the transport
-error, because only a configuration change cures them, and retrying would
-also hide the cause: httplib loads the bundle once per client, so a retry
-after a failed load reports the verification failure that follows instead.
-Exhausting retries returns `Failed`. Building the request target, the request
-and the parse run inside a `try`, so an exception becomes that attempt's
-error (`exception: <what>` or `unknown exception`) and is retried like any
-other failure; only an allocation failure while building the error text could
-still escape, which is why `fetch` is not `noexcept`.
+is set. A stop cannot interrupt a request already on the wire. Once connected,
+a request ends within the 60 s overall cap, which counts from the start of the
+request; resolving, connecting (per address) and each TLS handshake wait are
+bounded separately by the 10 s connection timeout. The client relies on the
+process ignoring SIGPIPE (section 9), because httplib's client does not
+suppress it per socket. The constructor throws `std::invalid_argument` when
+the WMS URL does not parse or when the new client reports `is_valid()` false
+(httplib could not set it up, for example without a TLS context), because its
+methods could then dereference a null implementation. One instance per worker
+thread. `fetch` loops over attempts: HTTP 200 with a finite in-range band
+value is `Value`; HTTP 200 without the band marker is `NoData` only when the
+body is not blank, does not contain `ServiceException` and does not start with
+markup; any other status, a transport error, or `ParseError` (every other 200
+body) is a failure that sleeps `RetryPolicy::delayFor` in 100 ms slices while
+checking `stop`, then retries. Certificate errors are the exception: a CA
+bundle that cannot be loaded, a chain that does not verify and a certificate
+that does not cover the host (httplib's `SSLLoadingCerts`,
+`SSLServerVerification` and `SSLServerHostnameVerification`) return `Failed`
+at once with the transport error, because only a configuration change cures
+them, and retrying would also hide the cause: httplib loads the bundle once
+per client, so a retry after a failed load reports the verification failure
+that follows instead. For the same reason a failed load is sticky: the client
+keeps the first `SSLLoadingCerts` error and answers every later fetch with it,
+as `Failed` with one attempt, without sending a request, so the stop message's
+last error still names the real cause. Exhausting retries returns `Failed`.
+Building the request target, the request and the parse run inside a `try`, so
+an exception becomes that attempt's error (`exception: <what>` or `unknown
+exception`) and is retried like any other failure; only an allocation failure
+while building the error text could still escape, which is why `fetch` is not
+`noexcept`.
 
 Two warnings go to stderr, never stdout, so they cannot corrupt the progress
 lines. Each is written once per process, across all workers, under its own
 `std::once_flag`, and writing one never throws. The first failed attempt of
-the run prints `warning: first failed request: <error>`, so a wrong path, a
-bad CA bundle or an unverifiable chain shows within seconds even without
-`--verbose`. The first `ParseError` body prints the line built by the pure
+the run prints `warning: first failed request: <error> (retrying)` when
+`fetch` will retry it, or `warning: first failed request: <error> (not
+retried)` when it will not (a certificate error, retries exhausted, or a stop
+requested), so a wrong path, a bad CA bundle or an unverifiable chain shows
+within seconds even without `--verbose`, and a transient failure does not look
+alarming. The first `ParseError` body prints the line built by the pure
 function `describeUnparseableBody`, which is exposed for tests: a blank body
-is reported by its byte count (`was N bytes of whitespace`), any other body
-by its first 200 bytes with every byte outside printable ASCII replaced by
-`.`, so the warning stays on one line and no control character, raw or
+is reported by its byte count (`was N bytes of whitespace`), any other body by
+its first 200 bytes with every byte outside printable ASCII replaced by `.`,
+so the warning stays on one line and no control character, raw or
 UTF-8-encoded, reaches the terminal.
 
 **DemRaster** holds `width`, `height`, `BoundingBox`, `RasterMetadata{layer,
@@ -560,27 +568,30 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   recovers (three requests), and a 200 `ServiceExceptionReport` that is
   retried and fails as `unparseable body` after three requests; a refused
   connection fails after the retries with a transport error, and a stop
-  request cuts the 10 s backoff after a 404 short (one attempt,
-  `stopped during backoff after: http 404`). Three fetches through one client
-  arrive from a single remote port, proving keep-alive reuse; the server
-  receives the decoded `BBOX`, `LAYERS`, `I` and `J` for pixel (2, 0) of the
-  example box on a 4 x 1 grid; a layer named `Elevation Layer+1&2%` arrives
-  intact in both `LAYERS` and `QUERY_LAYERS`, which locks httplib's
-  re-encoding of the query across upgrades; and every request carries exactly
-  one User-Agent, `dl_elevation/<version>`. Only decoded parameters are
-  compared, never the raw request target, because httplib re-encodes the
-  query (`%2C` goes out as `,`). TLS is tested on loopback against an
-  `httplib::SSLServer` whose self-signed EC P-256 certificate for
-  `IP:127.0.0.1` is generated at test time through the OpenSSL API, so no key
-  is committed: with the defaults, verification rejects it after one attempt
-  (`SSLServerVerification`) and the handler is never reached; `insecure`
-  accepts it; the certificate written to a temporary PEM file and passed as
-  the CA bundle makes it trusted; and a CA bundle path that does not exist
-  fails after one attempt (`SSLLoadingCerts`), again without reaching the
-  handler. `describeUnparseableBody` is tested directly: an empty and a
-  whitespace-only body give their byte counts, a 300-byte body shows exactly
-  200 bytes, and ESC, BEL, DEL and the UTF-8 bytes `C2 9B` become `.` on a
-  single line.
+  request cuts the 10 s backoff after a 404 short (one attempt, `stopped
+  during backoff after: http 404`). Three fetches through one client arrive
+  from a single remote port, proving keep-alive reuse; the server receives the
+  decoded `BBOX`, `LAYERS`, `I` and `J` for pixel (2, 0) of the example box on
+  a 4 x 1 grid; a layer named `Elevation Layer+1&2%` arrives intact in both
+  `LAYERS` and `QUERY_LAYERS`, which locks httplib's re-encoding of the query
+  across upgrades; and every request carries exactly one User-Agent,
+  `dl_elevation/<version>`. Only decoded parameters are compared, never the
+  raw request target, because httplib re-encodes the query (`%2C` goes out as
+  `,`). TLS is tested on loopback against an `httplib::SSLServer` whose
+  self-signed EC P-256 certificate for `IP:127.0.0.1` is generated at test
+  time through the OpenSSL API, so no key is committed: with the defaults,
+  verification rejects it after one attempt (`SSLServerVerification`) and the
+  handler is never reached; `insecure` accepts it; the certificate written to
+  a temporary PEM file and passed as the CA bundle makes it trusted; and a CA
+  bundle path that does not exist fails after one attempt (`SSLLoadingCerts`),
+  again without reaching the handler, and keeps failing with that same error,
+  one attempt each, on the next fetch; with the bundle trusted but the URL
+  naming `localhost`, which the certificate's only subjectAltName
+  `IP:127.0.0.1` does not cover, the host name check fails after one attempt
+  (`SSLServerHostnameVerification`) before any request reaches the handler.
+  `describeUnparseableBody` is tested directly: an empty and a whitespace-only
+  body give their byte counts, a 300-byte body shows exactly 200 bytes, and
+  ESC, BEL, DEL and the UTF-8 bytes `C2 9B` become `.` on a single line.
 - **Cli**: the example argv yields the expected Config; omitting `--north`
   fails; `--insecure` and `--ca-bundle` set their fields; `--threads 0`
   fails validation.

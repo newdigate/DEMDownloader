@@ -392,6 +392,42 @@ TEST_CASE("a missing CA bundle fails without retrying", "[elevationclient]") {
   CHECK(srv.hits[0].load() == 0);  // loading the bundle fails before any request is sent
 }
 
+TEST_CASE("a CA bundle that failed to load keeps failing with the same error", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  const TempDir dir;
+  CannedServer srv(certificate);
+  Config cfg = configFor(srv.url());
+  cfg.caBundle = (dir.path / "missing.pem").string();
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  // httplib loads the bundle once per client, so a second request would fail verification instead.
+  for (int fetch = 0; fetch < 2; ++fetch) {
+    const FetchResult r = client.fetch(0, 0, stop);
+    CHECK(r.kind == FetchResult::Kind::Failed);
+    CHECK(r.attempts == 1);
+    CHECK(r.error == "transport: " + httplib::to_string(httplib::Error::SSLLoadingCerts));
+  }
+  CHECK(srv.hits[0].load() == 0);
+}
+
+TEST_CASE("a certificate that does not cover the host name fails without retrying", "[elevationclient]") {
+  const LoopbackCertificate certificate;
+  const TempDir dir;
+  const std::filesystem::path bundle = dir.path / "bundle.pem";
+  certificate.writePem(bundle);
+  CannedServer srv(certificate);
+  // The certificate's only subjectAltName is IP:127.0.0.1, which the name localhost does not match.
+  Config cfg = configFor("https://localhost:" + std::to_string(srv.port) + "/wms");
+  cfg.caBundle = bundle.string();
+  ElevationClient client(cfg, fastPolicy());
+  std::atomic<bool> stop{false};
+  const FetchResult r = client.fetch(0, 0, stop);
+  CHECK(r.kind == FetchResult::Kind::Failed);
+  CHECK(r.attempts == 1);
+  CHECK(r.error == "transport: " + httplib::to_string(httplib::Error::SSLServerHostnameVerification));
+  CHECK(srv.hits[0].load() == 0);  // the host name is checked before any request is sent
+}
+
 TEST_CASE("a blank unparseable body is described by its size", "[elevationclient]") {
   CHECK(describeUnparseableBody("") == "warning: first unparseable response body was 0 bytes of whitespace");
   CHECK(describeUnparseableBody(" \t\r\n") ==

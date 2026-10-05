@@ -186,7 +186,7 @@ void Downloader::fetchPixel(PixelFetcher& fetcher, int x, int row, RowTally& row
       if (streak >= options_.maxConsecutiveFailures) {
         {
           const std::lock_guard<std::mutex> lock(runTally.limitMutex);
-          if (!runTally.limitError) runTally.limitError = result.error;  // the first to reach the limit
+          if (!runTally.limitError) runTally.limitError = std::move(result.error);  // the first to reach it
         }
         stop_.request(StopReason::ConsecutiveFailures);
       }
