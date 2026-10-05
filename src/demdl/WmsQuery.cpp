@@ -48,11 +48,14 @@ std::optional<double> leadingNumber(std::string_view rest) {
   return value;
 }
 
-// The text after the first `marker` that starts a line, at the start of the body or right after a
-// '\n', or nothing when no line starts with it.
+// The text after the first `marker` that starts a line, or nothing when no line starts with it. A line
+// starts at the start of the body or right after a '\n' or a '\r', the characters that end one in
+// leadingNumber, so a body with bare carriage returns for line endings keeps its lines.
 std::optional<std::string_view> afterLineStart(std::string_view body, std::string_view marker) {
   for (auto pos = body.find(marker); pos != std::string_view::npos; pos = body.find(marker, pos + 1)) {
-    if (pos == 0 || body[pos - 1] == '\n') return body.substr(pos + marker.size());
+    if (pos == 0 || body[pos - 1] == '\n' || body[pos - 1] == '\r') {
+      return body.substr(pos + marker.size());
+    }
   }
   return std::nullopt;
 }
@@ -110,10 +113,11 @@ ParseResult parseElevation(std::string_view body) {
   if (!height) return {ParseResult::Kind::ParseError, 0.0};
   // BAND 1 is the layer's mask, 255 where there is an elevation and 0 where there is none. At sea the
   // server answers "BAND 0: 0" with "BAND 1: 0", so the height alone would store a real 0 m for every
-  // sea pixel, for good. Only a line of its own counts, so the marker quoted inside another line cannot
-  // mark a pixel as no data, and a mask that does not parse is a parse error, retried, because a false
-  // NoData is permanent. Without a mask line the height stands, so layers and servers without a mask
-  // band keep working.
+  // sea pixel, for good. The mask is read from the first line that starts with "BAND 1:" (text may
+  // follow its number, as after the height), so the marker quoted inside another line cannot mark a
+  // pixel as no data. A mask that does not parse is a parse error, retried, because a false NoData is
+  // permanent, and the height is read first, so a mask of 0 never rescues an unusable one. Without a
+  // mask line the height stands, so layers and servers without a mask band keep working.
   const std::optional<std::string_view> maskText = afterLineStart(body, maskMarker);
   if (!maskText) return {ParseResult::Kind::Value, *height};
   const std::optional<double> mask = leadingNumber(*maskText);

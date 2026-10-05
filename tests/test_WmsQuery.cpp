@@ -119,6 +119,9 @@ TEST_CASE("a BAND 1 mask of 0 is NoData and any other mask keeps the BAND 0 valu
   const auto unmasked = parseElevation("BAND 0: 12.5\r\n");
   REQUIRE(unmasked.kind == ParseResult::Kind::Value);
   CHECK_THAT(unmasked.value, WithinAbs(12.5, 1e-12));
+
+  // The height comes first: a mask of 0 does not rescue an unusable one.
+  CHECK(parseElevation("BAND 0: x\r\nBAND 1: 0\r\n").kind == ParseResult::Kind::ParseError);
 }
 
 TEST_CASE("a BAND 1 without a usable number is a parse error, not NoData", "[wmsquery]") {
@@ -140,9 +143,19 @@ TEST_CASE("BAND 1 counts only at the start of a line", "[wmsquery]") {
     CHECK_THAT(parsed.value, WithinAbs(12.5, 1e-12));
   }
 
-  // At the start of the body, or after a bare line feed, it is the mask.
+  // At the start of the body, or after a line feed or a bare carriage return, it is the mask.
   CHECK(parseElevation("BAND 1: 0\nBAND 0: 12.5\n").kind == ParseResult::Kind::NoData);
   CHECK(parseElevation("BAND 0: 12.5\nBAND 1: 0\n").kind == ParseResult::Kind::NoData);
+  CHECK(parseElevation("BAND 0: 12.5\rBAND 1: 0\r").kind == ParseResult::Kind::NoData);
+
+  // A mention inside an earlier line does not end the search for the line that starts with it.
+  const auto mentionedFirst = parseElevation("FileName: BAND 1: 255\r\nBAND 0: 12.5\r\nBAND 1: 0\r\n");
+  CHECK(mentionedFirst.kind == ParseResult::Kind::NoData);
+
+  // The recorded sea answer with bare carriage returns for line endings keeps its mask.
+  std::string seaWithCarriageReturns(kRecordedSea);
+  std::erase(seaWithCarriageReturns, '\n');
+  CHECK(parseElevation(seaWithCarriageReturns).kind == ParseResult::Kind::NoData);
 }
 
 TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsquery]") {

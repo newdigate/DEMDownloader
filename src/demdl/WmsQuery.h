@@ -40,10 +40,12 @@ std::string featureInfoUrl(const Config& cfg, int x, int y);
 //   " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError. The number must be
 //   on the marker's own line, finite and within float range (the raster stores float32, so a Value
 //   always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
-// - The first line that starts with "BAND 1:" (at the start of the body or right after a '\n') is the
-//   mask, and its number is read by the same rules: 0 is NoData, any other number gives the height as
-//   the Value, and a mask that does not parse is ParseError, because a false NoData is permanent while
-//   a ParseError is only retried. "BAND 1:" inside another line is ignored.
+// - The first line that starts with "BAND 1:" (at the start of the body or right after a '\n' or a
+//   '\r', the characters that end a line) is the mask, and its number is read by the same rules: 0 is
+//   NoData, any other number gives the height as the Value, and a mask that does not parse is
+//   ParseError, because a false NoData is permanent while a ParseError is only retried. "BAND 1:"
+//   inside another line is ignored, and the search goes on past it. An unusable height is ParseError
+//   whatever the mask says.
 // - Without a mask line the height is the Value, so layers and servers without a mask band still work.
 // Relies on the C locale for the decimal point; nothing in this program calls setlocale.
 ParseResult parseElevation(std::string_view body);

@@ -918,6 +918,9 @@ TEST_CASE("a BAND 1 mask of 0 is NoData and any other mask keeps the BAND 0 valu
   const auto unmasked = parseElevation("BAND 0: 12.5\r\n");
   REQUIRE(unmasked.kind == ParseResult::Kind::Value);
   CHECK_THAT(unmasked.value, WithinAbs(12.5, 1e-12));
+
+  // The height comes first: a mask of 0 does not rescue an unusable one.
+  CHECK(parseElevation("BAND 0: x\r\nBAND 1: 0\r\n").kind == ParseResult::Kind::ParseError);
 }
 
 TEST_CASE("a BAND 1 without a usable number is a parse error, not NoData", "[wmsquery]") {
@@ -939,9 +942,19 @@ TEST_CASE("BAND 1 counts only at the start of a line", "[wmsquery]") {
     CHECK_THAT(parsed.value, WithinAbs(12.5, 1e-12));
   }
 
-  // At the start of the body, or after a bare line feed, it is the mask.
+  // At the start of the body, or after a line feed or a bare carriage return, it is the mask.
   CHECK(parseElevation("BAND 1: 0\nBAND 0: 12.5\n").kind == ParseResult::Kind::NoData);
   CHECK(parseElevation("BAND 0: 12.5\nBAND 1: 0\n").kind == ParseResult::Kind::NoData);
+  CHECK(parseElevation("BAND 0: 12.5\rBAND 1: 0\r").kind == ParseResult::Kind::NoData);
+
+  // A mention inside an earlier line does not end the search for the line that starts with it.
+  const auto mentionedFirst = parseElevation("FileName: BAND 1: 255\r\nBAND 0: 12.5\r\nBAND 1: 0\r\n");
+  CHECK(mentionedFirst.kind == ParseResult::Kind::NoData);
+
+  // The recorded sea answer with bare carriage returns for line endings keeps its mask.
+  std::string seaWithCarriageReturns(kRecordedSea);
+  std::erase(seaWithCarriageReturns, '\n');
+  CHECK(parseElevation(seaWithCarriageReturns).kind == ParseResult::Kind::NoData);
 }
 
 TEST_CASE("parseElevation reads the whole number after the band marker", "[wmsquery]") {
@@ -1116,10 +1129,12 @@ std::string featureInfoUrl(const Config& cfg, int x, int y);
 //   " m" or "</pre>" is ignored, but "12,5", "1.#QNAN" and "12abc" are ParseError. The number must be
 //   on the marker's own line, finite and within float range (the raster stores float32, so a Value
 //   always fits in a float); no number, "nan", "inf" and 1e300 are ParseError.
-// - The first line that starts with "BAND 1:" (at the start of the body or right after a '\n') is the
-//   mask, and its number is read by the same rules: 0 is NoData, any other number gives the height as
-//   the Value, and a mask that does not parse is ParseError, because a false NoData is permanent while
-//   a ParseError is only retried. "BAND 1:" inside another line is ignored.
+// - The first line that starts with "BAND 1:" (at the start of the body or right after a '\n' or a
+//   '\r', the characters that end a line) is the mask, and its number is read by the same rules: 0 is
+//   NoData, any other number gives the height as the Value, and a mask that does not parse is
+//   ParseError, because a false NoData is permanent while a ParseError is only retried. "BAND 1:"
+//   inside another line is ignored, and the search goes on past it. An unusable height is ParseError
+//   whatever the mask says.
 // - Without a mask line the height is the Value, so layers and servers without a mask band still work.
 // Relies on the C locale for the decimal point; nothing in this program calls setlocale.
 ParseResult parseElevation(std::string_view body);
@@ -1180,11 +1195,14 @@ std::optional<double> leadingNumber(std::string_view rest) {
   return value;
 }
 
-// The text after the first `marker` that starts a line, at the start of the body or right after a
-// '\n', or nothing when no line starts with it.
+// The text after the first `marker` that starts a line, or nothing when no line starts with it. A line
+// starts at the start of the body or right after a '\n' or a '\r', the characters that end one in
+// leadingNumber, so a body with bare carriage returns for line endings keeps its lines.
 std::optional<std::string_view> afterLineStart(std::string_view body, std::string_view marker) {
   for (auto pos = body.find(marker); pos != std::string_view::npos; pos = body.find(marker, pos + 1)) {
-    if (pos == 0 || body[pos - 1] == '\n') return body.substr(pos + marker.size());
+    if (pos == 0 || body[pos - 1] == '\n' || body[pos - 1] == '\r') {
+      return body.substr(pos + marker.size());
+    }
   }
   return std::nullopt;
 }
@@ -1242,10 +1260,11 @@ ParseResult parseElevation(std::string_view body) {
   if (!height) return {ParseResult::Kind::ParseError, 0.0};
   // BAND 1 is the layer's mask, 255 where there is an elevation and 0 where there is none. At sea the
   // server answers "BAND 0: 0" with "BAND 1: 0", so the height alone would store a real 0 m for every
-  // sea pixel, for good. Only a line of its own counts, so the marker quoted inside another line cannot
-  // mark a pixel as no data, and a mask that does not parse is a parse error, retried, because a false
-  // NoData is permanent. Without a mask line the height stands, so layers and servers without a mask
-  // band keep working.
+  // sea pixel, for good. The mask is read from the first line that starts with "BAND 1:" (text may
+  // follow its number, as after the height), so the marker quoted inside another line cannot mark a
+  // pixel as no data. A mask that does not parse is a parse error, retried, because a false NoData is
+  // permanent, and the height is read first, so a mask of 0 never rescues an unusable one. Without a
+  // mask line the height stands, so layers and servers without a mask band keep working.
   const std::optional<std::string_view> maskText = afterLineStart(body, maskMarker);
   if (!maskText) return {ParseResult::Kind::Value, *height};
   const std::optional<double> mask = leadingNumber(*maskText);
@@ -7887,7 +7906,7 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 
 ## Behaviours to keep in mind
 
-- **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server's mask band says there is no elevation there (`BAND 1: 0`, as at sea, where `BAND 0` reads 0) and is final; a body without `BAND 0:` is a parse error, retried, never NoData. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
+- **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server's mask band says there is no elevation there (`BAND 1: 0`, as at sea, where `BAND 0` reads 0) and is final; a body without `BAND 0:` is a parse error, retried, never NoData. The mask rule applies to every `--layer`: one whose `BAND 1` is a data band rather than a 0/255 mask would have every pixel where that band reads exactly 0 stored as NoData, so check a captured response before using another layer. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
 - **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp`, syncs it and renames it over the output, so every row with work rewrites 4 x width x height bytes: about 26 GB over a 2048 x 1792 run, and about 50 TB for a square grid near the 2^29-pixel limit, enough to wear an SSD noticeably. A save after the first request that fails, on a full disk for instance, stops the run with exit 2 and the last good checkpoint intact, and is reported on stderr as `error: checkpoint write failed: ...` (after another stop reason, `error: interrupted; checkpoint write failed: ...`) as well as in the summary on stdout. If the save before the first request fails, the run exits 1 with `error: ...` and makes no request.
 - **Stopping is one flag.** SIGINT, SIGTERM, SIGHUP (closing the terminal; left ignored when the tool is started under `nohup`), closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
 - **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143, and a second SIGHUP by SIGHUP, 129.

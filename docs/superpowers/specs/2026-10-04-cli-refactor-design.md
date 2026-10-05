@@ -176,12 +176,15 @@ while a parse error is retried. A number on the next line does not count. The
 number must be finite and within float range, because the raster stores
 float32; anything else (no number, `nan`, `inf`, `1e300`) is a `ParseError`.
 The first line that starts with `BAND 1:` (at the start of the body or right
-after a line feed) is the mask band, and its number is read by the same rules:
-0 makes the result `NoData`, any other value gives the `BAND 0` number as the
+after a line feed or a carriage return, the characters that end a line) is the
+mask band, and its number is read by the same rules, so text may follow it: 0
+makes the result `NoData`, any other value gives the `BAND 0` number as the
 `Value`, and a mask that does not parse (`x`, nothing, `nan`, `0abc`) is a
 `ParseError`, because a false NoData is permanent while a parse error is only
-retried. `BAND 1:` inside another line is ignored. Without a mask line the
-`BAND 0` number is the `Value`. All four are pure.
+retried. `BAND 1:` inside another line is ignored, and the search goes on past
+it. The height is read first: an unusable `BAND 0` number is a `ParseError`
+whatever the mask says. Without a mask line the `BAND 0` number is the
+`Value`. All four are pure.
 
 The parse rules were settled against two responses recorded from the real
 server on 2026-10-05 for the default layer: pixel (2040, 8) of the 2048 x 1792
@@ -193,7 +196,10 @@ dashed line, `RED:`, `GREEN:`, `BLUE:`, `FileName:`, `Timestamp:`,
 `BAND 0` is the height, 366.2 m as the old download has it, and `BAND 1` is
 255; at sea both read 0. `BAND 1` is therefore the default layer's 0/255 mask,
 and `BAND 0` alone would have stored every sea pixel as a real 0 m, for good.
-Other layers, or servers, without a mask band keep the `BAND 0` value. A
+Other layers, or servers, without a mask band keep the `BAND 0` value. The
+rule applies to every `--layer`, though: a layer whose `BAND 1` is a data band
+rather than a 0/255 mask would have every pixel where that band reads exactly
+0 stored as NoData, so check a captured response before using another layer. A
 server that signals no data by omitting the marker would now see those pixels
 fail after their retries, with a warning on stderr, and a stretch of them stop
 the run at the consecutive-failure limit, loudly, instead of being stored.
@@ -828,10 +834,14 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   lines, `BAND 0: 0` and `BAND 1: 255` is a Value of 0 (a real sea-level
   height), `BAND 0: 12.5` and `BAND 1: 0` is NoData, with `BAND 1: 1` it is
   12.5, with a mask of `x`, nothing, `nan` or `0abc` a ParseError, and
-  `BAND 0: 12.5` alone is 12.5; `BAND 1:` counts at the start of the body and
-  after a bare LF, but inside another line (`FileName: BAND 1: 0`,
-  `FileName: BAND 1: x`, or after the height on the marker's line) it is
-  ignored; a body without `BAND 0:` is a ParseError, such as
+  `BAND 0: 12.5` alone is 12.5, while `BAND 0: x` with `BAND 1: 0` is a
+  ParseError (a mask of 0 does not rescue an unusable height); `BAND 1:`
+  counts at the start of the body and after a bare LF or a bare CR, and the
+  recorded sea answer with bare CRs for line endings is still NoData, but
+  inside another line (`FileName: BAND 1: 0`, `FileName: BAND 1: x`, or after
+  the height on the marker's line) it is ignored, and the search goes on:
+  `FileName: BAND 1: 255` before a `BAND 1: 0` line is NoData; a body without
+  `BAND 0:` is a ParseError, such as
   `GetFeatureInfo results:`, `GetFeatureInfo results:\nno bands\n`,
   `Error: layer not found`, a UTF-8 byte order mark before `<html>`,
   `BAND 1: 0` alone, an empty body, a whitespace-only body, an HTML page, an
