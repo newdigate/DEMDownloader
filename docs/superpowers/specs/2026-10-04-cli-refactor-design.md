@@ -266,8 +266,9 @@ and an integer a plain whole number (`0`, or an optional `-` and digits not
 starting with `0`), so an empty value, digit separators, `0x`, `0b` and `0o`
 prefixes, leading-zero octal, `true`, hex floats, `nan` and `inf`, all of
 which CLI11 would otherwise accept, are usage errors; the message ends with
-the value as given, quoted (`, not '1,5'`), so stray characters such as a
-trailing space show. A value for `--output`, `--layer`, `--wms-url` or
+the value quoted (`, not '1,5'`), with bytes outside printable ASCII shown as
+escapes such as `\r` and `\xE2`, so stray characters such as a trailing space
+or a carriage return show. A value for `--output`, `--layer`, `--wms-url` or
 `--ca-bundle` that starts with `--` is a usage error
 (`looks like a flag; is the value missing?`), so a forgotten path cannot turn
 `--output --dry-run` into a real run that writes to a file named `--dry-run`.
@@ -694,9 +695,14 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `20,48` and `true` and an empty `--max-retries` are usage errors naming the
   flag and quoting the value (`, not '0100'`), and so are `--north` values
   that are empty, `1,5`, `-34,18`, `0x1p3`, `nan` or `inf`, while `1e-3`,
-  `.5` and `-34.` are accepted with their values; each of the four
-  coordinate flags rejects `1,5` and each of the five integer flags rejects
-  `0100`, so every option runs its own check; `--output --dry-run` and
+  `.5` and `-34.` are accepted with their values; in the quoted value, `2048`
+  followed by a carriage return shows as `'2048\r'` with no raw carriage
+  return anywhere in the output, `-34.18` with a trailing space keeps the
+  space inside the quotes, a Unicode minus before `34.18` shows as
+  `'\xE2\x88\x9234.18'`, and a tab, a newline, a backslash and a single quote
+  show as `\t`, `\n`, `\\` and `\'`; each of the four coordinate flags
+  rejects `1,5` and each of the five integer flags rejects `0100`, so every
+  option runs its own check; `--output --dry-run` and
   `--layer --verbose` are usage errors because the value looks like a flag,
   and each of `--output`, `--layer`, `--wms-url` and `--ca-bundle` rejects
   `--x` that way, which for `--ca-bundle` shows that this check runs before

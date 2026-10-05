@@ -5232,6 +5232,22 @@ TEST_CASE("coordinates may have an exponent or a bare leading or trailing point"
   CHECK_THAT(p.config.box.north, WithinAbs(expected, 1e-12));
 }
 
+TEST_CASE("the echoed value is quoted, with bytes outside printable ASCII escaped", "[cli]") {
+  const auto [flag, value, shown] = GENERATE(table<const char*, const char*, const char*>({
+      {"--width", "2048\r", "2048\\r"},  // a carriage return left by a Windows file
+      {"--north", "-34.18 ", "-34.18 "},   // a trailing space stays visible inside the quotes
+      {"--north", "\xE2\x88\x92" "34.18", "\\xE2\\x88\\x9234.18"},  // a Unicode minus sign
+      {"--width", "1\t2", "1\\t2"},
+      {"--width", "1\n2", "1\\n2"},
+      {"--width", "1\\2", "1\\\\2"},
+      {"--width", "1'2", "1\\'2"}}));
+  const Parsed p = parse(exampleWith(flag, value));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(std::string(", not '") + shown + "'\n"));  // the end of the message
+  CHECK(p.err.find('\r') == std::string::npos);
+}
+
 TEST_CASE("a value that looks like a flag is a usage error", "[cli]") {
   // Unchecked, "--output --dry-run" would take "--dry-run" as the path and start a real run.
   const auto [flag, value] =
@@ -5405,17 +5421,43 @@ bool isPlainInteger(const std::string& text) {
   return true;
 }
 
+// `text` in single quotes, readable whatever it holds: \r, \n and \t become those escapes, a backslash
+// becomes \\, a single quote \', and any other byte outside printable ASCII (0x20..0x7E) \xHH.
+std::string quoted(const std::string& text) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out = "'";
+  for (const char c : text) {
+    const auto byte = static_cast<unsigned char>(c);
+    switch (c) {
+      case '\r': out += "\\r"; break;
+      case '\n': out += "\\n"; break;
+      case '\t': out += "\\t"; break;
+      case '\\': out += "\\\\"; break;
+      case '\'': out += "\\'"; break;
+      default:
+        if (byte >= 0x20 && byte <= 0x7E) {
+          out += c;
+        } else {
+          out += "\\x";
+          out += kHex[byte >> 4];
+          out += kHex[byte & 0x0F];
+        }
+    }
+  }
+  return out + "'";
+}
+
 // The checks below return an empty string for an acceptable value, otherwise the problem. The numeric ones end
-// with the value as given, quoted, so that stray characters such as a trailing space show.
+// with the value quoted, so that stray characters such as a trailing space or a carriage return show.
 
 std::string checkDecimal(const std::string& text) {
   if (isPlainDecimal(text)) return {};
-  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator), not '" + text + "'";
+  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator), not " + quoted(text);
 }
 
 std::string checkWholeNumber(const std::string& text) {
   if (isPlainInteger(text)) return {};
-  return "must be a whole number without leading zeros, separators or prefixes, not '" + text + "'";
+  return "must be a whole number without leading zeros, separators or prefixes, not " + quoted(text);
 }
 
 std::string checkNotFlagLike(const std::string& text) {
@@ -5494,7 +5536,7 @@ ParseOutcome parseArgs(int argc, const char* const* argv, Config& config, std::o
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[cli]"`
-Expected: `All tests passed (N assertions in 21 test cases)`.
+Expected: `All tests passed (N assertions in 22 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
 Expected: `100% tests passed` across every tag so far.

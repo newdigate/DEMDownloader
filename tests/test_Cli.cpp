@@ -270,6 +270,22 @@ TEST_CASE("coordinates may have an exponent or a bare leading or trailing point"
   CHECK_THAT(p.config.box.north, WithinAbs(expected, 1e-12));
 }
 
+TEST_CASE("the echoed value is quoted, with bytes outside printable ASCII escaped", "[cli]") {
+  const auto [flag, value, shown] = GENERATE(table<const char*, const char*, const char*>({
+      {"--width", "2048\r", "2048\\r"},  // a carriage return left by a Windows file
+      {"--north", "-34.18 ", "-34.18 "},   // a trailing space stays visible inside the quotes
+      {"--north", "\xE2\x88\x92" "34.18", "\\xE2\\x88\\x9234.18"},  // a Unicode minus sign
+      {"--width", "1\t2", "1\\t2"},
+      {"--width", "1\n2", "1\\n2"},
+      {"--width", "1\\2", "1\\\\2"},
+      {"--width", "1'2", "1\\'2"}}));
+  const Parsed p = parse(exampleWith(flag, value));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(std::string(", not '") + shown + "'\n"));  // the end of the message
+  CHECK(p.err.find('\r') == std::string::npos);
+}
+
 TEST_CASE("a value that looks like a flag is a usage error", "[cli]") {
   // Unchecked, "--output --dry-run" would take "--dry-run" as the path and start a real run.
   const auto [flag, value] =

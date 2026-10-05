@@ -50,17 +50,43 @@ bool isPlainInteger(const std::string& text) {
   return true;
 }
 
+// `text` in single quotes, readable whatever it holds: \r, \n and \t become those escapes, a backslash
+// becomes \\, a single quote \', and any other byte outside printable ASCII (0x20..0x7E) \xHH.
+std::string quoted(const std::string& text) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out = "'";
+  for (const char c : text) {
+    const auto byte = static_cast<unsigned char>(c);
+    switch (c) {
+      case '\r': out += "\\r"; break;
+      case '\n': out += "\\n"; break;
+      case '\t': out += "\\t"; break;
+      case '\\': out += "\\\\"; break;
+      case '\'': out += "\\'"; break;
+      default:
+        if (byte >= 0x20 && byte <= 0x7E) {
+          out += c;
+        } else {
+          out += "\\x";
+          out += kHex[byte >> 4];
+          out += kHex[byte & 0x0F];
+        }
+    }
+  }
+  return out + "'";
+}
+
 // The checks below return an empty string for an acceptable value, otherwise the problem. The numeric ones end
-// with the value as given, quoted, so that stray characters such as a trailing space show.
+// with the value quoted, so that stray characters such as a trailing space or a carriage return show.
 
 std::string checkDecimal(const std::string& text) {
   if (isPlainDecimal(text)) return {};
-  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator), not '" + text + "'";
+  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator), not " + quoted(text);
 }
 
 std::string checkWholeNumber(const std::string& text) {
   if (isPlainInteger(text)) return {};
-  return "must be a whole number without leading zeros, separators or prefixes, not '" + text + "'";
+  return "must be a whole number without leading zeros, separators or prefixes, not " + quoted(text);
 }
 
 std::string checkNotFlagLike(const std::string& text) {
