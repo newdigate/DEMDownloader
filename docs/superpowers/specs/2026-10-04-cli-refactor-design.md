@@ -59,7 +59,7 @@ Non-goals for this iteration:
 | `demdl` | static library | `httplib::httplib`, `TIFF::TIFF`, libgeotiff, ctpl header | Every `src/demdl/*.cpp`: all logic. No OpenGL. Defines `DL_ELEVATION_VERSION` for itself and everything that links it. |
 | `demdl_cli` | object library | `demdl`, `CLI11::CLI11` (private) | `src/app/Cli.cpp`, compiled once and shared by the executable and the tests; the only file that includes CLI11. |
 | `dl_elevation` | executable | `demdl`, `demdl_cli`, optionally `demdl_preview` | `src/app/main.cpp`. Parses flags, wires components, maps results to exit codes. Compiled with `DL_ELEVATION_HAVE_PREVIEW` when it links `demdl_preview`. |
-| `demdl_preview` | static library, optional | `demdl`, glfw, OpenGL framework (macOS) or GLEW + GL (Linux) | `src/preview/PreviewWindow.cpp`. Built when `DL_ELEVATION_PREVIEW` is ON. Default ON on Apple, OFF elsewhere. |
+| `demdl_preview` | static library, optional | `demdl`; privately glfw and either the OpenGL, Cocoa, IOKit and CoreVideo frameworks (macOS) or GLEW and GL (elsewhere) | `src/preview/PreviewWindow.cpp`. Built when `DL_ELEVATION_PREVIEW` is ON. Default ON on Apple, OFF elsewhere. |
 | `demdl_tests` | executable | `demdl`, `demdl_cli`, `Catch2::Catch2WithMain`; built after `dl_elevation` | Every `tests/test_*.cpp`, `test_Palette.cpp` included whatever `DL_ELEVATION_PREVIEW` says. Built when `DL_ELEVATION_TESTS` is ON (default ON). Registered with `ctest` through `catch_discover_tests`. |
 
 The end-to-end tests run the executable itself, so `demdl_tests` depends on
@@ -164,18 +164,22 @@ max)` scaled by `1 + jitter * (2 * unitRandom - 1)`. The cap applies before
 jitter, so the longest sleep is 36 s with the defaults. Taking the random value
 as a parameter keeps the schedule testable.
 
-**PixelFetcher** is the seam for tests:
+**PixelFetcher** is the seam for tests, as declared in
+`src/demdl/PixelFetcher.h`:
 
 ```cpp
 struct FetchResult {
-  enum class Kind { Value, NoData, Failed } kind;
-  float value = 0;        // valid when kind == Value
-  int attempts = 0;
-  std::string error;      // last error when kind == Failed
+  enum class Kind { Value, NoData, Failed };
+  Kind kind = Kind::Failed;
+  float value = 0.0f;   // valid when kind == Value
+  int attempts = 0;     // attempts made, including the first
+  std::string error{};  // last error when kind == Failed
 };
-struct PixelFetcher {
+
+class PixelFetcher {
+ public:
   virtual ~PixelFetcher() = default;
-  virtual FetchResult fetch(int x, int y, const std::atomic<bool>& stop) = 0;
+  [[nodiscard]] virtual FetchResult fetch(int x, int y, const std::atomic<bool>& stop) = 0;
 };
 ```
 
@@ -646,12 +650,13 @@ window closes when the run finishes and `main` destroys the sink.
    SIGTERM each blocking both while the handler runs. The first signal calls
    `request(StopReason::Signal)` on the shared `StopToken`. A second one
    resets its signal to the default action, unblocks it and raises it, so the
-   process dies by that signal: a calling shell reports 130 (143 for SIGTERM)
-   and stops a script or loop running the tool, which an ordinary exit, even
-   with code 130, would not make it do. SIGPIPE is ignored, also through
-   `sigaction`. The handler touches nothing but a signal counter and the
-   token, both constant-initialised at namespace scope and made of lock-free
-   atomics, and makes only async-signal-safe calls.
+   process dies by that signal, which a shell reports as 130 for SIGINT and
+   143 for SIGTERM. Ctrl-C reaches the whole foreground job, so after a
+   second Ctrl-C a shell script or loop running the tool stops too, which an
+   ordinary exit, even with code 130, would not make it do. SIGPIPE is
+   ignored, also through `sigaction`. The handler touches nothing but a signal
+   counter and the token, both constant-initialised at namespace scope and
+   made of lock-free atomics, and makes only async-signal-safe calls.
 10. Construct the `Downloader`, whose constructor validates its options, and
     start `run()` on a `std::thread` of its own, which hands back the
     summary, or the exception that escaped, through a `std::promise`. A
@@ -689,7 +694,7 @@ one `ElevationClient` per worker id so each thread reuses its own connection.
 | 1 | usage, configuration or file error before any request, or an unexpected internal error during the run (message on stderr) |
 | 2 | stopped early (signal, window closed, consecutive failures, write error); checkpoint intact; rerun resumes |
 | 3 | ran to the end but `failed > 0`; rerun resumes |
-| 130 | killed by a second SIGINT or SIGTERM: the signal's default action, so the shell reports 130 (or 143) and a calling script stops |
+| 130 or 143 | killed by a second SIGINT (130) or SIGTERM (143), the signal's default action; Ctrl-C reaches the whole foreground job, so after a second Ctrl-C a calling shell script stops too |
 
 The codes are named in the header-only `src/app/ExitCodes.h` (namespace
 `demdl::cli`) as `kExitComplete`, `kExitError`, `kExitStopped` and
@@ -720,6 +725,26 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 - **BoundingBox**: accepts a valid box; rejects north <= south, east <= west,
   out-of-range values, and NaN or infinity on each of the four edges; pixel
   scale for the example box; `approxEquals` tolerance.
+- **Config**: the default WMS URL splits into the origin
+  `https://cityimg.capetown.gov.za` and the path
+  `/erdas-iws/ogc/wms/GeoSpatial%20Datasets`, and a port stays in the origin;
+  ports 1 and 65535 and `-`, `_` and `.` in a host name are accepted, and so
+  are bracketed IPv6 hosts with and without a port; a URL without a path gets
+  the path `/`. `parseWmsUrl` refuses an `ftp` or an uppercase `HTTPS` scheme,
+  a missing scheme, an empty host with or without a port, an empty,
+  non-numeric, zero or 65536 port, a doubled `:` before the port, a second
+  port, a space in the host or the path, userinfo, a query with or without a
+  path, a fragment, an unclosed `[`, an unbracketed IPv6 address and a CR LF
+  in the path. The example Config is valid. `validate` returns its exact
+  message for threads 0 and 65 (64 is accepted), a zero width and a negative
+  height, a URL that does not parse, `maxRetries` -1 and 101 (100 is
+  accepted), `maxConsecutiveFailures` 0, an empty output, swapped north and
+  south, an empty layer and one containing `;`, an output ending in `/` or
+  named `.`, `..`, `dir/.` or `dir/..` (`.dem.tif` is accepted), and grids of
+  536870913 x 1, 65536 x 65536 and `INT_MAX` x `INT_MAX` pixels
+  (32768 x 16384, exactly 2^29, is accepted); a grid that is too large is
+  reported before an empty output, and a zero width before a zero thread
+  count.
 - **WmsQuery**: golden URL for the example Config at pixel (0, 0) equals
   `/erdas-iws/ogc/wms/GeoSpatial%20Datasets?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&BBOX=-34.216344700%2C18.418579100%2C-34.184541800%2C18.462524400&CRS=EPSG%3A4326&WIDTH=2048&HEIGHT=1792&LAYERS=Elevation_CCT_GLM2019_5m_DEM&STYLES=&FORMAT=image%2Fpng&QUERY_LAYERS=Elevation_CCT_GLM2019_5m_DEM&INFO_FORMAT=text%2Fplain&I=0&J=0`
   (coordinates fixed at nine decimals, order south, west, north, east as WMS
@@ -984,7 +1009,8 @@ written or requested, so with `--overwrite` an existing file keeps its bytes.
   `demdl_preview`, whose header includes none of theirs; as a static library
   it still hands them on to the executable's link. No GLM, assimp, FreeType,
   CoreAudio or AudioUnit.
-- `-Wall -Wextra` on `demdl`, `dl_elevation` and `demdl_preview`.
+- `-Wall -Wextra` on every target of ours: `demdl`, `demdl_cli`,
+  `dl_elevation`, `demdl_preview` and `demdl_tests`.
 - `.gitignore` adds `build*/`, `*.tif`, `*.tif.tmp`.
 - CLAUDE.md is rewritten for the new layout, commands, flags and test run.
 

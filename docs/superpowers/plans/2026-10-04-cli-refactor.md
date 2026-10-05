@@ -7529,7 +7529,7 @@ Design and plan: `docs/superpowers/specs/2026-10-04-cli-refactor-design.md` and 
 
 ## Build, test, run
 
-CMake 3.27+ with Ninja. The first configure downloads the pinned dependencies and compiles Catch2, so allow a few minutes.
+CMake 3.27+ with Ninja. The first configure downloads the pinned dependencies. The first build also compiles Catch2, so allow a few minutes.
 
 ```bash
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -S . -B build
@@ -7552,8 +7552,10 @@ Homebrew packages: `pkg-config libtiff libgeotiff openssl@3`, plus `glfw` for th
 Running the tool makes real requests to a public server. Check a command line with `--dry-run`, and never start a live download just to see whether the build works:
 
 ```bash
-./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output simonstown.tif --dry-run
+./build/dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output "${TMPDIR:-/tmp}/simonstown.tif" --dry-run
 ```
+
+The `.tif` files in the repository root are old RGB16 downloads that the new tool refuses to resume; `--overwrite` on them would destroy them, so choose another `--output` for new runs.
 
 The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 run the whole program against 127.0.0.1 and need no network. Live requests to the City of Cape Town server are for the owner to start.
 
@@ -7573,8 +7575,8 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 - **The raster is the resume state.** NaN means not fetched, or failed last time and due for retry. `-32768`, the declared NoData, means the server has no elevation there and is final. On start an existing output must match width, height, bounding box (within 1e-9 degrees) and layer, otherwise exit 1 with the differences; `--overwrite` starts fresh. Files from the old RGB16 format are rejected.
 - **Checkpoints are atomic.** Before anything is written, the output directory is checked and the sink is created. The checkpoint is saved before the first request and after every row with work. Each save writes the whole raster to `<output>.tmp` and renames it over the output.
 - **Stopping is one flag.** SIGINT, SIGTERM, closing the preview, a checkpoint write failure, or the consecutive-failure limit set the `StopToken`. Queued pixels are abandoned, in-flight ones finish, and the partial row is saved. `main` prints `stopping: ...` to stderr.
-- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C (or SIGTERM) kills the process by that signal's default action, so the shell reports 130 (143 for SIGTERM) and a calling script stops.
-- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. If the system trust store rejects the server's chain, `ca-bundle.crt` in the repository root, the CA bundle the old program used, is a candidate for `--ca-bundle`. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
+- **Exit codes:** 0 complete; 1 usage, configuration, file or internal error; 2 stopped early and resumable; 3 finished with failed pixels and resumable. A second Ctrl-C kills the process by SIGINT, which the shell reports as 130, and because Ctrl-C reaches the whole foreground job, a calling shell script stops too. A second SIGTERM kills it by SIGTERM, which the shell reports as 143.
+- **Failures:** with the default policy and 8 workers, an unreachable server or a wrong path takes about 20 minutes to reach the 100-failure limit (longer when each connection attempt times out). Certificate errors are not retried, so they fail at once. `ca-bundle.crt` in the repository root is Mozilla's CA snapshot of 2019-01-22 and may be stale. The old program passed it to httplib but turned verification off, so it never verified anything. Try it with `--ca-bundle` only if the system trust store does not verify the server. The first failed request and the first unparseable body are each reported once per run on stderr. Progress lines go to stdout.
 - **Threading:** worker threads write distinct raster cells and own one `ElevationClient` each; sinks guard their own state; nothing prints from a signal handler.
 - The old single-file `main.cpp` and the `include/` LearnOpenGL boilerplate are gone. Do not resurrect them.
 
