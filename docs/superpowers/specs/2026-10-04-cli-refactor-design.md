@@ -204,6 +204,19 @@ server that signals no data by omitting the marker would now see those pixels
 fail after their retries, with a warning on stderr, and a stretch of them stop
 the run at the consecutive-failure limit, loudly, instead of being stored.
 
+The `Point:` lines also show where the server samples: the top-left corner of
+the requested pixel (west + I x width/W, north - J x height/H), not its
+centre. The same day a 12-request live run on a 4 x 3 grid over the example
+box, with the client's own TLS stack, returned 8 heights and 4 NoData pixels
+and no failure. Its heights differed from the earlier full-resolution download
+at the same corner points, so the server appears to answer coarse requests
+from lower-resolution overviews, while at 2048 x 1792 the recorded land height
+equals the earlier download's. Because samples sit at pixel corners and the
+file declares `RasterPixelIsArea` with the tiepoint at the north-west corner,
+GIS tools place each height half a pixel south-east of its sample point, about
+1 m on the default grid; declaring `RasterPixelIsPoint` instead would remove
+the offset.
+
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
 max)` scaled by `1 + jitter * (2 * unitRandom - 1)`. The cap applies before
