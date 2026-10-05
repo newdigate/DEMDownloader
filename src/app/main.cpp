@@ -246,6 +246,7 @@ int main(int argc, char** argv) {
   // any of that goes away. It must also have ended before exit() starts its cleanup: its end runs
   // thread-local destructors, such as OpenSSL's per-thread state from the clients the factory made, and
   // libc++'s std::async would detach it.
+  // Any early return added once the runner has started must request a stop first, or this waits for the whole run.
   const ThreadJoiner joinRunner(runner);
   try {
     downloader.emplace(*raster, cfg.output, factory, *sink, g_stopToken,

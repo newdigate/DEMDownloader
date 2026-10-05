@@ -28,7 +28,8 @@ struct DownloaderOptions {
 // saves the raster after each row and reports progress.
 //
 // Call run() exactly once. It blocks until the run ends, so when a preview window is active it must
-// not run on the main thread, which belongs to the GLFW event loop; main calls it under std::async.
+// not run on the main thread, which belongs to the GLFW event loop; main runs it on a std::thread of
+// its own and takes the summary through a std::promise.
 // Pixel callbacks reach the sink from the pool threads and from the thread calling run() (Queued);
 // row and run callbacks come only from the thread calling run().
 //

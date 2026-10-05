@@ -804,7 +804,11 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   they were; junk bytes at the output path exit 1 with the `use --overwrite`
   hint exactly once, no request and the bytes unchanged,
   `--overwrite --dry-run` reports `(exists, will be overwritten)` and still
-  leaves them, and `--overwrite` exits 0 with the file complete. A dry run
+  leaves them, and `--overwrite` exits 0 with the file complete. A complete
+  file whose description is rewritten in place to start with `xx_elevation;`
+  exits 1 with `use --overwrite` exactly once, the load error's own, and no
+  request; a complete file in a read-only directory exits 0 with no request
+  and its bytes unchanged (skipped when running as root). A dry run
   exits 0, prints the plan, starting with `dry run` and naming the loopback
   URL in its first request, and neither requests nor writes anything; into a
   directory that does not exist it exits 1 with

@@ -3335,7 +3335,8 @@ struct DownloaderOptions {
 // saves the raster after each row and reports progress.
 //
 // Call run() exactly once. It blocks until the run ends, so when a preview window is active it must
-// not run on the main thread, which belongs to the GLFW event loop; main calls it under std::async.
+// not run on the main thread, which belongs to the GLFW event loop; main runs it on a std::thread of
+// its own and takes the summary through a std::promise.
 // Pixel callbacks reach the sink from the pool threads and from the thread calling run() (Queued);
 // row and run callbacks come only from the thread calling run().
 //
@@ -5693,6 +5694,7 @@ The test starts the executable with `posix_spawn` and serves it from an `httplib
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -5712,6 +5714,7 @@ The test starts the executable with `posix_spawn` and serves it from an `httplib
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "FakeFetcher.h"  // Gate
@@ -5799,8 +5802,30 @@ std::string readFile(const std::filesystem::path& path) {
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+void writeFile(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream file(path, std::ios::binary);
+  file << bytes;
+  file.close();
+  REQUIRE(file.good());
+}
+
 // True when the file holds exactly `bytes`. A bool, so that a failed check prints no binary data.
 bool fileHolds(const std::filesystem::path& path, const std::string& bytes) { return readFile(path) == bytes; }
+
+// Makes a directory read-only (0555) for as long as it lives and writable (0755) again afterwards, even when a
+// check fails, so that the TempDir can remove it.
+class ReadOnlyDirectory {
+ public:
+  explicit ReadOnlyDirectory(std::filesystem::path path) : path_(std::move(path)) {
+    REQUIRE(chmod(path_.c_str(), 0555) == 0);
+  }
+  ~ReadOnlyDirectory() { chmod(path_.c_str(), 0755); }
+  ReadOnlyDirectory(const ReadOnlyDirectory&) = delete;
+  ReadOnlyDirectory& operator=(const ReadOnlyDirectory&) = delete;
+
+ private:
+  std::filesystem::path path_;
+};
 
 // How many times `needle` occurs in `text` without overlapping.
 std::size_t occurrences(std::string_view text, std::string_view needle) {
@@ -5934,6 +5959,7 @@ class Child {
     const auto deadline = std::chrono::steady_clock::now() + kDeadline;
     while (!satisfied()) {
       if (ended()) {
+        if (satisfied()) return;  // it came true just before the child ended
         INFO("stderr:\n" << readFile(errPath_));
         FAIL("dl_elevation ended first, with " << describeStatus(status_));
       }
@@ -6046,11 +6072,7 @@ TEST_CASE("an output that is not a GeoTIFF is refused untouched, and --overwrite
   const TempDir dir;
   const std::filesystem::path output = dir.path / "dem.tif";
   const std::string junk = "these bytes are not a GeoTIFF\n";
-  {
-    std::ofstream file(output, std::ios::binary);
-    file << junk;
-    REQUIRE(file.good());
-  }
+  writeFile(output, junk);
   std::vector<std::string> args = commandLine(wms, output, 4, 3, {"--threads", "2"});
   {
     const Finished refused = runToExit(args, dir.path);
@@ -6075,6 +6097,51 @@ TEST_CASE("an output that is not a GeoTIFF is refused untouched, and --overwrite
   CHECK(replaced.exitCode() == 0);
   CHECK(wms.requests.load() == 12);
   checkPixels(output, 4, 3, -1, -1);
+}
+
+TEST_CASE("a GeoTIFF that dl_elevation did not write is refused with the load error's own hint", "[e2e]") {
+  LoopbackWms wms;
+  const TempDir dir;
+  const std::filesystem::path output = dir.path / "dem.tif";
+  const std::vector<std::string> args = commandLine(wms, output, 4, 3, {"--threads", "2"});
+  REQUIRE(runToExit(args, dir.path).exitCode() == 0);
+  // The same number of bytes, so the TIFF stays readable; only its description no longer names dl_elevation.
+  std::string bytes = readFile(output);
+  const std::string marker = "dl_elevation;layer=";
+  const std::size_t at = bytes.find(marker);
+  REQUIRE(at != std::string::npos);
+  REQUIRE(bytes.find(marker, at + 1) == std::string::npos);
+  bytes.replace(at, 2, "xx");
+  writeFile(output, bytes);
+
+  wms.requests = 0;
+  const Finished result = runToExit(args, dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 1);
+  CHECK_THAT(result.err, ContainsSubstring("was not written by dl_elevation"));
+  CHECK(occurrences(result.err, "use --overwrite") == 1);  // the message names it, so main adds no hint
+  CHECK(wms.requests.load() == 0);
+  CHECK(fileHolds(output, bytes));
+}
+
+TEST_CASE("a complete file in a read-only directory is left alone, without an error", "[e2e]") {
+  if (geteuid() == 0) SKIP("root ignores directory permissions");
+  LoopbackWms wms;
+  const TempDir dir;
+  const std::filesystem::path sub = dir.path / "readonly";
+  REQUIRE(std::filesystem::create_directory(sub));
+  const std::filesystem::path output = sub / "dem.tif";
+  const std::vector<std::string> args = commandLine(wms, output, 4, 3, {"--threads", "2"});
+  REQUIRE(runToExit(args, dir.path).exitCode() == 0);
+  const std::string before = readFile(output);
+
+  wms.requests = 0;
+  const ReadOnlyDirectory readOnly(sub);
+  const Finished result = runToExit(args, dir.path);  // stdout and stderr go to the writable TempDir
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 0);
+  CHECK(wms.requests.load() == 0);
+  CHECK(fileHolds(output, before));
 }
 
 TEST_CASE("a dry run prints the plan, makes no request and writes nothing", "[e2e]") {
@@ -6488,6 +6555,7 @@ int main(int argc, char** argv) {
   // any of that goes away. It must also have ended before exit() starts its cleanup: its end runs
   // thread-local destructors, such as OpenSSL's per-thread state from the clients the factory made, and
   // libc++'s std::async would detach it.
+  // Any early return added once the runner has started must request a stop first, or this waits for the whole run.
   const ThreadJoiner joinRunner(runner);
   try {
     downloader.emplace(*raster, cfg.output, factory, *sink, g_stopToken,
@@ -6546,10 +6614,10 @@ Run: `cmake --build build && ./build/demdl_tests "[exitcodes]"`
 Expected: builds `dl_elevation` and `demdl_tests` with no warnings, then `All tests passed (N assertions in 7 test cases)`.
 
 Run: `./build/demdl_tests "[e2e]"`
-Expected: `All tests passed (N assertions in 9 test cases)` in about two seconds.
+Expected: `All tests passed (N assertions in 11 test cases)` in about two seconds.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 146`.
+Expected: `100% tests passed out of 148`.
 
 - [ ] **Step 8: Smoke-test the dry run (no network)**
 
