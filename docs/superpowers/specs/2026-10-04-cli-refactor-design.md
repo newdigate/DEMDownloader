@@ -426,11 +426,15 @@ row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s
 
 The rate divides the pixels attempted (ok, nodata and failed) in the last ten
 saved rows, or all rows if fewer, by those rows' elapsed time. The ETA divides
-the pixels still NaN by that rate and reads `--` while the rate is zero.
-Durations read `41.2s` under a minute, `12m05s` under an hour and `13h31m`
-beyond, with the unit chosen after rounding, so 59.95 s reads `1m00s`; NaN
-and negative durations read `0.0s`, and anything above a billion hours reads
-`1000000000h00m`. With `--verbose`, each resolved pixel also logs
+the pixels the run has not yet attempted (the plan's to-do count less the
+pixels attempted in its saved rows) by that rate, so a pixel that failed,
+which the run does not retry, stops counting once attempted; the ETA reads
+`--` while the rate is zero. The `done` count and percentage describe the
+file: its non-NaN pixels after the save. Durations read `41.2s` under a
+minute, `12m05s` under an hour and `13h31m` beyond, with the unit chosen after
+rounding, so 59.95 s reads `1m00s`; NaN and negative durations read `0.0s`,
+and anything above a billion hours reads `1000000000h00m`. With `--verbose`,
+each resolved pixel also logs
 `x=12 y=812 123.4 m (1 attempt)`, `x=12 y=812 nodata`, or
 `x=12 y=812 failed after 9 attempts: <error>` (`after 1 attempt` for a single
 one, and plain `x=12 y=812 failed: <error>` when no attempt was counted, as
@@ -443,12 +447,25 @@ done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed
 rerun with the same arguments to retry the 3 failed pixels
 ```
 
-The hint reads `retry the 1 failed pixel` for a single failure. A stopped run
-adds `stopped: <stop message>` after the `done:` line. The starting line, each
-row line and the finish lines are flushed as they are written, so that with
-stdout redirected to a file each row reaches the log when it is saved; the
-frequent verbose pixel lines are not flushed. The line that announces a stop
-as it happens, for example
+A stopped run adds `stopped: <stop message>` after the `done:` line. The last
+line says how to complete the file, in one of three forms:
+
+```
+rerun with the same arguments to retry the 3 failed pixels
+rerun with the same arguments to resume the remaining 500 pixels
+rerun with the same arguments to resume the remaining 500 pixels (2 failed this run)
+```
+
+The `retry` form appears when the only NaN pixels left in the file are this
+run's failures, the `resume` forms when more are left, with the failure count
+when some pixels failed; there is no such line when no pixel is NaN. A count
+of one reads `pixel`: `retry the 1 failed pixel`,
+`resume the remaining 1 pixel`. `writeSummary` writes these finish lines;
+`onRunFinished` calls it, and `main` calls it after a `--preview` run, whose
+sink prints nothing. The starting line, each row line and the finish lines
+are flushed as they are written, so that with stdout redirected to a file
+each row reaches the log when it is saved; the frequent verbose pixel lines
+are not flushed. The line that announces a stop as it happens, for example
 `stopping: interrupted; waiting for 8 in-flight requests`, is printed by
 `main` when it sees the stop token raised, not by the reporter: `main` polls
 the token every 100 ms, because nothing may print from inside a signal
@@ -612,20 +629,31 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   body give their byte counts, a 300-byte body shows exactly 200 bytes, and
   ESC, BEL, DEL and the UTF-8 bytes `C2 9B` become `.` on a single line.
 - **ConsoleReporter**, writing to a `std::ostringstream`: `formatDuration`
-  gives `41.2s`, `12m05s`, `13h31m` and `14h02m`; it chooses the unit after
-  rounding, so 59.94 gives `59.9s`, 59.95 and 60 give `1m00s`, 3599.4 gives
-  `59m59s` and 3599.6 gives `1h00m`; -1 and NaN give `0.0s`, and 1e300 and
-  infinity give `1000000000h00m`. Row 811 of 1792, saved with 2048 ok,
-  0 nodata and 3 failed in 41.2 s and 1247296 of 3670016 pixels done, prints
-  exactly
+  gives `41.2s`, `12m05s`, `13h31m`, `14h02m` and, truncating the minutes,
+  `1h59m` for 7199; it chooses the unit after rounding, so 59.94 gives
+  `59.9s`, 59.95 and 60 give `1m00s`, 3599.4 gives `59m59s` and 3599.6 gives
+  `1h00m`; -1 and NaN give `0.0s`, and 1e300 and infinity give
+  `1000000000h00m`. A resumed run's starting line reads exactly
+  `starting: 2422720 pixels in 1100 rows remaining of 3670016 pixels in 1792 rows`.
+  Row 811 of 1792, saved with 2048 ok, 0 nodata and 3 failed in 41.2 s, with
+  1247296 of 3670016 pixels done and 2422720 of the run's pixels unattempted,
+  prints exactly
   `row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.8 px/s  eta 13h31m`;
   a row saved with no elapsed time prints `0.0 px/s  eta --`; of eleven rows
   whose first took 1e6 s, the tenth line still prints `0.0 px/s`, and the
   eleventh, whose window has dropped that row, prints exactly
-  `row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.8s`.
-  The summary prints the totals line and the retry hint and no `stopped:`
-  line, and for a single failure the hint reads `retry the 1 failed pixel`; a
-  stopped run prints `stopped: interrupted`. Verbose lines are checked for
+  `row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.0s`;
+  a row that attempts the run's last 100 pixels, 10 of them failing, prints
+  `10.0 px/s  eta 0.0s`; and after a second `onRunStarted` the rate and the
+  ETA come from the new run's row alone (`50.0 px/s  eta 34.0s`). The summary
+  prints the totals line and the retry hint and no `stopped:` line, and for a
+  single failure the hint reads `retry the 1 failed pixel`; a stopped run with
+  nothing failed and nothing left prints exactly its `done:` line and then
+  `stopped: interrupted`; a stopped run with 500 pixels left ends
+  `resume the remaining 500 pixels`, followed by ` (2 failed this run)` after
+  two failures, and one with a single pixel left ends
+  `resume the remaining 1 pixel`; `writeSummary` writes exactly what
+  `onRunFinished` prints. Verbose lines are checked for
   values after one attempt and after two, NoData, failures after 9 attempts
   and after 1, and failures with attempts 0 and -1, which print
   `failed: <error>` without a count; `Queued` and `InFlight` print nothing,

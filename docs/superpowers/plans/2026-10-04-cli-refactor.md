@@ -4405,6 +4405,7 @@ using demdl::RunPlan;
 using demdl::RunSummary;
 using demdl::StopReason;
 using demdl::formatDuration;
+using demdl::writeSummary;
 
 namespace {
 
@@ -4438,6 +4439,7 @@ TEST_CASE("formatDuration picks units by magnitude", "[consolereporter]") {
   CHECK(formatDuration(725.0) == "12m05s");
   CHECK(formatDuration(48667.0) == "13h31m");
   CHECK(formatDuration(50520.0) == "14h02m");
+  CHECK(formatDuration(7199.0) == "1h59m");  // minutes are truncated, not rounded
 }
 
 TEST_CASE("formatDuration rounds before it picks the unit and tames odd inputs", "[consolereporter]") {
@@ -4452,13 +4454,22 @@ TEST_CASE("formatDuration rounds before it picks the unit and tames odd inputs",
   CHECK(formatDuration(std::numeric_limits<double>::infinity()) == "1000000000h00m");
 }
 
+TEST_CASE("the starting line gives what is left and the whole", "[consolereporter]") {
+  std::ostringstream out;
+  ConsoleReporter reporter(out, false);
+  reporter.onRunStarted(RunPlan{3670016, 2422720, 1100, 1792});
+  CHECK(out.str() == "starting: 2422720 pixels in 1100 rows remaining of 3670016 pixels in 1792 rows\n");
+}
+
 TEST_CASE("a saved row prints progress, rate and ETA", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
-  reporter.onRunStarted(RunPlan{3670016, 3670016, 1792, 1792});
+  // The run set out to fetch 2424771 pixels; this row attempts 2051 of them, which leaves 2422720.
+  reporter.onRunStarted(RunPlan{3670016, 2424771, 981, 1792});
   reporter.onRowSaved(RowReport{811, 1792, 2048, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
   const std::string text = out.str();
-  CHECK_THAT(text, ContainsSubstring("starting: 3670016 pixels in 1792 rows"));
+  CHECK_THAT(text,
+             ContainsSubstring("starting: 2424771 pixels in 981 rows remaining of 3670016 pixels in 1792 rows\n"));
   CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed "
                                      "41.2s  49.8 px/s  eta 13h31m"));
 }
@@ -4473,6 +4484,7 @@ TEST_CASE("a row without elapsed time prints no ETA", "[consolereporter]") {
 TEST_CASE("rate and ETA cover the last ten saved rows", "[consolereporter]") {
   std::ostringstream out;
   ConsoleReporter reporter(out, false);
+  reporter.onRunStarted(RunPlan{2000, 2000, 20, 20});
   // Row 0 attempts 100 pixels in an absurd 1e6 s. Rows 1 to 10 attempt 100 each (90 ok, 6 nodata,
   // 4 failed) in 2 s, so each of them adds 96 to the 2000 pixels' done count.
   reporter.onRowSaved(RowReport{0, 20, 100, 0, 0, std::chrono::duration<double>(1e6), 100, 2000});
@@ -4481,11 +4493,37 @@ TEST_CASE("rate and ETA cover the last ten saved rows", "[consolereporter]") {
                                   100 + 96 * static_cast<std::uint64_t>(row), 2000});
   }
   const std::vector<std::string> lines = linesOf(out.str());
-  REQUIRE(lines.size() == 11);
-  // The tenth line still counts row 0: 1000 pixels in 1000018 s.
-  CHECK_THAT(lines[9], ContainsSubstring("  0.0 px/s  "));
-  // The eleventh drops it: 1000 pixels in 20 s is 50 px/s, and 940 pixels remain.
-  CHECK(lines[10] == "row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.8s");
+  REQUIRE(lines.size() == 12);  // the starting line, then eleven row lines
+  // The tenth row line still counts row 0: 1000 pixels in 1000018 s.
+  CHECK_THAT(lines[10], ContainsSubstring("  0.0 px/s  "));
+  // The eleventh drops it: 1000 pixels in 20 s is 50 px/s, and 900 of the 2000 pixels are unattempted.
+  CHECK(lines[11] == "row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.0s");
+}
+
+TEST_CASE("the ETA leaves out pixels that failed this run", "[consolereporter]") {
+  std::ostringstream out;
+  ConsoleReporter reporter(out, false);
+  reporter.onRunStarted(RunPlan{100, 100, 1, 1});
+  // Every pixel has been attempted. The 10 failures stay NaN, but this run does not retry them.
+  reporter.onRowSaved(RowReport{0, 1, 90, 0, 10, std::chrono::duration<double>(10.0), 90, 100});
+  const std::vector<std::string> lines = linesOf(out.str());
+  REQUIRE(lines.size() == 2);
+  CHECK(lines[1] == "row 1/1  done 90/100 (90.0%)  row: 90 ok 0 nodata 10 failed 10.0s  10.0 px/s  eta 0.0s");
+}
+
+TEST_CASE("a new run starts a new window and a new count", "[consolereporter]") {
+  std::ostringstream out;
+  ConsoleReporter reporter(out, false);
+  reporter.onRunStarted(RunPlan{2000, 2000, 20, 20});
+  reporter.onRowSaved(RowReport{0, 20, 100, 0, 0, std::chrono::duration<double>(100.0), 100, 2000});
+  reporter.onRowSaved(RowReport{1, 20, 100, 0, 0, std::chrono::duration<double>(100.0), 200, 2000});
+  reporter.onRunStarted(RunPlan{2000, 1800, 18, 20});
+  reporter.onRowSaved(RowReport{2, 20, 100, 0, 0, std::chrono::duration<double>(2.0), 300, 2000});
+  const std::vector<std::string> lines = linesOf(out.str());
+  REQUIRE(lines.size() == 5);
+  // Only the second run's row counts: 100 pixels in 2 s, with 1700 of its 1800 pixels left. Keeping
+  // the first run's rows would give 1.5 px/s, and keeping its attempts an ETA of 30.0s.
+  CHECK(lines[4] == "row 3/20  done 300/2000 (15.0%)  row: 100 ok 0 nodata 0 failed 2.0s  50.0 px/s  eta 34.0s");
 }
 
 TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
@@ -4505,6 +4543,7 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
   CHECK_THAT(out.str(), !ContainsSubstring("stopped:"));
 
   s.failed = 1;
+  s.remainingNaN = 1;
   std::ostringstream one;
   ConsoleReporter oneFailure(one, false);
   oneFailure.onRunFinished(s);
@@ -4518,7 +4557,59 @@ TEST_CASE("a stopped run names the reason", "[consolereporter]") {
   s.stopReason = StopReason::Signal;
   s.stopMessage = "interrupted";
   reporter.onRunFinished(s);
-  CHECK_THAT(out.str(), ContainsSubstring("stopped: interrupted"));
+  // The totals come first; with nothing failed and nothing left there is no hint.
+  CHECK(out.str() == "done: 0 values, 0 nodata, 0 failed, 0 rows saved, 0.0s elapsed\nstopped: interrupted\n");
+}
+
+TEST_CASE("a run that stops early says how to resume", "[consolereporter]") {
+  RunSummary s;
+  s.pixelsFetched = 1490;
+  s.noData = 8;
+  s.remainingNaN = 500;
+  s.rowsSaved = 3;
+  s.elapsed = std::chrono::duration<double>(30.0);
+  s.stopReason = StopReason::Signal;
+  s.stopMessage = "interrupted";
+
+  std::ostringstream noFailures;
+  writeSummary(noFailures, s);
+  CHECK(noFailures.str() ==
+        "done: 1490 values, 8 nodata, 0 failed, 3 rows saved, 30.0s elapsed\n"
+        "stopped: interrupted\n"
+        "rerun with the same arguments to resume the remaining 500 pixels\n");
+
+  s.failed = 2;
+  std::ostringstream twoFailures;
+  writeSummary(twoFailures, s);
+  CHECK(twoFailures.str() ==
+        "done: 1490 values, 8 nodata, 2 failed, 3 rows saved, 30.0s elapsed\n"
+        "stopped: interrupted\n"
+        "rerun with the same arguments to resume the remaining 500 pixels (2 failed this run)\n");
+
+  s.failed = 0;
+  s.remainingNaN = 1;
+  std::ostringstream onePixel;
+  writeSummary(onePixel, s);
+  CHECK_THAT(onePixel.str(), ContainsSubstring("rerun with the same arguments to resume the remaining 1 pixel\n"));
+}
+
+TEST_CASE("writeSummary writes the lines onRunFinished prints", "[consolereporter]") {
+  RunSummary s;
+  s.pixelsFetched = 1490;
+  s.noData = 8;
+  s.failed = 2;
+  s.remainingNaN = 500;
+  s.rowsSaved = 3;
+  s.elapsed = std::chrono::duration<double>(30.0);
+  s.stopReason = StopReason::ConsecutiveFailures;
+  s.stopMessage = "server unreachable: 100 consecutive failures; last error: http 503";
+  std::ostringstream direct;
+  writeSummary(direct, s);
+  std::ostringstream viaSink;
+  ConsoleReporter reporter(viaSink, false);
+  reporter.onRunFinished(s);
+  CHECK(linesOf(direct.str()).size() == 3);
+  CHECK(direct.str() == viaSink.str());
 }
 
 TEST_CASE("verbose mode prints one line per resolved pixel", "[consolereporter]") {
@@ -4657,6 +4748,7 @@ Expected: FAIL with `Cannot find source file: src/demdl/ConsoleReporter.cpp`.
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <mutex>
 #include <string>
@@ -4670,12 +4762,20 @@ namespace demdl {
 // inputs give "0.0s", and inputs above a billion hours give "1000000000h00m".
 [[nodiscard]] std::string formatDuration(double seconds);
 
+// Writes the finish lines of a run: the totals, "stopped: <message>" if it stopped, and, while the
+// file still has NaN pixels, how to finish the job (retry this run's failures, or resume the rest).
+// Does not flush. ConsoleReporter::onRunFinished prints these lines; main calls this itself after a
+// --preview run, whose sink prints nothing.
+void writeSummary(std::ostream& out, const RunSummary& summary);
+
 // Headless progress: one line per saved row, optional per-pixel lines, a final summary.
 // Each callback writes its lines whole under one mutex, so concurrent pixel events never interleave.
 // The starting, row and finish lines are flushed as they are written, so a redirected stdout logs
 // each row when it is saved; the frequent verbose pixel lines are left to the stream's buffering.
-// Callbacks never throw except on allocation failure while formatting (std::bad_alloc), which is
-// why they are not noexcept. The stream must keep exceptions disabled, as std::cout does by default.
+// Callbacks do not throw in practice: lines are formatted into fixed buffers and short strings.
+// They are not noexcept only because std::mutex::lock and std::string construction may formally
+// throw. The stream must keep exceptions disabled; once it fails (closed stdout, EPIPE), later
+// lines are silently dropped.
 class ConsoleReporter : public ProgressSink {
  public:
   // `out` must outlive the reporter. `verbose` adds a line per resolved pixel.
@@ -4695,9 +4795,13 @@ class ConsoleReporter : public ProgressSink {
   std::ostream& out_;
   const bool verbose_;
   std::mutex mutex_;
-  // The last ten saved rows, for rate and ETA: a ring that never allocates. Unused slots are zero.
+  // The last ten saved rows, for the rate: a ring that never allocates. Unused slots are zero.
   std::array<RowSample, 10> window_{};
   std::size_t next_ = 0;  // the slot the next saved row overwrites
+  // For the ETA: the pixels the run set out to fetch and how many it has attempted. A run does not
+  // retry its own failures, so a pixel that failed no longer counts as work left.
+  std::uint64_t pixelsTodo_ = 0;
+  std::uint64_t attempted_ = 0;
 };
 
 }  // namespace demdl
@@ -4736,18 +4840,36 @@ std::string formatDuration(double seconds) {
   return buf;
 }
 
+void writeSummary(std::ostream& out, const RunSummary& s) {
+  out << "done: " << s.pixelsFetched << " values, " << s.noData << " nodata, " << s.failed << " failed, "
+      << s.rowsSaved << " rows saved, " << formatDuration(s.elapsed.count()) << " elapsed\n";
+  if (s.stopReason != StopReason::None) out << "stopped: " << s.stopMessage << "\n";
+  if (s.remainingNaN == 0) return;
+  out << "rerun with the same arguments to ";
+  if (s.failed > 0 && s.remainingNaN == s.failed) {
+    out << "retry the " << s.failed << (s.failed == 1 ? " failed pixel" : " failed pixels");
+  } else {
+    out << "resume the remaining " << s.remainingNaN << (s.remainingNaN == 1 ? " pixel" : " pixels");
+    if (s.failed > 0) out << " (" << s.failed << " failed this run)";
+  }
+  out << "\n";
+}
+
 ConsoleReporter::ConsoleReporter(std::ostream& out, bool verbose) : out_(out), verbose_(verbose) {}
 
 void ConsoleReporter::onRunStarted(const RunPlan& plan) {
   std::lock_guard<std::mutex> lock(mutex_);
   window_.fill(RowSample{});
   next_ = 0;
+  pixelsTodo_ = plan.pixelsTodo;
+  attempted_ = 0;
   out_ << "starting: " << plan.pixelsTodo << " pixels in " << plan.rowsTodo << " rows remaining of "
        << plan.pixelsTotal << " pixels in " << plan.rowsTotal << " rows\n" << std::flush;
 }
 
 void ConsoleReporter::onPixelState(const PixelEvent& e) {
-  if (!verbose_) return;
+  // Queued and InFlight print nothing, so they return before taking the lock.
+  if (!verbose_ || e.state == PixelState::Queued || e.state == PixelState::InFlight) return;
   std::lock_guard<std::mutex> lock(mutex_);
   switch (e.state) {
     case PixelState::Value: {
@@ -4774,19 +4896,22 @@ void ConsoleReporter::onPixelState(const PixelEvent& e) {
 
 void ConsoleReporter::onRowSaved(const RowReport& r) {
   std::lock_guard<std::mutex> lock(mutex_);
-  const double pixels = static_cast<double>(r.ok) + static_cast<double>(r.noData) + static_cast<double>(r.failed);
-  window_[next_] = RowSample{pixels, r.elapsed.count()};
+  const std::uint64_t rowAttempted =
+      static_cast<std::uint64_t>(r.ok) + static_cast<std::uint64_t>(r.noData) + static_cast<std::uint64_t>(r.failed);
+  attempted_ += rowAttempted;
+  window_[next_] = RowSample{static_cast<double>(rowAttempted), r.elapsed.count()};
   next_ = (next_ + 1) % window_.size();
-  double attempted = 0.0;
-  double seconds = 0.0;
+  double windowPixels = 0.0;
+  double windowSeconds = 0.0;
   for (const RowSample& w : window_) {
-    attempted += w.pixels;
-    seconds += w.seconds;
+    windowPixels += w.pixels;
+    windowSeconds += w.seconds;
   }
-  const double rate = seconds > 0.0 ? attempted / seconds : 0.0;
+  const double rate = windowSeconds > 0.0 ? windowPixels / windowSeconds : 0.0;
+  // "done" and the percentage describe the file; the ETA counts only pixels the run has yet to attempt.
   const double percent =
       r.pixelsTotal > 0 ? 100.0 * static_cast<double>(r.pixelsDoneTotal) / static_cast<double>(r.pixelsTotal) : 100.0;
-  const std::uint64_t remaining = r.pixelsTotal > r.pixelsDoneTotal ? r.pixelsTotal - r.pixelsDoneTotal : 0;
+  const std::uint64_t remaining = pixelsTodo_ > attempted_ ? pixelsTodo_ - attempted_ : 0;
   const std::string eta = rate > 0.0 ? formatDuration(static_cast<double>(remaining) / rate) : std::string("--");
   const std::string rowTime = formatDuration(r.elapsed.count());
   char line[256];
@@ -4800,13 +4925,7 @@ void ConsoleReporter::onRowSaved(const RowReport& r) {
 
 void ConsoleReporter::onRunFinished(const RunSummary& s) {
   std::lock_guard<std::mutex> lock(mutex_);
-  out_ << "done: " << s.pixelsFetched << " values, " << s.noData << " nodata, " << s.failed << " failed, "
-       << s.rowsSaved << " rows saved, " << formatDuration(s.elapsed.count()) << " elapsed\n";
-  if (s.stopReason != StopReason::None) out_ << "stopped: " << s.stopMessage << "\n";
-  if (s.failed > 0) {
-    out_ << "rerun with the same arguments to retry the " << s.failed
-         << (s.failed == 1 ? " failed pixel\n" : " failed pixels\n");
-  }
+  writeSummary(out_, s);
   out_.flush();
 }
 
@@ -4816,7 +4935,7 @@ void ConsoleReporter::onRunFinished(const RunSummary& s) {
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[consolereporter]"`
-Expected: `All tests passed (N assertions in 10 test cases)`. The four-thread case takes about 0.05 s.
+Expected: `All tests passed (N assertions in 15 test cases)`. The four-thread case takes about 0.05 s.
 
 - [ ] **Step 7: Commit**
 
