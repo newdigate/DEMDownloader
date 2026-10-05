@@ -4381,9 +4381,17 @@ Implements the headless sink from spec section 8.
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "demdl/ConsoleReporter.h"
 
@@ -4397,11 +4405,35 @@ using demdl::RunSummary;
 using demdl::StopReason;
 using demdl::formatDuration;
 
+namespace {
+
+// The lines of `text`, without their newlines.
+std::vector<std::string> linesOf(const std::string& text) {
+  std::vector<std::string> lines;
+  std::istringstream in(text);
+  for (std::string line; std::getline(in, line);) lines.push_back(line);
+  return lines;
+}
+
+}  // namespace
+
 TEST_CASE("formatDuration picks units by magnitude", "[consolereporter]") {
   CHECK(formatDuration(41.2) == "41.2s");
   CHECK(formatDuration(725.0) == "12m05s");
   CHECK(formatDuration(48667.0) == "13h31m");
   CHECK(formatDuration(50520.0) == "14h02m");
+}
+
+TEST_CASE("formatDuration rounds before it picks the unit and tames odd inputs", "[consolereporter]") {
+  CHECK(formatDuration(59.94) == "59.9s");
+  CHECK(formatDuration(59.95) == "1m00s");  // "%.1f" alone would print 60.0
+  CHECK(formatDuration(60.0) == "1m00s");
+  CHECK(formatDuration(3599.4) == "59m59s");
+  CHECK(formatDuration(3599.6) == "1h00m");  // not 60m00s
+  CHECK(formatDuration(-1.0) == "0.0s");
+  CHECK(formatDuration(std::nan("")) == "0.0s");
+  CHECK(formatDuration(1e300) == "1000000000h00m");  // capped at a billion hours
+  CHECK(formatDuration(std::numeric_limits<double>::infinity()) == "1000000000h00m");
 }
 
 TEST_CASE("a saved row prints progress, rate and ETA", "[consolereporter]") {
@@ -4411,8 +4443,33 @@ TEST_CASE("a saved row prints progress, rate and ETA", "[consolereporter]") {
   reporter.onRowSaved(RowReport{811, 1792, 2048, 0, 3, std::chrono::duration<double>(41.2), 1247296, 3670016});
   const std::string text = out.str();
   CHECK_THAT(text, ContainsSubstring("starting: 3670016 pixels in 1792 rows"));
-  CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  "
-                                     "49.8 px/s  eta 13h31m"));
+  CHECK_THAT(text, ContainsSubstring("row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed "
+                                     "41.2s  49.8 px/s  eta 13h31m"));
+}
+
+TEST_CASE("a row without elapsed time prints no ETA", "[consolereporter]") {
+  std::ostringstream out;
+  ConsoleReporter reporter(out, false);
+  reporter.onRowSaved(RowReport{0, 4, 10, 0, 0, std::chrono::duration<double>(0.0), 10, 40});
+  CHECK(out.str() == "row 1/4  done 10/40 (25.0%)  row: 10 ok 0 nodata 0 failed 0.0s  0.0 px/s  eta --\n");
+}
+
+TEST_CASE("rate and ETA cover the last ten saved rows", "[consolereporter]") {
+  std::ostringstream out;
+  ConsoleReporter reporter(out, false);
+  // Row 0 attempts 100 pixels in an absurd 1e6 s. Rows 1 to 10 attempt 100 each (90 ok, 6 nodata,
+  // 4 failed) in 2 s, so each of them adds 96 to the 2000 pixels' done count.
+  reporter.onRowSaved(RowReport{0, 20, 100, 0, 0, std::chrono::duration<double>(1e6), 100, 2000});
+  for (int row = 1; row <= 10; ++row) {
+    reporter.onRowSaved(RowReport{row, 20, 90, 6, 4, std::chrono::duration<double>(2.0),
+                                  100 + 96 * static_cast<std::uint64_t>(row), 2000});
+  }
+  const std::vector<std::string> lines = linesOf(out.str());
+  REQUIRE(lines.size() == 11);
+  // The tenth line still counts row 0: 1000 pixels in 1000018 s.
+  CHECK_THAT(lines[9], ContainsSubstring("  0.0 px/s  "));
+  // The eleventh drops it: 1000 pixels in 20 s is 50 px/s, and 940 pixels remain.
+  CHECK(lines[10] == "row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.8s");
 }
 
 TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
@@ -4426,7 +4483,8 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
   s.rowsSaved = 1792;
   s.elapsed = std::chrono::duration<double>(50520.0);
   reporter.onRunFinished(s);
-  CHECK_THAT(out.str(), ContainsSubstring("done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
+  CHECK_THAT(out.str(),
+             ContainsSubstring("done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
   CHECK_THAT(out.str(), ContainsSubstring("rerun with the same arguments to retry the 3 failed pixels"));
   CHECK_THAT(out.str(), !ContainsSubstring("stopped:"));
 }
@@ -4454,7 +4512,50 @@ TEST_CASE("verbose mode prints one line per resolved pixel", "[consolereporter]"
   verbose.onPixelState(PixelEvent{14, 812, PixelState::Failed, 0.0f, 9, "http 500"});
   verbose.onPixelState(PixelEvent{15, 812, PixelState::Queued, 0.0f, 0, {}});
   verbose.onPixelState(PixelEvent{15, 812, PixelState::InFlight, 0.0f, 0, {}});
-  CHECK(out.str() == "x=12 y=812 123.4 m (1 attempt)\nx=13 y=812 nodata\nx=14 y=812 failed: http 500\n");
+  verbose.onPixelState(PixelEvent{15, 812, PixelState::Failed, 0.0f, 1, "transport: SSL server verification failed"});
+  verbose.onPixelState(PixelEvent{16, 812, PixelState::Value, 5.0f, 2, {}});
+  CHECK(out.str() ==
+        "x=12 y=812 123.4 m (1 attempt)\n"
+        "x=13 y=812 nodata\n"
+        "x=14 y=812 failed after 9 attempts: http 500\n"
+        "x=15 y=812 failed after 1 attempt: transport: SSL server verification failed\n"
+        "x=16 y=812 5.0 m (2 attempts)\n");
+}
+
+TEST_CASE("concurrent pixel events print whole lines", "[consolereporter]") {
+  constexpr int kThreads = 4;
+  constexpr int kEvents = 1000;
+  std::ostringstream out;
+  ConsoleReporter reporter(out, true);
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&reporter, &go, t] {
+      while (!go.load()) std::this_thread::yield();
+      for (int i = 0; i < kEvents; ++i) {
+        if (i % 3 == 0) reporter.onPixelState(PixelEvent{i, t, PixelState::Value, static_cast<float>(i) + 0.5f, 1, {}});
+        if (i % 3 == 1) reporter.onPixelState(PixelEvent{i, t, PixelState::NoData, 0.0f, 1, {}});
+        if (i % 3 == 2) reporter.onPixelState(PixelEvent{i, t, PixelState::Failed, 0.0f, 3, "http 503"});
+      }
+    });
+  }
+  go = true;
+  for (std::thread& thread : threads) thread.join();
+
+  std::vector<std::string> expected;
+  for (int t = 0; t < kThreads; ++t) {
+    for (int i = 0; i < kEvents; ++i) {
+      const std::string pixel = "x=" + std::to_string(i) + " y=" + std::to_string(t);
+      if (i % 3 == 0) expected.push_back(pixel + " " + std::to_string(i) + ".5 m (1 attempt)");
+      if (i % 3 == 1) expected.push_back(pixel + " nodata");
+      if (i % 3 == 2) expected.push_back(pixel + " failed after 3 attempts: http 503");
+    }
+  }
+  std::vector<std::string> lines = linesOf(out.str());
+  CHECK(lines.size() == static_cast<std::size_t>(kThreads * kEvents));
+  std::sort(lines.begin(), lines.end());
+  std::sort(expected.begin(), expected.end());
+  CHECK(lines == expected);
 }
 ```
 
@@ -4495,7 +4596,8 @@ Expected: FAIL with `Cannot find source file: src/demdl/ConsoleReporter.cpp`.
 ```cpp
 #pragma once
 
-#include <deque>
+#include <array>
+#include <cstddef>
 #include <iosfwd>
 #include <mutex>
 #include <string>
@@ -4504,12 +4606,18 @@ Expected: FAIL with `Cannot find source file: src/demdl/ConsoleReporter.cpp`.
 
 namespace demdl {
 
-// "41.2s" under a minute, "12m05s" under an hour, otherwise "13h31m".
-std::string formatDuration(double seconds);
+// "41.2s" under a minute, "12m05s" under an hour, otherwise "13h31m" (minutes truncated). The unit
+// is chosen after rounding, so 59.95 gives "1m00s" and 3599.6 gives "1h00m". NaN and negative
+// inputs give "0.0s", and inputs above a billion hours give "1000000000h00m".
+[[nodiscard]] std::string formatDuration(double seconds);
 
 // Headless progress: one line per saved row, optional per-pixel lines, a final summary.
+// Each callback writes its lines whole under one mutex, so concurrent pixel events never interleave.
+// Callbacks never throw except on allocation failure while formatting (std::bad_alloc), which is
+// why they are not noexcept. The stream must keep exceptions disabled, as std::cout does by default.
 class ConsoleReporter : public ProgressSink {
  public:
+  // `out` must outlive the reporter. `verbose` adds a line per resolved pixel.
   ConsoleReporter(std::ostream& out, bool verbose);
 
   void onRunStarted(const RunPlan& plan) override;
@@ -4518,10 +4626,17 @@ class ConsoleReporter : public ProgressSink {
   void onRunFinished(const RunSummary& summary) override;
 
  private:
+  struct RowSample {
+    double pixels = 0.0;   // ok + noData + failed
+    double seconds = 0.0;  // the row's elapsed time
+  };
+
   std::ostream& out_;
-  bool verbose_;
+  const bool verbose_;
   std::mutex mutex_;
-  std::deque<RowReport> window_;  // the last ten rows, for rate and ETA
+  // The last ten saved rows, for rate and ETA: a ring that never allocates. Unused slots are zero.
+  std::array<RowSample, 10> window_{};
+  std::size_t next_ = 0;  // the slot the next saved row overwrites
 };
 
 }  // namespace demdl
@@ -4540,17 +4655,23 @@ class ConsoleReporter : public ProgressSink {
 namespace demdl {
 
 std::string formatDuration(double seconds) {
+  // NaN fails the comparison as well, so it joins the negatives at zero. The cap keeps llround in range.
+  constexpr double kMaxSeconds = 3600.0 * 1e9;  // a billion hours
+  if (!(seconds > 0.0)) seconds = 0.0;
+  if (seconds > kMaxSeconds) seconds = kMaxSeconds;
   char buf[48];
-  if (seconds < 60.0) {
-    std::snprintf(buf, sizeof buf, "%.1fs", seconds);
+  // Round first and choose the unit from the rounded value, which rules out "60.0s" and "60m00s".
+  const long long tenths = std::llround(seconds * 10.0);
+  if (tenths < 600) {
+    std::snprintf(buf, sizeof buf, "%lld.%llds", tenths / 10, tenths % 10);
     return buf;
   }
-  const long total = std::lround(seconds);
+  const long long total = std::llround(seconds);
   if (total < 3600) {
-    std::snprintf(buf, sizeof buf, "%ldm%02lds", total / 60, total % 60);
+    std::snprintf(buf, sizeof buf, "%lldm%02llds", total / 60, total % 60);
     return buf;
   }
-  std::snprintf(buf, sizeof buf, "%ldh%02ldm", total / 3600, (total % 3600) / 60);
+  std::snprintf(buf, sizeof buf, "%lldh%02lldm", total / 3600, (total % 3600) / 60);
   return buf;
 }
 
@@ -4558,7 +4679,8 @@ ConsoleReporter::ConsoleReporter(std::ostream& out, bool verbose) : out_(out), v
 
 void ConsoleReporter::onRunStarted(const RunPlan& plan) {
   std::lock_guard<std::mutex> lock(mutex_);
-  window_.clear();
+  window_.fill(RowSample{});
+  next_ = 0;
   out_ << "starting: " << plan.pixelsTodo << " pixels in " << plan.rowsTodo << " rows remaining of "
        << plan.pixelsTotal << " pixels in " << plan.rowsTotal << " rows\n";
 }
@@ -4568,7 +4690,7 @@ void ConsoleReporter::onPixelState(const PixelEvent& e) {
   std::lock_guard<std::mutex> lock(mutex_);
   switch (e.state) {
     case PixelState::Value: {
-      char value[32];
+      char value[48];  // room for -FLT_MAX at one decimal
       std::snprintf(value, sizeof value, "%.1f", static_cast<double>(e.value));
       out_ << "x=" << e.x << " y=" << e.y << " " << value << " m (" << e.attempts
            << (e.attempts == 1 ? " attempt)" : " attempts)") << "\n";
@@ -4578,7 +4700,8 @@ void ConsoleReporter::onPixelState(const PixelEvent& e) {
       out_ << "x=" << e.x << " y=" << e.y << " nodata\n";
       break;
     case PixelState::Failed:
-      out_ << "x=" << e.x << " y=" << e.y << " failed: " << e.error << "\n";
+      out_ << "x=" << e.x << " y=" << e.y << " failed after " << e.attempts
+           << (e.attempts == 1 ? " attempt: " : " attempts: ") << e.error << "\n";
       break;
     case PixelState::Queued:
     case PixelState::InFlight:
@@ -4588,13 +4711,14 @@ void ConsoleReporter::onPixelState(const PixelEvent& e) {
 
 void ConsoleReporter::onRowSaved(const RowReport& r) {
   std::lock_guard<std::mutex> lock(mutex_);
-  window_.push_back(r);
-  if (window_.size() > 10) window_.pop_front();
+  const double pixels = static_cast<double>(r.ok) + static_cast<double>(r.noData) + static_cast<double>(r.failed);
+  window_[next_] = RowSample{pixels, r.elapsed.count()};
+  next_ = (next_ + 1) % window_.size();
   double attempted = 0.0;
   double seconds = 0.0;
-  for (const RowReport& w : window_) {
-    attempted += static_cast<double>(w.ok + w.noData + w.failed);
-    seconds += w.elapsed.count();
+  for (const RowSample& w : window_) {
+    attempted += w.pixels;
+    seconds += w.seconds;
   }
   const double rate = seconds > 0.0 ? attempted / seconds : 0.0;
   const double percent =
@@ -4625,7 +4749,7 @@ void ConsoleReporter::onRunFinished(const RunSummary& s) {
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[consolereporter]"`
-Expected: `All tests passed (N assertions in 5 test cases)`.
+Expected: `All tests passed (N assertions in 9 test cases)`. The four-thread case takes about 0.05 s.
 
 - [ ] **Step 7: Commit**
 

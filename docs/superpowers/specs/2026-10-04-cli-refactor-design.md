@@ -419,21 +419,32 @@ throw, because pixel events are delivered inside pool jobs.
 **ConsoleReporter** writes to stdout. Per saved row:
 
 ```
-row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.7 px/s  eta 13h32m
+row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.8 px/s  eta 13h31m
 ```
 
-Rate and ETA use the pixels completed over the last ten saved rows, or all
-rows if fewer. With `--verbose`, each pixel also logs
+The rate divides the pixels attempted (ok, nodata and failed) in the last ten
+saved rows, or all rows if fewer, by those rows' elapsed time. The ETA divides
+the pixels still NaN by that rate and reads `--` while the rate is zero.
+Durations read `41.2s` under a minute, `12m05s` under an hour and `13h31m`
+beyond, with the unit chosen after rounding, so 59.95 s reads `1m00s`; NaN
+and negative durations read `0.0s`, and anything above a billion hours reads
+`1000000000h00m`. With `--verbose`, each resolved pixel also logs
 `x=12 y=812 123.4 m (1 attempt)`, `x=12 y=812 nodata`, or
-`x=12 y=812 failed: <error>` under a mutex. On finish:
+`x=12 y=812 failed after 9 attempts: <error>` (`after 1 attempt` for a single
+one); `Queued` and `InFlight` log nothing. Every line is written whole under
+the reporter's mutex, so concurrent pixel lines never interleave. On finish:
 
 ```
 done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed
 rerun with the same arguments to retry the 3 failed pixels
 ```
 
-A stop prints its reason first, for example
-`stopping: interrupted; waiting for 8 in-flight requests`.
+A stopped run adds `stopped: <stop message>` after the `done:` line. The
+line that announces a stop as it happens, for example
+`stopping: interrupted; waiting for 8 in-flight requests`, is printed by
+`main` when it sees the stop token raised, not by the reporter: `main` polls
+the token every 100 ms, because nothing may print from inside a signal
+handler.
 
 **PreviewWindow** implements the sink over GLFW 3.3 core profile in a 640x480
 resizable window titled `dl_elevation 34.0%`. It owns a per-pixel state byte
@@ -592,6 +603,24 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `describeUnparseableBody` is tested directly: an empty and a whitespace-only
   body give their byte counts, a 300-byte body shows exactly 200 bytes, and
   ESC, BEL, DEL and the UTF-8 bytes `C2 9B` become `.` on a single line.
+- **ConsoleReporter**, writing to a `std::ostringstream`: `formatDuration`
+  gives `41.2s`, `12m05s`, `13h31m` and `14h02m`; it chooses the unit after
+  rounding, so 59.94 gives `59.9s`, 59.95 and 60 give `1m00s`, 3599.4 gives
+  `59m59s` and 3599.6 gives `1h00m`; -1 and NaN give `0.0s`, and 1e300 and
+  infinity give `1000000000h00m`. Row 811 of 1792, saved with 2048 ok,
+  0 nodata and 3 failed in 41.2 s and 1247296 of 3670016 pixels done, prints
+  exactly
+  `row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.8 px/s  eta 13h31m`;
+  a row saved with no elapsed time prints `0.0 px/s  eta --`; of eleven rows
+  whose first took 1e6 s, the tenth line still prints `0.0 px/s`, and the
+  eleventh, whose window has dropped that row, prints exactly
+  `row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.8s`.
+  The summary prints the totals line and the retry hint and no `stopped:`
+  line; a stopped run prints `stopped: interrupted`. Verbose lines are checked
+  for values after one attempt and after two, NoData, and failures after 9
+  attempts and after 1; `Queued` and `InFlight` print nothing, and without
+  verbose nothing prints at all. Four threads posting 1000 verbose events each
+  produce exactly the 4000 expected lines, none interleaved.
 - **Cli**: the example argv yields the expected Config; omitting `--north`
   fails; `--insecure` and `--ca-bundle` set their fields; `--threads 0`
   fails validation.
