@@ -130,6 +130,8 @@ TEST_CASE("the --help flag prints usage and exits successfully", "[cli]") {
   CHECK_THAT(p.out, ContainsSubstring("--max-consecutive-failures"));
   CHECK_THAT(p.out, ContainsSubstring("(1..64)"));
   CHECK_THAT(p.out, ContainsSubstring("(0..100)"));
+  CHECK_THAT(p.out, ContainsSubstring("(width x height at most 536870912)"));
+  CHECK_THAT(p.out, ContainsSubstring("(a file name, not . or ..)"));
 }
 
 TEST_CASE("help wins over an invalid value", "[cli]") {

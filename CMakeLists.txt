@@ -26,7 +26,8 @@ option(DL_ELEVATION_TESTS "Build the Catch2 test suite" ON)
 
 include(FetchContent)
 # cpp-httplib is pinned to the Homebrew version in use so both dependency paths compile identical
-# code. FIND_PACKAGE_ARGS prefers the system package when it is 0.46.x, otherwise the pinned copy is downloaded.
+# code. FIND_PACKAGE_ARGS prefers the system package when it is 0.46.1 or a later 0.46 release,
+# otherwise the pinned copy is downloaded.
 FetchContent_Declare(httplib
   GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
   GIT_TAG        v0.46.1

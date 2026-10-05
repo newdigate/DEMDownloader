@@ -1,14 +1,16 @@
 # dl_elevation: class refactor and command-line interface
 
 Date: 2026-10-04
-Status: approved design, awaiting implementation plan
+Status: approved design, implemented through
+`docs/superpowers/plans/2026-10-04-cli-refactor.md`
 
 ## 1. Summary
 
 `dl_elevation` scrapes a Digital Elevation Model from the City of Cape Town's
 public WMS server one pixel at a time and accumulates the heights into a TIFF.
-Today it is a single 450-line `main.cpp` with every parameter hardcoded, global
-state throughout, an always-on OpenGL preview window, and no tests.
+The previous program was a single 450-line `main.cpp` with every parameter
+hardcoded, global state throughout, an always-on OpenGL preview window, and no
+tests.
 
 This design restructures it into a small static library of single-purpose
 units, a thin command-line executable, an optional preview component, and a
@@ -48,7 +50,7 @@ Non-goals for this iteration:
 | Shutdown | SIGINT/SIGTERM stop queueing, drain in-flight requests, save, exit. |
 | Preview | Off by default; `--preview` opens the window. |
 | Structure | Static library + thin CLI + optional preview + tests. No source or sink abstractions beyond a one-method fetch interface for testing. |
-| Dependencies | FetchContent pinned to release tags. CLI11 for parsing, Catch2 v3 for tests. ctpl kept for the pool. |
+| Dependencies | FetchContent pins cpp-httplib, CLI11 and Catch2 to release tags and ctpl to a commit hash. CLI11 for parsing, Catch2 v3 for tests. ctpl kept for the pool. |
 
 ## 4. Architecture
 
@@ -123,12 +125,13 @@ is reported first. `pixelScale(width, height)` returns
 sizes and a validated box, and checks neither. `approxEquals(other, tol)`
 compares each edge with an absolute tolerance that is inclusive, so a
 tolerance of 0 accepts an identical box, and a NaN edge never compares equal.
-This replaces the current code, in which the variable named `north` holds the
-smaller latitude.
+This replaces the previous single-file program, in which the variable named
+`north` held the smaller latitude.
 
 **Config** is a struct mirroring the flags in section 5 plus `validate()`,
 which reports the first problem it finds, checking in this order: the box; a
-positive grid size; a grid of at most 536870912 (2^29) pixels, with `width *
+positive grid size; a grid of at most `kMaxPixels` (2^29 = 536870912) pixels,
+a constant in `Config.h` that `DemRaster::load` also applies, with `width *
 height` computed in 64 bits, which keeps the float32 data within 2 GiB, well
 under the 4 GiB a classic TIFF file can hold; an output path that is not empty
 and names a file (not a directory path ending in a separator, and not `.` or
@@ -136,12 +139,16 @@ and names a file (not a directory path ending in a separator, and not `.` or
 not empty and contains no `;` (the field separator of the output's
 `IMAGEDESCRIPTION`); `threads` between 1 and 64; `maxRetries` between 0 and
 100; and `maxConsecutiveFailures >= 1`. The scheme is `http` or `https`, the
-host is a hostname or a bracketed IPv6 literal, the port is 1 to 65535, and
-userinfo, queries, fragments, whitespace and control characters are refused;
-the message for a URL that does not parse names what is accepted and what is
-refused. No parsing library appears in the library.
+host is a hostname, an IPv4 address or a bracketed IPv6 literal, the port is 1
+to 65535, and userinfo, queries, fragments, whitespace and control characters
+are refused; the message for a URL that does not parse names what is accepted
+and what is refused. No parsing library appears in the library.
 
-**WmsQuery** has two free functions.
+**WmsQuery** has four free functions.
+`std::string percentEncode(std::string_view)` applies RFC 3986
+percent-encoding: unreserved characters pass through, every other byte
+becomes `%XX`. `std::string formatCoordinate(double)` prints degrees with nine
+fixed decimals, the form used in URLs and in reports alike.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
 target (path plus query) for pixel column `x`, row `y`.
 `ParseResult parseElevation(std::string_view body)` returns one of
@@ -156,7 +163,7 @@ contain `ServiceException` and does not start with markup (`<` as the first
 non-whitespace character). Anything else is a `ParseError` and is retried,
 because NoData is stored as -32768 and never re-requested; WMS servers often
 report a fault, such as a wrong layer name, as HTTP 200 with an XML exception
-report or an HTML page. Both are pure.
+report or an HTML page. All four are pure.
 
 **RetryPolicy** is `{maxRetries, baseDelay = 500 ms, maxDelay = 30 s,
 jitter = 0.2}` with `delayFor(attempt, unitRandom)`: `min(base * 2^attempt,
@@ -244,9 +251,10 @@ UTF-8-encoded, reaches the terminal.
 **DemRaster** holds `width`, `height`, `BoundingBox`, `RasterMetadata{layer,
 wmsUrl}` and `std::vector<float>` in row-major order, row 0 at the north edge.
 API: `create(width, height, box, metadata)` filled with NaN; `load(path)`
-(throws on missing, unreadable or non-matching format, and rejects a file
-whose box, reconstructed from the tiepoint and pixel scale, fails
-validation); `save(path)` atomic; `float at(x, y) const`;
+(throws on missing, unreadable or non-matching format, rejects a file whose
+box, reconstructed from the tiepoint and pixel scale, fails validation, and
+refuses one with more than `kMaxPixels` pixels before allocating);
+`save(path)` atomic; `float at(x, y) const`;
 `void set(x, y, float)`; `std::vector<int> todoInRow(row)` listing NaN
 columns; `rowsWithWork()`; `countNaN()`;
 `bool matches(const Config&, std::string& why)`; constant `kNoData =
@@ -271,9 +279,9 @@ CLI11; the version string is the CMake project version, starting at 0.2.0.
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
 | `--north`, `--south`, `--east`, `--west` | yes | | WGS84 decimal degrees |
-| `--width`, `--height` | yes | | grid size in pixels; width x height at most 536870912 (2^29, a 2 GiB float32 file) |
-| `--output PATH`, `-o` | yes | | GeoTIFF path, relative to the current directory; must name a file, so not a directory, `.` or `..` |
-| `--wms-url URL` | no | `https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets` | `http://` or `https://`, a host name or bracketed IPv6 address, an optional port (1 to 65535) and an optional path; no user name, query, fragment, spaces or control characters |
+| `--width`, `--height` | yes | | grid width and height in pixels; width x height at most 536870912 (2^29, 2 GiB of float32) |
+| `--output PATH`, `-o` | yes | | GeoTIFF to create or resume, relative to the current directory; a file name, not a directory, `.` or `..` |
+| `--wms-url URL` | no | `https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets` | `http://` or `https://`, a host name, an IPv4 address or a bracketed IPv6 address, an optional port (1 to 65535) and an optional path; no user name, query, fragment, spaces or control characters |
 | `--layer NAME` | no | `Elevation_CCT_GLM2019_5m_DEM` | WMS layer name, taken unencoded; used for `LAYERS` and `QUERY_LAYERS` |
 | `--threads N` | no | 8 | worker threads (1..64), one keep-alive connection each |
 | `--max-retries N` | no | 8 | retries per pixel after the first attempt (0..100) |
@@ -299,10 +307,10 @@ or a carriage return show. A value for `--output`, `--layer`, `--wms-url` or
 (`looks like a flag; is the value missing?`), so a forgotten path cannot turn
 `--output --dry-run` into a real run that writes to a file named `--dry-run`.
 
-Example, today's Simon's Town run with the latitude names corrected:
+Example, the original Simon's Town run with the latitude names corrected:
 
 ```bash
-dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output simonstown.tif --preview
+dl_elevation --north -34.1845418 --south -34.2163447 --west 18.4185791 --east 18.4625244 --width 2048 --height 1792 --output "${TMPDIR:-/tmp}/simonstown.tif" --preview
 ```
 
 `--dry-run` prints: the resolved Config, whether the output will be created,
@@ -363,8 +371,9 @@ On start, when the output exists and `--overwrite` is not given:
    format cannot be resumed". A file whose `IMAGEDESCRIPTION` does not start
    with `dl_elevation;` was not written by this tool and is refused, before
    anything is allocated, with "was not written by dl_elevation; choose
-   another --output or use --overwrite". `load` also rejects a width or
-   height above `INT_MAX` before allocating.
+   another --output or use --overwrite". `load` also rejects, before
+   allocating, a width or height above `INT_MAX` and a width x height above
+   536870912, the limit `Config::validate` applies.
 2. `matches(config)` compares width, height, each box edge within 1e-9
    degrees, and the layer from `IMAGEDESCRIPTION`. Any mismatch is an error
    that lists every differing field and suggests `--overwrite` or a different
@@ -742,9 +751,10 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   south, an empty layer and one containing `;`, an output ending in `/` or
   named `.`, `..`, `dir/.` or `dir/..` (`.dem.tif` is accepted), and grids of
   536870913 x 1, 65536 x 65536 and `INT_MAX` x `INT_MAX` pixels
-  (32768 x 16384, exactly 2^29, is accepted); a grid that is too large is
-  reported before an empty output, and a zero width before a zero thread
-  count.
+  (32768 x 16384, exactly 2^29, is accepted); two sides of -65536 are
+  reported as not positive, so positivity comes before the size, a grid that
+  is too large is reported before an empty output, and a zero width before a
+  zero thread count.
 - **WmsQuery**: golden URL for the example Config at pixel (0, 0) equals
   `/erdas-iws/ogc/wms/GeoSpatial%20Datasets?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&BBOX=-34.216344700%2C18.418579100%2C-34.184541800%2C18.462524400&CRS=EPSG%3A4326&WIDTH=2048&HEIGHT=1792&LAYERS=Elevation_CCT_GLM2019_5m_DEM&STYLES=&FORMAT=image%2Fpng&QUERY_LAYERS=Elevation_CCT_GLM2019_5m_DEM&INFO_FORMAT=text%2Fplain&I=0&J=0`
   (coordinates fixed at nine decimals, order south, west, north, east as WMS
@@ -775,7 +785,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   `(none)`; a hand-written RGB16 TIFF is rejected with the legacy message; a
   hand-written float32 GeoTIFF whose tiepoint has a NaN west edge is rejected
   as an invalid bounding box, and one without the dl_elevation description
-  as not written by dl_elevation; a file claiming a width above `INT_MAX` is
+  as not written by dl_elevation; a file claiming a width above `INT_MAX`,
+  and one claiming 65536 x 65536 pixels, more than `validate` allows, are
   rejected before anything is allocated; a missing file's error carries
   libtiff's reason, and a `save` into a missing directory names the reason
   exactly once; after `save` no `.tmp` file remains; a `save` whose
@@ -999,11 +1010,12 @@ written or requested, so with `--overwrite` an existing file keeps its bytes.
   way.
 - FetchContent pins: cpp-httplib `v0.46.1` (matches the Homebrew package in
   use; `FIND_PACKAGE_ARGS 0.46.1 NAMES httplib` so a system copy is preferred
-  only when it is 0.46.x, otherwise the pinned copy is downloaded),
+  only when it is 0.46.1 or a later 0.46 release, 0.46.0 being refused,
+  otherwise the pinned copy is downloaded),
   ctpl commit `437e135dbd94eb65b45533d9ce8ee28b5bd37b6d`
   (its two tags point at this commit), CLI11 `v2.7.2`, Catch2 `v3.16.0`.
 - libtiff via `find_package(TIFF REQUIRED)`; libgeotiff via `find_path` and
-  `find_library` as today, now actually used.
+  `find_library` as in the previous build, now actually used.
 - Preview: glfw via pkg-config; on Apple link the OpenGL, Cocoa, IOKit and
   CoreVideo frameworks; on Linux link GLEW and GL. All of them are PRIVATE to
   `demdl_preview`, whose header includes none of theirs; as a static library
@@ -1018,7 +1030,7 @@ Toolchain requirement: AppleClang 15 on macOS, GCC 12 or Clang 15 on Linux.
 `std::jthread` and `std::format` are unavailable on AppleClang 15 and are not
 used.
 
-## 13. Behaviour changes relative to today
+## 13. Behaviour changes relative to the previous program
 
 - Output is float32 metres with NoData `-32768`; no 700 m scale factor;
   negative heights preserved.

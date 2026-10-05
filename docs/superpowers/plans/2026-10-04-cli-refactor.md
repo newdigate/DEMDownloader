@@ -32,7 +32,7 @@
 - Include library headers as `"demdl/Name.h"`; the `src` directory is on the include path.
 - Never run `dl_elevation` without `--dry-run` against the default WMS URL during this plan. It makes real requests to a public city server. The only live-request step is the optional manual check at the end of Task 13, and it needs the owner's go-ahead first.
 - Commit after every task with the message given. Every commit message ends with the attribution trailer of the model doing the work: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` through `4a9747c`, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` from `82ed491` on.
-- The first configure after Task 1 fetches four dependencies and compiles Catch2; allow a few minutes.
+- The first configure after Task 1 downloads the dependencies (three when Homebrew's cpp-httplib 0.46.1 or a later 0.46 release is found, otherwise four); the first build compiles Catch2, so allow a few minutes.
 
 ## File structure
 
@@ -104,7 +104,8 @@ option(DL_ELEVATION_TESTS "Build the Catch2 test suite" ON)
 
 include(FetchContent)
 # cpp-httplib is pinned to the Homebrew version in use so both dependency paths compile identical
-# code. FIND_PACKAGE_ARGS prefers the system package when it is 0.46.x, otherwise the pinned copy is downloaded.
+# code. FIND_PACKAGE_ARGS prefers the system package when it is 0.46.1 or a later 0.46 release,
+# otherwise the pinned copy is downloaded.
 FetchContent_Declare(httplib
   GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
   GIT_TAG        v0.46.1
@@ -386,7 +387,7 @@ Implements spec section 4.3 (Config) and the default values in section 5.
 
 #include "demdl/Config.h"
 
-// Today's Simon's Town run with the latitude names corrected (the old code
+// The original Simon's Town run with the latitude names corrected (the old code
 // stored the smaller latitude in a variable called "north").
 inline demdl::Config exampleConfig() {
   demdl::Config c;
@@ -487,9 +488,9 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config url = exampleConfig();
   url.wmsUrl = "not a url";
   CHECK(url.validate() ==
-        "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
-        "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
-        "characters are not allowed");
+        "wms-url must be http:// or https:// followed by a host name, an IPv4 address or an [IPv6 address], "
+        "an optional :port (1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces "
+        "and control characters are not allowed");
 
   Config retries = exampleConfig();
   retries.maxRetries = -1;
@@ -542,8 +543,8 @@ TEST_CASE("validation reports the first problem", "[config]") {
   CHECK(directory.validate().empty());
 
   // At most 2^29 pixels, counted in 64 bits, so 65536 x 65536 and INT_MAX x INT_MAX cannot wrap into range.
-  const std::string tooLarge =
-      "width x height must be at most 536870912 pixels (a classic TIFF file holds at most 4 GiB)";
+  const std::string tooLarge = "width x height must be at most 536870912 pixels "
+                               "(2 GiB of float32; a classic TIFF file holds at most 4 GiB)";
   Config size = exampleConfig();
   size.width = 32768;
   size.height = 16384;  // exactly 2^29
@@ -560,6 +561,11 @@ TEST_CASE("validation reports the first problem", "[config]") {
   // The size is checked right after positivity, before the output path.
   size.output.clear();
   CHECK(size.validate() == tooLarge);
+  // And after positivity: two negative sides multiply to 2^32, which the size check would refuse.
+  Config negative = exampleConfig();
+  negative.width = -65536;
+  negative.height = -65536;
+  CHECK(negative.validate() == "width and height must be positive");
 
   // Two faults at once: the grid is checked before the thread count, which pins the check order.
   Config both = exampleConfig();
@@ -595,6 +601,7 @@ Expected: FAIL with `Cannot find source file: src/demdl/Config.cpp` (CMake re-ru
 ```cpp
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -613,6 +620,10 @@ struct WmsEndpoint {
 // Userinfo, queries, fragments, whitespace and control characters are refused, and so is anything
 // else that does not fit: the result is then nullopt.
 [[nodiscard]] std::optional<WmsEndpoint> parseWmsUrl(const std::string& url);
+
+// The largest width x height that Config::validate accepts and DemRaster::load reads: 2^29 float32
+// pixels make 2 GiB, well under the 4 GiB that classic TIFF's 32-bit offsets reach.
+inline constexpr std::int64_t kMaxPixels = std::int64_t{1} << 29;
 
 // Every runtime option, mirroring the command-line flags one to one.
 // No command-line parsing lives here.
@@ -651,9 +662,6 @@ struct Config {
 namespace demdl {
 
 namespace {
-
-// 2^29 float32 pixels make a 2 GiB file, well under the 4 GiB that classic TIFF's 32-bit offsets reach.
-constexpr std::int64_t kMaxPixels = std::int64_t{1} << 29;
 
 // The character tests are ASCII only, so the result does not depend on the locale.
 bool isDigit(char c) { return c >= '0' && c <= '9'; }
@@ -737,7 +745,7 @@ std::string Config::validate() const {
   if (width <= 0 || height <= 0) return "width and height must be positive";
   if (std::int64_t{width} * height > kMaxPixels) {
     return "width x height must be at most " + std::to_string(kMaxPixels) +
-           " pixels (a classic TIFF file holds at most 4 GiB)";
+           " pixels (2 GiB of float32; a classic TIFF file holds at most 4 GiB)";
   }
   if (output.empty()) return "output path must not be empty";
   // "." and ".." name directories even without a trailing separator.
@@ -745,9 +753,9 @@ std::string Config::validate() const {
     return "output must name a file";
   }
   if (!parseWmsUrl(wmsUrl)) {
-    return "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
-           "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
-           "characters are not allowed";
+    return "wms-url must be http:// or https:// followed by a host name, an IPv4 address or an "
+           "[IPv6 address], an optional :port (1 to 65535) and an optional path; user names, queries (?), "
+           "fragments (#), spaces and control characters are not allowed";
   }
   if (layer.empty()) return "layer must not be empty";
   if (layer.find(';') != std::string::npos) return "layer must not contain ';'";
@@ -1844,25 +1852,32 @@ TEST_CASE("a GeoTIFF that dl_elevation did not write is rejected", "[demraster]"
 
 TEST_CASE("oversized dimensions are rejected before allocation", "[demraster]") {
   TempDir dir;
-  const auto file = dir.path / "oversized.tif";
-  {
-    // libtiff will not read back a directory without strip offsets, so one four-byte placeholder
-    // strip stands in for the 8 GiB that a single row of this width would take.
+  // A dl_elevation header claiming width x height pixels in one strip. libtiff will not read back a
+  // directory without strip offsets, so a four-byte placeholder strip stands in for the gigabytes the
+  // pixels would take. There is no tiepoint, which load would refuse next, before allocating.
+  const auto claim = [&dir](const char* name, uint32_t width, uint32_t height) {
+    const auto file = dir.path / name;
     TIFF* tif = XTIFFOpen(file.string().c_str(), "w");
     REQUIRE(tif != nullptr);
-    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 2147483649u);
-    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 1u);
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, width);
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, height);
     TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
     TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 32);
     TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
     TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 1u);
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, height);
     TIFFSetField(tif, TIFFTAG_IMAGEDESCRIPTION, "dl_elevation;layer=;wms=");
     float placeholder = 0.0f;
     REQUIRE(TIFFWriteRawStrip(tif, 0, &placeholder, 4) == 4);
     XTIFFClose(tif);
-  }
-  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("is too large"));
+    return file;
+  };
+  // A side above INT_MAX.
+  CHECK_THROWS_WITH(DemRaster::load(claim("wide.tif", 2147483649u, 1u)), ContainsSubstring("is too large"));
+  // Sides that fit an int, with more pixels than Config::validate allows.
+  CHECK_THROWS_WITH(DemRaster::load(claim("big.tif", 65536u, 65536u)),
+                    ContainsSubstring("is too large: 65536 x 65536 pixels; width x height must be at most "
+                                      "536870912 pixels"));
 }
 
 TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {
@@ -2255,6 +2270,12 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
   if (width > kMaxSide || height > kMaxSide) {
     fail(path.string() + " is too large: " + std::to_string(width) + " x " + std::to_string(height) +
          " pixels");
+  }
+  // The limit Config::validate applies, so that a file this program could not have written is refused
+  // before its pixels are allocated.
+  if (static_cast<std::uint64_t>(width) * height > static_cast<std::uint64_t>(kMaxPixels)) {
+    fail(path.string() + " is too large: " + std::to_string(width) + " x " + std::to_string(height) +
+         " pixels; width x height must be at most " + std::to_string(kMaxPixels) + " pixels");
   }
   if (width == 0 || height == 0) fail(path.string() + " has an empty image");
 
@@ -5180,6 +5201,8 @@ TEST_CASE("the --help flag prints usage and exits successfully", "[cli]") {
   CHECK_THAT(p.out, ContainsSubstring("--max-consecutive-failures"));
   CHECK_THAT(p.out, ContainsSubstring("(1..64)"));
   CHECK_THAT(p.out, ContainsSubstring("(0..100)"));
+  CHECK_THAT(p.out, ContainsSubstring("(width x height at most 536870912)"));
+  CHECK_THAT(p.out, ContainsSubstring("(a file name, not . or ..)"));
 }
 
 TEST_CASE("help wins over an invalid value", "[cli]") {
@@ -5576,9 +5599,13 @@ ParseOutcome parseArgs(int argc, const char* const* argv, Config& config, std::o
   app.add_option("--south", config.box.south, "southern edge, WGS84 decimal degrees")->required()->check(decimal);
   app.add_option("--east", config.box.east, "eastern edge, WGS84 decimal degrees")->required()->check(decimal);
   app.add_option("--west", config.box.west, "western edge, WGS84 decimal degrees")->required()->check(decimal);
-  app.add_option("--width", config.width, "grid width in pixels")->required()->check(wholeNumber);
-  app.add_option("--height", config.height, "grid height in pixels")->required()->check(wholeNumber);
-  app.add_option("-o,--output", output, "GeoTIFF to create or resume")->required()->check(notFlagLike);
+  // The limit Config::validate applies, from the same constant.
+  const std::string sizeLimit = " (width x height at most " + std::to_string(kMaxPixels) + ")";
+  app.add_option("--width", config.width, "grid width in pixels" + sizeLimit)->required()->check(wholeNumber);
+  app.add_option("--height", config.height, "grid height in pixels" + sizeLimit)->required()->check(wholeNumber);
+  app.add_option("-o,--output", output, "GeoTIFF to create or resume (a file name, not . or ..)")
+      ->required()
+      ->check(notFlagLike);
   app.add_option("--wms-url", config.wmsUrl, "WMS endpoint: scheme, host and path")
       ->capture_default_str()
       ->check(notFlagLike);
@@ -6438,8 +6465,8 @@ constexpr const char* kOverwriteHint = "use --overwrite to start fresh or choose
 
 // SIGINT and SIGTERM. The first requests a stop, which main announces when it sees the token raised:
 // nothing may print here. A second ends the process by that signal's default action, so a calling shell
-// sees the signal, reports 130 or 143 and stops a script or loop running this program. Every call here is
-// async-signal-safe.
+// sees the signal and reports 130 or 143; after a second Ctrl-C, which reaches the whole foreground job, a
+// script or loop running this program stops too. Every call here is async-signal-safe.
 void onSignal(int number) {
   if (g_signalCount.fetch_add(1) == 0) {
     g_stopToken.request(demdl::StopReason::Signal);
@@ -6990,7 +7017,7 @@ class Shader {
       char log[1024] = "";
       glGetProgramInfoLog(id_, sizeof log, nullptr, log);
       glDeleteProgram(id_);  // the destructor does not run for a constructor that throws
-      throw std::runtime_error("shader link error: " + tidy(log));
+      throw std::runtime_error(withLog("shader link error", log));
     }
   }
   ~Shader() {
@@ -7015,9 +7042,15 @@ class Shader {
       char log[1024] = "";
       glGetShaderInfoLog(shader, sizeof log, nullptr, log);
       glDeleteShader(shader);
-      throw std::runtime_error(std::string(label) + " shader compile error: " + tidy(log));
+      throw std::runtime_error(withLog(std::string(label) + " shader compile error", log));
     }
     return shader;
+  }
+
+  // "<what>: <log>", or just <what> when the driver's log is empty or blank.
+  static std::string withLog(std::string what, const char* log) {
+    if (const std::string text = tidy(log); !text.empty()) what += ": " + text;
+    return what;
   }
 
   // The driver's log on one line, so that all of it stays on main's "error:" line: each line trimmed,
@@ -7503,8 +7536,8 @@ Implements the deletions in spec section 4.2 and the documentation item in secti
 git rm -q -r include opengl.cmake.in main.cpp
 ```
 
-Run: `git status --short | head`
-Expected: `D` entries for `main.cpp`, `opengl.cmake.in` and every file under `include/`, nothing else.
+Run: `git status --short | grep -v '^??'`
+Expected: 21 `D` lines, for `main.cpp`, `opengl.cmake.in` and the nineteen files under `include/`, nothing else.
 
 - [ ] **Step 2: Confirm nothing referenced them**
 
@@ -7547,7 +7580,7 @@ One unit's tests by Catch2 tag, for example `./build/demdl_tests "[downloader]"`
 
 Options: `-DDL_ELEVATION_PREVIEW=OFF` drops the GLFW window and every OpenGL dependency (default ON on macOS, OFF elsewhere). `-DDL_ELEVATION_TESTS=OFF` skips Catch2.
 
-Homebrew packages: `pkg-config libtiff libgeotiff openssl@3`, plus `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
+Homebrew packages: `libtiff libgeotiff openssl@3`, plus `pkg-config` and `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
 
 Running the tool makes real requests to a public server. Check a command line with `--dry-run`, and never start a live download just to see whether the build works:
 
@@ -7584,13 +7617,13 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 
 - Link `httplib::httplib`, never bare `httplib`. Only the namespaced target exists when Homebrew's package is found, and the bare name silently drops `CPPHTTPLIB_OPENSSL_SUPPORT`.
 - `CMAKE_FIND_FRAMEWORK` is `LAST` because `/Library/Frameworks/Mono.framework/Headers` ships a libtiff 4.0.9 `tiff.h` that otherwise wins over Homebrew's.
-- Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from a FetchContent target. Harmless today, worth knowing when bumping versions.
+- Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so it compiles `/usr/local/include/httplib.h` even when FetchContent supplies the pinned copy. After `brew upgrade cpp-httplib` moves past 0.46, the build silently compiles the newer header. Pin the formula with `brew pin cpp-httplib`, or bump the pin in `CMakeLists.txt` to match.
 - Policy CMP0156 is set to NEW so that `libdemdl.a` is linked once when a target names both `demdl` and `demdl_cli`, which links `demdl` itself. Without it, the Xcode 15 linker warns about a duplicate library. The block is guarded by `if(POLICY CMP0156)` because the minimum version, CMake 3.27, predates the policy, which arrived in 3.29.
 - Dependencies are pinned: cpp-httplib v0.46.1 (matches the Homebrew package), ctpl 437e135, CLI11 v2.7.2, Catch2 v3.16.0. Bump cpp-httplib together with the Homebrew package.
 
 ## Repository hygiene
 
-`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Never stage with `git add -A`.
+`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Each is RGB16 with the same value in every channel and no georeferencing, and reads as metres = `value * S / 65535` with negative heights written as 0: S is 1100 for `capetown.tif` and its two byte-identical copies (grid and box in `e2bea3e:main.cpp`) and 700 for `simonstown.tif` (`fc7dcef:main.cpp`). Never stage with `git add -A`.
 ````
 
 - [ ] **Step 4: Commit**

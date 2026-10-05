@@ -37,7 +37,7 @@ class Shader {
       char log[1024] = "";
       glGetProgramInfoLog(id_, sizeof log, nullptr, log);
       glDeleteProgram(id_);  // the destructor does not run for a constructor that throws
-      throw std::runtime_error("shader link error: " + tidy(log));
+      throw std::runtime_error(withLog("shader link error", log));
     }
   }
   ~Shader() {
@@ -62,9 +62,15 @@ class Shader {
       char log[1024] = "";
       glGetShaderInfoLog(shader, sizeof log, nullptr, log);
       glDeleteShader(shader);
-      throw std::runtime_error(std::string(label) + " shader compile error: " + tidy(log));
+      throw std::runtime_error(withLog(std::string(label) + " shader compile error", log));
     }
     return shader;
+  }
+
+  // "<what>: <log>", or just <what> when the driver's log is empty or blank.
+  static std::string withLog(std::string what, const char* log) {
+    if (const std::string text = tidy(log); !text.empty()) what += ": " + text;
+    return what;
   }
 
   // The driver's log on one line, so that all of it stays on main's "error:" line: each line trimmed,

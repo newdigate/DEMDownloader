@@ -2,7 +2,7 @@
 
 #include "demdl/Config.h"
 
-// Today's Simon's Town run with the latitude names corrected (the old code
+// The original Simon's Town run with the latitude names corrected (the old code
 // stored the smaller latitude in a variable called "north").
 inline demdl::Config exampleConfig() {
   demdl::Config c;

@@ -28,7 +28,7 @@ One unit's tests by Catch2 tag, for example `./build/demdl_tests "[downloader]"`
 
 Options: `-DDL_ELEVATION_PREVIEW=OFF` drops the GLFW window and every OpenGL dependency (default ON on macOS, OFF elsewhere). `-DDL_ELEVATION_TESTS=OFF` skips Catch2.
 
-Homebrew packages: `pkg-config libtiff libgeotiff openssl@3`, plus `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
+Homebrew packages: `libtiff libgeotiff openssl@3`, plus `pkg-config` and `glfw` for the preview (Linux also needs `glew`). Homebrew's `cpp-httplib` is used when it is 0.46.1 or a later 0.46 release; otherwise FetchContent downloads the pinned version.
 
 Running the tool makes real requests to a public server. Check a command line with `--dry-run`, and never start a live download just to see whether the build works:
 
@@ -65,10 +65,10 @@ The end-to-end tests and the loopback WMS script in the plan's Task 13 Step 9 ru
 
 - Link `httplib::httplib`, never bare `httplib`. Only the namespaced target exists when Homebrew's package is found, and the bare name silently drops `CPPHTTPLIB_OPENSSL_SUPPORT`.
 - `CMAKE_FIND_FRAMEWORK` is `LAST` because `/Library/Frameworks/Mono.framework/Headers` ships a libtiff 4.0.9 `tiff.h` that otherwise wins over Homebrew's.
-- Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so a Homebrew header shadows a same-named header from a FetchContent target. Harmless today, worth knowing when bumping versions.
+- Apple clang searches `/usr/local/include` ahead of every `-isystem` directory, so it compiles `/usr/local/include/httplib.h` even when FetchContent supplies the pinned copy. After `brew upgrade cpp-httplib` moves past 0.46, the build silently compiles the newer header. Pin the formula with `brew pin cpp-httplib`, or bump the pin in `CMakeLists.txt` to match.
 - Policy CMP0156 is set to NEW so that `libdemdl.a` is linked once when a target names both `demdl` and `demdl_cli`, which links `demdl` itself. Without it, the Xcode 15 linker warns about a duplicate library. The block is guarded by `if(POLICY CMP0156)` because the minimum version, CMake 3.27, predates the policy, which arrived in 3.29.
 - Dependencies are pinned: cpp-httplib v0.46.1 (matches the Homebrew package), ctpl 437e135, CLI11 v2.7.2, Catch2 v3.16.0. Bump cpp-httplib together with the Homebrew package.
 
 ## Repository hygiene
 
-`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Never stage with `git add -A`.
+`*.tif` and `*.tif.tmp` are ignored. The 20 to 40 MB files in the repository root are download outputs, not sources. Each is RGB16 with the same value in every channel and no georeferencing, and reads as metres = `value * S / 65535` with negative heights written as 0: S is 1100 for `capetown.tif` and its two byte-identical copies (grid and box in `e2bea3e:main.cpp`) and 700 for `simonstown.tif` (`fc7dcef:main.cpp`). Never stage with `git add -A`.

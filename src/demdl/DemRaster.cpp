@@ -193,6 +193,12 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
     fail(path.string() + " is too large: " + std::to_string(width) + " x " + std::to_string(height) +
          " pixels");
   }
+  // The limit Config::validate applies, so that a file this program could not have written is refused
+  // before its pixels are allocated.
+  if (static_cast<std::uint64_t>(width) * height > static_cast<std::uint64_t>(kMaxPixels)) {
+    fail(path.string() + " is too large: " + std::to_string(width) + " x " + std::to_string(height) +
+         " pixels; width x height must be at most " + std::to_string(kMaxPixels) + " pixels");
+  }
   if (width == 0 || height == 0) fail(path.string() + " has an empty image");
 
   uint16_t tieCount = 0;

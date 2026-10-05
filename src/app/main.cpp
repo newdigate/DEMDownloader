@@ -44,8 +44,8 @@ constexpr const char* kOverwriteHint = "use --overwrite to start fresh or choose
 
 // SIGINT and SIGTERM. The first requests a stop, which main announces when it sees the token raised:
 // nothing may print here. A second ends the process by that signal's default action, so a calling shell
-// sees the signal, reports 130 or 143 and stops a script or loop running this program. Every call here is
-// async-signal-safe.
+// sees the signal and reports 130 or 143; after a second Ctrl-C, which reaches the whole foreground job, a
+// script or loop running this program stops too. Every call here is async-signal-safe.
 void onSignal(int number) {
   if (g_signalCount.fetch_add(1) == 0) {
     g_stopToken.request(demdl::StopReason::Signal);

@@ -117,9 +117,13 @@ ParseOutcome parseArgs(int argc, const char* const* argv, Config& config, std::o
   app.add_option("--south", config.box.south, "southern edge, WGS84 decimal degrees")->required()->check(decimal);
   app.add_option("--east", config.box.east, "eastern edge, WGS84 decimal degrees")->required()->check(decimal);
   app.add_option("--west", config.box.west, "western edge, WGS84 decimal degrees")->required()->check(decimal);
-  app.add_option("--width", config.width, "grid width in pixels")->required()->check(wholeNumber);
-  app.add_option("--height", config.height, "grid height in pixels")->required()->check(wholeNumber);
-  app.add_option("-o,--output", output, "GeoTIFF to create or resume")->required()->check(notFlagLike);
+  // The limit Config::validate applies, from the same constant.
+  const std::string sizeLimit = " (width x height at most " + std::to_string(kMaxPixels) + ")";
+  app.add_option("--width", config.width, "grid width in pixels" + sizeLimit)->required()->check(wholeNumber);
+  app.add_option("--height", config.height, "grid height in pixels" + sizeLimit)->required()->check(wholeNumber);
+  app.add_option("-o,--output", output, "GeoTIFF to create or resume (a file name, not . or ..)")
+      ->required()
+      ->check(notFlagLike);
   app.add_option("--wms-url", config.wmsUrl, "WMS endpoint: scheme, host and path")
       ->capture_default_str()
       ->check(notFlagLike);

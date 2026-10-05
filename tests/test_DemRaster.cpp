@@ -336,25 +336,32 @@ TEST_CASE("a GeoTIFF that dl_elevation did not write is rejected", "[demraster]"
 
 TEST_CASE("oversized dimensions are rejected before allocation", "[demraster]") {
   TempDir dir;
-  const auto file = dir.path / "oversized.tif";
-  {
-    // libtiff will not read back a directory without strip offsets, so one four-byte placeholder
-    // strip stands in for the 8 GiB that a single row of this width would take.
+  // A dl_elevation header claiming width x height pixels in one strip. libtiff will not read back a
+  // directory without strip offsets, so a four-byte placeholder strip stands in for the gigabytes the
+  // pixels would take. There is no tiepoint, which load would refuse next, before allocating.
+  const auto claim = [&dir](const char* name, uint32_t width, uint32_t height) {
+    const auto file = dir.path / name;
     TIFF* tif = XTIFFOpen(file.string().c_str(), "w");
     REQUIRE(tif != nullptr);
-    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, 2147483649u);
-    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, 1u);
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, width);
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, height);
     TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
     TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 32);
     TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
     TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 1u);
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, height);
     TIFFSetField(tif, TIFFTAG_IMAGEDESCRIPTION, "dl_elevation;layer=;wms=");
     float placeholder = 0.0f;
     REQUIRE(TIFFWriteRawStrip(tif, 0, &placeholder, 4) == 4);
     XTIFFClose(tif);
-  }
-  CHECK_THROWS_WITH(DemRaster::load(file), ContainsSubstring("is too large"));
+    return file;
+  };
+  // A side above INT_MAX.
+  CHECK_THROWS_WITH(DemRaster::load(claim("wide.tif", 2147483649u, 1u)), ContainsSubstring("is too large"));
+  // Sides that fit an int, with more pixels than Config::validate allows.
+  CHECK_THROWS_WITH(DemRaster::load(claim("big.tif", 65536u, 65536u)),
+                    ContainsSubstring("is too large: 65536 x 65536 pixels; width x height must be at most "
+                                      "536870912 pixels"));
 }
 
 TEST_CASE("loading a missing file reports the path and libtiff's reason", "[demraster]") {

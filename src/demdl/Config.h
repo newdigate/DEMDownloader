@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -18,6 +19,10 @@ struct WmsEndpoint {
 // Userinfo, queries, fragments, whitespace and control characters are refused, and so is anything
 // else that does not fit: the result is then nullopt.
 [[nodiscard]] std::optional<WmsEndpoint> parseWmsUrl(const std::string& url);
+
+// The largest width x height that Config::validate accepts and DemRaster::load reads: 2^29 float32
+// pixels make 2 GiB, well under the 4 GiB that classic TIFF's 32-bit offsets reach.
+inline constexpr std::int64_t kMaxPixels = std::int64_t{1} << 29;
 
 // Every runtime option, mirroring the command-line flags one to one.
 // No command-line parsing lives here.

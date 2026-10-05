@@ -84,9 +84,9 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config url = exampleConfig();
   url.wmsUrl = "not a url";
   CHECK(url.validate() ==
-        "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
-        "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
-        "characters are not allowed");
+        "wms-url must be http:// or https:// followed by a host name, an IPv4 address or an [IPv6 address], "
+        "an optional :port (1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces "
+        "and control characters are not allowed");
 
   Config retries = exampleConfig();
   retries.maxRetries = -1;
@@ -139,8 +139,8 @@ TEST_CASE("validation reports the first problem", "[config]") {
   CHECK(directory.validate().empty());
 
   // At most 2^29 pixels, counted in 64 bits, so 65536 x 65536 and INT_MAX x INT_MAX cannot wrap into range.
-  const std::string tooLarge =
-      "width x height must be at most 536870912 pixels (a classic TIFF file holds at most 4 GiB)";
+  const std::string tooLarge = "width x height must be at most 536870912 pixels "
+                               "(2 GiB of float32; a classic TIFF file holds at most 4 GiB)";
   Config size = exampleConfig();
   size.width = 32768;
   size.height = 16384;  // exactly 2^29
@@ -157,6 +157,11 @@ TEST_CASE("validation reports the first problem", "[config]") {
   // The size is checked right after positivity, before the output path.
   size.output.clear();
   CHECK(size.validate() == tooLarge);
+  // And after positivity: two negative sides multiply to 2^32, which the size check would refuse.
+  Config negative = exampleConfig();
+  negative.width = -65536;
+  negative.height = -65536;
+  CHECK(negative.validate() == "width and height must be positive");
 
   // Two faults at once: the grid is checked before the thread count, which pins the check order.
   Config both = exampleConfig();
