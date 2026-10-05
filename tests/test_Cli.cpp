@@ -132,6 +132,16 @@ TEST_CASE("the --help flag prints usage and exits successfully", "[cli]") {
   CHECK_THAT(p.out, ContainsSubstring("(0..100)"));
 }
 
+TEST_CASE("help wins over an invalid value", "[cli]") {
+  std::vector<const char*> argv = exampleWith("--north", "1,5");
+  argv.push_back("--help");
+  const Parsed p = parse(argv);
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 0);
+  CHECK_THAT(p.out, ContainsSubstring("dl_elevation [OPTIONS]"));
+  CHECK(p.err.empty());
+}
+
 TEST_CASE("the --version flag prints the project version", "[cli]") {
   const Parsed p = parse({"--version"});
   CHECK(p.outcome.exitNow);
@@ -219,6 +229,17 @@ TEST_CASE("integer flags take only plain whole numbers", "[cli]") {
   CHECK(p.outcome.exitCode == 1);
   CHECK_THAT(p.err, ContainsSubstring(std::string(flag) +
                                       ": must be a whole number without leading zeros, separators or prefixes"));
+  CHECK_THAT(p.err, ContainsSubstring(std::string(", not '") + value + "'"));
+}
+
+TEST_CASE("each integer flag runs the whole-number check", "[cli]") {
+  const std::string flag =
+      GENERATE(as<std::string>{}, "--width", "--height", "--threads", "--max-retries", "--max-consecutive-failures");
+  const Parsed p = parse(exampleWith(flag.c_str(), "0100"));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err,
+             ContainsSubstring(flag + ": must be a whole number without leading zeros, separators or prefixes"));
 }
 
 TEST_CASE("coordinates take only plain decimals", "[cli]") {
@@ -229,6 +250,16 @@ TEST_CASE("coordinates take only plain decimals", "[cli]") {
   CHECK(p.outcome.exitCode == 1);
   CHECK_THAT(p.err, ContainsSubstring(
                         "--north: must be a decimal number such as -34.1845418 (use '.' as the decimal separator)"));
+  CHECK_THAT(p.err, ContainsSubstring(", not '" + value + "'"));
+}
+
+TEST_CASE("each coordinate flag runs the decimal check", "[cli]") {
+  const std::string flag = GENERATE(as<std::string>{}, "--north", "--south", "--east", "--west");
+  const Parsed p = parse(exampleWith(flag.c_str(), "1,5"));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(
+                        flag + ": must be a decimal number such as -34.1845418 (use '.' as the decimal separator)"));
 }
 
 TEST_CASE("coordinates may have an exponent or a bare leading or trailing point", "[cli]") {
@@ -249,6 +280,15 @@ TEST_CASE("a value that looks like a flag is a usage error", "[cli]") {
   CHECK_THAT(p.err, ContainsSubstring(std::string(flag) + ": looks like a flag; is the value missing?"));
 }
 
+TEST_CASE("each string option refuses a value that looks like a flag", "[cli]") {
+  // For --ca-bundle this also shows that the check runs before the existing-file check.
+  const std::string flag = GENERATE(as<std::string>{}, "--output", "--layer", "--wms-url", "--ca-bundle");
+  const Parsed p = parse(exampleWith(flag.c_str(), "--x"));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring(flag + ": looks like a flag; is the value missing?"));
+}
+
 TEST_CASE("an unknown flag or a positional argument is a usage error", "[cli]") {
   const std::string extra = GENERATE(as<std::string>{}, "--bogus", "extra");
   std::vector<const char*> argv = kExample;
@@ -257,6 +297,17 @@ TEST_CASE("an unknown flag or a positional argument is a usage error", "[cli]") 
   CHECK(p.outcome.exitNow);
   CHECK(p.outcome.exitCode == 1);
   CHECK_THAT(p.err, ContainsSubstring("not expected: " + extra));
+}
+
+TEST_CASE("a value option given twice is a usage error", "[cli]") {
+  std::vector<const char*> argv = kExample;
+  for (const char* a : {"--threads", "3", "--threads", "4"}) {
+    argv.push_back(a);
+  }
+  const Parsed p = parse(argv);
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, ContainsSubstring("--threads: At most 1 required"));
 }
 
 TEST_CASE("values that parse but are invalid are caught by validate", "[cli]") {

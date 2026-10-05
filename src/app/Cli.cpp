@@ -50,16 +50,17 @@ bool isPlainInteger(const std::string& text) {
   return true;
 }
 
-// The checks below return an empty string for an acceptable value, otherwise the problem.
+// The checks below return an empty string for an acceptable value, otherwise the problem. The numeric ones end
+// with the value as given, quoted, so that stray characters such as a trailing space show.
 
 std::string checkDecimal(const std::string& text) {
   if (isPlainDecimal(text)) return {};
-  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator)";
+  return "must be a decimal number such as -34.1845418 (use '.' as the decimal separator), not '" + text + "'";
 }
 
 std::string checkWholeNumber(const std::string& text) {
   if (isPlainInteger(text)) return {};
-  return "must be a whole number without leading zeros, separators or prefixes";
+  return "must be a whole number without leading zeros, separators or prefixes, not '" + text + "'";
 }
 
 std::string checkNotFlagLike(const std::string& text) {
