@@ -17,6 +17,8 @@ namespace demdl {
 
 // Headless progress: one line per saved row, optional per-pixel lines, a final summary.
 // Each callback writes its lines whole under one mutex, so concurrent pixel events never interleave.
+// The starting, row and finish lines are flushed as they are written, so a redirected stdout logs
+// each row when it is saved; the frequent verbose pixel lines are left to the stream's buffering.
 // Callbacks never throw except on allocation failure while formatting (std::bad_alloc), which is
 // why they are not noexcept. The stream must keep exceptions disabled, as std::cout does by default.
 class ConsoleReporter : public ProgressSink {

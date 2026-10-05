@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -34,6 +35,21 @@ std::vector<std::string> linesOf(const std::string& text) {
   for (std::string line; std::getline(in, line);) lines.push_back(line);
   return lines;
 }
+
+// A string buffer that counts sync() calls, which is where std::ostream::flush() ends up, and
+// remembers how many characters had been written at the last one.
+class SyncCountingBuf : public std::stringbuf {
+ public:
+  int syncs = 0;
+  std::size_t syncedSize = 0;
+
+ protected:
+  int sync() override {
+    ++syncs;
+    syncedSize = str().size();
+    return std::stringbuf::sync();
+  }
+};
 
 }  // namespace
 
@@ -107,6 +123,12 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
              ContainsSubstring("done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
   CHECK_THAT(out.str(), ContainsSubstring("rerun with the same arguments to retry the 3 failed pixels"));
   CHECK_THAT(out.str(), !ContainsSubstring("stopped:"));
+
+  s.failed = 1;
+  std::ostringstream one;
+  ConsoleReporter oneFailure(one, false);
+  oneFailure.onRunFinished(s);
+  CHECK_THAT(one.str(), ContainsSubstring("rerun with the same arguments to retry the 1 failed pixel\n"));
 }
 
 TEST_CASE("a stopped run names the reason", "[consolereporter]") {
@@ -134,12 +156,49 @@ TEST_CASE("verbose mode prints one line per resolved pixel", "[consolereporter]"
   verbose.onPixelState(PixelEvent{15, 812, PixelState::InFlight, 0.0f, 0, {}});
   verbose.onPixelState(PixelEvent{15, 812, PixelState::Failed, 0.0f, 1, "transport: SSL server verification failed"});
   verbose.onPixelState(PixelEvent{16, 812, PixelState::Value, 5.0f, 2, {}});
+  // No attempt counted, as for an exception the Downloader caught: the line carries no count.
+  verbose.onPixelState(PixelEvent{17, 812, PixelState::Failed, 0.0f, 0, "unknown exception"});
+  verbose.onPixelState(PixelEvent{18, 812, PixelState::Failed, 0.0f, -1, "exception: boom"});
   CHECK(out.str() ==
         "x=12 y=812 123.4 m (1 attempt)\n"
         "x=13 y=812 nodata\n"
         "x=14 y=812 failed after 9 attempts: http 500\n"
         "x=15 y=812 failed after 1 attempt: transport: SSL server verification failed\n"
-        "x=16 y=812 5.0 m (2 attempts)\n");
+        "x=16 y=812 5.0 m (2 attempts)\n"
+        "x=17 y=812 failed: unknown exception\n"
+        "x=18 y=812 failed: exception: boom\n");
+}
+
+TEST_CASE("the starting, row and finish lines are flushed, pixel lines are not", "[consolereporter]") {
+  SyncCountingBuf buf;
+  std::ostream out(&buf);
+  ConsoleReporter reporter(out, true);
+
+  reporter.onRunStarted(RunPlan{40, 40, 4, 4});
+  CHECK(buf.syncs >= 1);
+  CHECK(buf.syncedSize == buf.str().size());
+
+  const int beforePixels = buf.syncs;
+  reporter.onPixelState(PixelEvent{0, 0, PixelState::Queued, 0.0f, 0, {}});
+  reporter.onPixelState(PixelEvent{0, 0, PixelState::InFlight, 0.0f, 0, {}});
+  reporter.onPixelState(PixelEvent{0, 0, PixelState::Value, 12.5f, 1, {}});
+  reporter.onPixelState(PixelEvent{1, 0, PixelState::NoData, 0.0f, 1, {}});
+  reporter.onPixelState(PixelEvent{2, 0, PixelState::Failed, 0.0f, 3, "http 500"});
+  CHECK_THAT(buf.str(), ContainsSubstring("x=2 y=0 failed after 3 attempts: http 500\n"));
+  CHECK(buf.syncs == beforePixels);
+
+  reporter.onRowSaved(RowReport{0, 4, 1, 1, 1, std::chrono::duration<double>(1.0), 2, 40});
+  CHECK(buf.syncs > beforePixels);
+  CHECK(buf.syncedSize == buf.str().size());
+
+  const int beforeFinish = buf.syncs;
+  RunSummary s;
+  s.failed = 1;
+  s.stopReason = StopReason::Signal;
+  s.stopMessage = "interrupted";
+  reporter.onRunFinished(s);
+  CHECK(buf.syncs > beforeFinish);
+  CHECK(buf.syncedSize == buf.str().size());
 }
 
 TEST_CASE("concurrent pixel events print whole lines", "[consolereporter]") {

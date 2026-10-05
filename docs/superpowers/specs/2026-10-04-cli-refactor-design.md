@@ -416,7 +416,9 @@ downloader thread (`Queued` comes from the downloader); row and run events come
 from the downloader thread. Sinks guard their own state. Callbacks must not
 throw, because pixel events are delivered inside pool jobs.
 
-**ConsoleReporter** writes to stdout. Per saved row:
+**ConsoleReporter** writes to stdout. It opens with
+`starting: 3670016 pixels in 1792 rows remaining of 3670016 pixels in 1792 rows`
+and then prints, per saved row:
 
 ```
 row 812/1792  done 1247296/3670016 (34.0%)  row: 2048 ok 0 nodata 3 failed 41.2s  49.8 px/s  eta 13h31m
@@ -431,16 +433,22 @@ and negative durations read `0.0s`, and anything above a billion hours reads
 `1000000000h00m`. With `--verbose`, each resolved pixel also logs
 `x=12 y=812 123.4 m (1 attempt)`, `x=12 y=812 nodata`, or
 `x=12 y=812 failed after 9 attempts: <error>` (`after 1 attempt` for a single
-one); `Queued` and `InFlight` log nothing. Every line is written whole under
-the reporter's mutex, so concurrent pixel lines never interleave. On finish:
+one, and plain `x=12 y=812 failed: <error>` when no attempt was counted, as
+for an exception the Downloader caught); `Queued` and `InFlight` log nothing.
+Every line is written whole under the reporter's mutex, so concurrent pixel
+lines never interleave. On finish:
 
 ```
 done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed
 rerun with the same arguments to retry the 3 failed pixels
 ```
 
-A stopped run adds `stopped: <stop message>` after the `done:` line. The
-line that announces a stop as it happens, for example
+The hint reads `retry the 1 failed pixel` for a single failure. A stopped run
+adds `stopped: <stop message>` after the `done:` line. The starting line, each
+row line and the finish lines are flushed as they are written, so that with
+stdout redirected to a file each row reaches the log when it is saved; the
+frequent verbose pixel lines are not flushed. The line that announces a stop
+as it happens, for example
 `stopping: interrupted; waiting for 8 in-flight requests`, is printed by
 `main` when it sees the stop token raised, not by the reporter: `main` polls
 the token every 100 ms, because nothing may print from inside a signal
@@ -616,10 +624,15 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   eleventh, whose window has dropped that row, prints exactly
   `row 11/20  done 1060/2000 (53.0%)  row: 90 ok 6 nodata 4 failed 2.0s  50.0 px/s  eta 18.8s`.
   The summary prints the totals line and the retry hint and no `stopped:`
-  line; a stopped run prints `stopped: interrupted`. Verbose lines are checked
-  for values after one attempt and after two, NoData, and failures after 9
-  attempts and after 1; `Queued` and `InFlight` print nothing, and without
-  verbose nothing prints at all. Four threads posting 1000 verbose events each
+  line, and for a single failure the hint reads `retry the 1 failed pixel`; a
+  stopped run prints `stopped: interrupted`. Verbose lines are checked for
+  values after one attempt and after two, NoData, failures after 9 attempts
+  and after 1, and failures with attempts 0 and -1, which print
+  `failed: <error>` without a count; `Queued` and `InFlight` print nothing,
+  and without verbose nothing prints at all. Through a `std::stringbuf`
+  subclass that counts `sync()` calls, the starting line, a row line and the
+  finish lines each flush everything written so far, while five pixel events
+  in verbose mode flush nothing. Four threads posting 1000 verbose events each
   produce exactly the 4000 expected lines, none interleaved.
 - **Cli**: the example argv yields the expected Config; omitting `--north`
   fails; `--insecure` and `--ca-bundle` set their fields; `--threads 0`

@@ -4388,6 +4388,7 @@ Implements the headless sink from spec section 8.
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -4414,6 +4415,21 @@ std::vector<std::string> linesOf(const std::string& text) {
   for (std::string line; std::getline(in, line);) lines.push_back(line);
   return lines;
 }
+
+// A string buffer that counts sync() calls, which is where std::ostream::flush() ends up, and
+// remembers how many characters had been written at the last one.
+class SyncCountingBuf : public std::stringbuf {
+ public:
+  int syncs = 0;
+  std::size_t syncedSize = 0;
+
+ protected:
+  int sync() override {
+    ++syncs;
+    syncedSize = str().size();
+    return std::stringbuf::sync();
+  }
+};
 
 }  // namespace
 
@@ -4487,6 +4503,12 @@ TEST_CASE("the summary lists totals and the retry hint", "[consolereporter]") {
              ContainsSubstring("done: 3669980 values, 12034 nodata, 3 failed, 1792 rows saved, 14h02m elapsed"));
   CHECK_THAT(out.str(), ContainsSubstring("rerun with the same arguments to retry the 3 failed pixels"));
   CHECK_THAT(out.str(), !ContainsSubstring("stopped:"));
+
+  s.failed = 1;
+  std::ostringstream one;
+  ConsoleReporter oneFailure(one, false);
+  oneFailure.onRunFinished(s);
+  CHECK_THAT(one.str(), ContainsSubstring("rerun with the same arguments to retry the 1 failed pixel\n"));
 }
 
 TEST_CASE("a stopped run names the reason", "[consolereporter]") {
@@ -4514,12 +4536,49 @@ TEST_CASE("verbose mode prints one line per resolved pixel", "[consolereporter]"
   verbose.onPixelState(PixelEvent{15, 812, PixelState::InFlight, 0.0f, 0, {}});
   verbose.onPixelState(PixelEvent{15, 812, PixelState::Failed, 0.0f, 1, "transport: SSL server verification failed"});
   verbose.onPixelState(PixelEvent{16, 812, PixelState::Value, 5.0f, 2, {}});
+  // No attempt counted, as for an exception the Downloader caught: the line carries no count.
+  verbose.onPixelState(PixelEvent{17, 812, PixelState::Failed, 0.0f, 0, "unknown exception"});
+  verbose.onPixelState(PixelEvent{18, 812, PixelState::Failed, 0.0f, -1, "exception: boom"});
   CHECK(out.str() ==
         "x=12 y=812 123.4 m (1 attempt)\n"
         "x=13 y=812 nodata\n"
         "x=14 y=812 failed after 9 attempts: http 500\n"
         "x=15 y=812 failed after 1 attempt: transport: SSL server verification failed\n"
-        "x=16 y=812 5.0 m (2 attempts)\n");
+        "x=16 y=812 5.0 m (2 attempts)\n"
+        "x=17 y=812 failed: unknown exception\n"
+        "x=18 y=812 failed: exception: boom\n");
+}
+
+TEST_CASE("the starting, row and finish lines are flushed, pixel lines are not", "[consolereporter]") {
+  SyncCountingBuf buf;
+  std::ostream out(&buf);
+  ConsoleReporter reporter(out, true);
+
+  reporter.onRunStarted(RunPlan{40, 40, 4, 4});
+  CHECK(buf.syncs >= 1);
+  CHECK(buf.syncedSize == buf.str().size());
+
+  const int beforePixels = buf.syncs;
+  reporter.onPixelState(PixelEvent{0, 0, PixelState::Queued, 0.0f, 0, {}});
+  reporter.onPixelState(PixelEvent{0, 0, PixelState::InFlight, 0.0f, 0, {}});
+  reporter.onPixelState(PixelEvent{0, 0, PixelState::Value, 12.5f, 1, {}});
+  reporter.onPixelState(PixelEvent{1, 0, PixelState::NoData, 0.0f, 1, {}});
+  reporter.onPixelState(PixelEvent{2, 0, PixelState::Failed, 0.0f, 3, "http 500"});
+  CHECK_THAT(buf.str(), ContainsSubstring("x=2 y=0 failed after 3 attempts: http 500\n"));
+  CHECK(buf.syncs == beforePixels);
+
+  reporter.onRowSaved(RowReport{0, 4, 1, 1, 1, std::chrono::duration<double>(1.0), 2, 40});
+  CHECK(buf.syncs > beforePixels);
+  CHECK(buf.syncedSize == buf.str().size());
+
+  const int beforeFinish = buf.syncs;
+  RunSummary s;
+  s.failed = 1;
+  s.stopReason = StopReason::Signal;
+  s.stopMessage = "interrupted";
+  reporter.onRunFinished(s);
+  CHECK(buf.syncs > beforeFinish);
+  CHECK(buf.syncedSize == buf.str().size());
 }
 
 TEST_CASE("concurrent pixel events print whole lines", "[consolereporter]") {
@@ -4613,6 +4672,8 @@ namespace demdl {
 
 // Headless progress: one line per saved row, optional per-pixel lines, a final summary.
 // Each callback writes its lines whole under one mutex, so concurrent pixel events never interleave.
+// The starting, row and finish lines are flushed as they are written, so a redirected stdout logs
+// each row when it is saved; the frequent verbose pixel lines are left to the stream's buffering.
 // Callbacks never throw except on allocation failure while formatting (std::bad_alloc), which is
 // why they are not noexcept. The stream must keep exceptions disabled, as std::cout does by default.
 class ConsoleReporter : public ProgressSink {
@@ -4682,7 +4743,7 @@ void ConsoleReporter::onRunStarted(const RunPlan& plan) {
   window_.fill(RowSample{});
   next_ = 0;
   out_ << "starting: " << plan.pixelsTodo << " pixels in " << plan.rowsTodo << " rows remaining of "
-       << plan.pixelsTotal << " pixels in " << plan.rowsTotal << " rows\n";
+       << plan.pixelsTotal << " pixels in " << plan.rowsTotal << " rows\n" << std::flush;
 }
 
 void ConsoleReporter::onPixelState(const PixelEvent& e) {
@@ -4700,8 +4761,10 @@ void ConsoleReporter::onPixelState(const PixelEvent& e) {
       out_ << "x=" << e.x << " y=" << e.y << " nodata\n";
       break;
     case PixelState::Failed:
-      out_ << "x=" << e.x << " y=" << e.y << " failed after " << e.attempts
-           << (e.attempts == 1 ? " attempt: " : " attempts: ") << e.error << "\n";
+      // An exception the Downloader caught leaves attempts at 0, so there is no count to print.
+      out_ << "x=" << e.x << " y=" << e.y << " failed";
+      if (e.attempts >= 1) out_ << " after " << e.attempts << (e.attempts == 1 ? " attempt" : " attempts");
+      out_ << ": " << e.error << "\n";
       break;
     case PixelState::Queued:
     case PixelState::InFlight:
@@ -4732,7 +4795,7 @@ void ConsoleReporter::onRowSaved(const RowReport& r) {
                 r.rowsTotal, static_cast<unsigned long long>(r.pixelsDoneTotal),
                 static_cast<unsigned long long>(r.pixelsTotal), percent, r.ok, r.noData, r.failed, rowTime.c_str(),
                 rate, eta.c_str());
-  out_ << line << "\n";
+  out_ << line << "\n" << std::flush;
 }
 
 void ConsoleReporter::onRunFinished(const RunSummary& s) {
@@ -4740,7 +4803,11 @@ void ConsoleReporter::onRunFinished(const RunSummary& s) {
   out_ << "done: " << s.pixelsFetched << " values, " << s.noData << " nodata, " << s.failed << " failed, "
        << s.rowsSaved << " rows saved, " << formatDuration(s.elapsed.count()) << " elapsed\n";
   if (s.stopReason != StopReason::None) out_ << "stopped: " << s.stopMessage << "\n";
-  if (s.failed > 0) out_ << "rerun with the same arguments to retry the " << s.failed << " failed pixels\n";
+  if (s.failed > 0) {
+    out_ << "rerun with the same arguments to retry the " << s.failed
+         << (s.failed == 1 ? " failed pixel\n" : " failed pixels\n");
+  }
+  out_.flush();
 }
 
 }  // namespace demdl
@@ -4749,7 +4816,7 @@ void ConsoleReporter::onRunFinished(const RunSummary& s) {
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[consolereporter]"`
-Expected: `All tests passed (N assertions in 9 test cases)`. The four-thread case takes about 0.05 s.
+Expected: `All tests passed (N assertions in 10 test cases)`. The four-thread case takes about 0.05 s.
 
 - [ ] **Step 7: Commit**
 

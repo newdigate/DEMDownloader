@@ -35,7 +35,7 @@ void ConsoleReporter::onRunStarted(const RunPlan& plan) {
   window_.fill(RowSample{});
   next_ = 0;
   out_ << "starting: " << plan.pixelsTodo << " pixels in " << plan.rowsTodo << " rows remaining of "
-       << plan.pixelsTotal << " pixels in " << plan.rowsTotal << " rows\n";
+       << plan.pixelsTotal << " pixels in " << plan.rowsTotal << " rows\n" << std::flush;
 }
 
 void ConsoleReporter::onPixelState(const PixelEvent& e) {
@@ -53,8 +53,10 @@ void ConsoleReporter::onPixelState(const PixelEvent& e) {
       out_ << "x=" << e.x << " y=" << e.y << " nodata\n";
       break;
     case PixelState::Failed:
-      out_ << "x=" << e.x << " y=" << e.y << " failed after " << e.attempts
-           << (e.attempts == 1 ? " attempt: " : " attempts: ") << e.error << "\n";
+      // An exception the Downloader caught leaves attempts at 0, so there is no count to print.
+      out_ << "x=" << e.x << " y=" << e.y << " failed";
+      if (e.attempts >= 1) out_ << " after " << e.attempts << (e.attempts == 1 ? " attempt" : " attempts");
+      out_ << ": " << e.error << "\n";
       break;
     case PixelState::Queued:
     case PixelState::InFlight:
@@ -85,7 +87,7 @@ void ConsoleReporter::onRowSaved(const RowReport& r) {
                 r.rowsTotal, static_cast<unsigned long long>(r.pixelsDoneTotal),
                 static_cast<unsigned long long>(r.pixelsTotal), percent, r.ok, r.noData, r.failed, rowTime.c_str(),
                 rate, eta.c_str());
-  out_ << line << "\n";
+  out_ << line << "\n" << std::flush;
 }
 
 void ConsoleReporter::onRunFinished(const RunSummary& s) {
@@ -93,7 +95,11 @@ void ConsoleReporter::onRunFinished(const RunSummary& s) {
   out_ << "done: " << s.pixelsFetched << " values, " << s.noData << " nodata, " << s.failed << " failed, "
        << s.rowsSaved << " rows saved, " << formatDuration(s.elapsed.count()) << " elapsed\n";
   if (s.stopReason != StopReason::None) out_ << "stopped: " << s.stopMessage << "\n";
-  if (s.failed > 0) out_ << "rerun with the same arguments to retry the " << s.failed << " failed pixels\n";
+  if (s.failed > 0) {
+    out_ << "rerun with the same arguments to retry the " << s.failed
+         << (s.failed == 1 ? " failed pixel\n" : " failed pixels\n");
+  }
+  out_.flush();
 }
 
 }  // namespace demdl
