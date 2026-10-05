@@ -38,6 +38,14 @@ struct DownloaderOptions {
 // job an exception from the InFlight callback or the fetch is recorded as a Failed pixel. Jobs are
 // noexcept, so any other exception in one (a sink callback reporting the result, or building the
 // error text under memory pressure) calls std::terminate instead of unwinding past the pool.
+// A failed save is caught: it stops the run and shows in the summary. From onRunStarted on, an
+// exception on the calling thread still leaves run(), without a summary: one thrown by a sink callback
+// made there (onRunStarted, Queued, onRowSaved or onRunFinished), the std::system_error of a pool
+// that cannot start its first thread (if a later one fails, ctpl ends the process), or an allocation
+// failure. No job outlives run(): an exception while a row's jobs are being queued drops the queued
+// ones and waits for the running ones before it leaves. The file keeps the rows saved before it.
+// main receives the exception through the run's std::promise, prints "error: <what>", or
+// "error: unknown exception" for a type not derived from std::exception, and exits 1.
 class Downloader {
  public:
   // Throws std::invalid_argument when threads or maxConsecutiveFailures is below 1.

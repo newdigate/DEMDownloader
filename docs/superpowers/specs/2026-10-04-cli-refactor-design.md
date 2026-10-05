@@ -105,19 +105,27 @@ and is no longer referenced by default.
 `validate()` requires north > south, east > west, latitudes in [-90, 90],
 longitudes in [-180, 180]. All four values must also be finite, and that check
 is reported first. `pixelScale(width, height)` returns
-`((east - west) / width, (north - south) / height)`. `approxEquals(other, tol)`
-compares each edge with an absolute tolerance. This replaces the current code,
-in which the variable named `north` holds the smaller latitude.
+`((east - west) / width, (north - south) / height)`; it requires positive
+sizes and a validated box, and checks neither. `approxEquals(other, tol)`
+compares each edge with an absolute tolerance that is inclusive, so a
+tolerance of 0 accepts an identical box, and a NaN edge never compares equal.
+This replaces the current code, in which the variable named `north` holds the
+smaller latitude.
 
 **Config** is a struct mirroring the flags in section 5 plus `validate()`,
-which checks the box, positive grid size, `threads` between 1 and 64,
-`maxRetries` between 0 and 100, `maxConsecutiveFailures >= 1`, that the output
-path names a file, that the layer is not empty and contains no `;` (the field
-separator of the output's `IMAGEDESCRIPTION`), and that the WMS URL parses as
-`scheme://host[:port]/path`. The scheme is `http` or `https`, the host is a
-hostname or a bracketed IPv6 literal, the port is 1 to 65535, and userinfo,
-queries, fragments and whitespace are refused. No parsing library appears in
-the library.
+which reports the first problem it finds, checking in this order: the box; a
+positive grid size; a grid of at most 536870912 (2^29) pixels, with `width *
+height` computed in 64 bits, which keeps the float32 data within 2 GiB, well
+under the 4 GiB a classic TIFF file can hold; an output path that is not empty
+and names a file (not a directory path ending in a separator, and not `.` or
+`..`); a WMS URL that parses as `scheme://host[:port][/path]`; a layer that is
+not empty and contains no `;` (the field separator of the output's
+`IMAGEDESCRIPTION`); `threads` between 1 and 64; `maxRetries` between 0 and
+100; and `maxConsecutiveFailures >= 1`. The scheme is `http` or `https`, the
+host is a hostname or a bracketed IPv6 literal, the port is 1 to 65535, and
+userinfo, queries, fragments, whitespace and control characters are refused;
+the message for a URL that does not parse names what is accepted and what is
+refused. No parsing library appears in the library.
 
 **WmsQuery** has two free functions.
 `std::string featureInfoUrl(const Config&, int x, int y)` returns the request
@@ -245,9 +253,9 @@ CLI11; the version string is the CMake project version, starting at 0.2.0.
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
 | `--north`, `--south`, `--east`, `--west` | yes | | WGS84 decimal degrees |
-| `--width`, `--height` | yes | | grid size in pixels |
-| `--output PATH`, `-o` | yes | | GeoTIFF path, relative to the current directory |
-| `--wms-url URL` | no | `https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets` | scheme, host and path of the WMS endpoint |
+| `--width`, `--height` | yes | | grid size in pixels; width x height at most 536870912 (2^29, a 2 GiB float32 file) |
+| `--output PATH`, `-o` | yes | | GeoTIFF path, relative to the current directory; must name a file, so not a directory, `.` or `..` |
+| `--wms-url URL` | no | `https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial%20Datasets` | `http://` or `https://`, a host name or bracketed IPv6 address, an optional port (1 to 65535) and an optional path; no user name, query, fragment, spaces or control characters |
 | `--layer NAME` | no | `Elevation_CCT_GLM2019_5m_DEM` | WMS layer name, taken unencoded; used for `LAYERS` and `QUERY_LAYERS` |
 | `--threads N` | no | 8 | worker threads (1..64), one keep-alive connection each |
 | `--max-retries N` | no | 8 | retries per pixel after the first attempt (0..100) |
@@ -310,7 +318,8 @@ libtiff does not know it by default.
 renames it over the output. libtiff's diagnostics are not printed: errors
 are collected by a libtiff error handler and appended to the message of the
 `load` or `save` error they explain, followed for a failed write by the
-operating system's reason in parentheses, and warnings are discarded.
+operating system's reason in parentheses unless libtiff's text already names
+it, as it does for a file it cannot open, and warnings are discarded.
 
 Pixel semantics:
 
@@ -416,12 +425,12 @@ struct ProgressSink {
 };
 ```
 
-`remainingNaN` counts the NaN pixels in the last checkpoint written
-successfully, not those in memory, so a failed save can never make an
-incomplete file look complete. `checkpointWriteFailed` is set whenever a save
-threw. The stop message then reads `checkpoint write failed: <reason>`, or,
-when another stop reason came first and was kept, that reason's message
-followed by `; checkpoint write failed: <reason>`. A stop for the
+`remainingNaN` counts the NaN pixels as of the last successful save, or at the
+start of the run if none succeeded, not those in memory, so a failed save can
+never make an incomplete file look complete. `checkpointWriteFailed` is set
+whenever a save threw. The stop message then reads `checkpoint write failed:
+<reason>`, or, when another stop reason came first and was kept, that reason's
+message followed by `; checkpoint write failed: <reason>`. A stop for the
 consecutive-failure limit reads `server unreachable: <limit> consecutive
 failures; last error: <error>`, where `<error>` is the error of the failure
 that reached the limit, for example `server unreachable: 100 consecutive
@@ -652,8 +661,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
 `ctest --test-dir <build>`.
 
 - **BoundingBox**: accepts a valid box; rejects north <= south, east <= west,
-  out-of-range values; pixel scale for the example box; `approxEquals`
-  tolerance.
+  out-of-range values, and NaN or infinity on each of the four edges; pixel
+  scale for the example box; `approxEquals` tolerance.
 - **WmsQuery**: golden URL for the example Config at pixel (0, 0) equals
   `/erdas-iws/ogc/wms/GeoSpatial%20Datasets?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&BBOX=-34.216344700%2C18.418579100%2C-34.184541800%2C18.462524400&CRS=EPSG%3A4326&WIDTH=2048&HEIGHT=1792&LAYERS=Elevation_CCT_GLM2019_5m_DEM&STYLES=&FORMAT=image%2Fpng&QUERY_LAYERS=Elevation_CCT_GLM2019_5m_DEM&INFO_FORMAT=text%2Fplain&I=0&J=0`
   (coordinates fixed at nine decimals, order south, west, north, east as WMS
@@ -686,7 +695,8 @@ Catch2 v3 via FetchContent, discovered with `catch_discover_tests`, run with
   as an invalid bounding box, and one without the dl_elevation description
   as not written by dl_elevation; a file claiming a width above `INT_MAX` is
   rejected before anything is allocated; a missing file's error carries
-  libtiff's reason; after `save` no `.tmp` file remains; a `save` whose
+  libtiff's reason, and a `save` into a missing directory names the reason
+  exactly once; after `save` no `.tmp` file remains; a `save` whose
   directory write fails (a file-size limit one byte short of a complete file)
   throws with the operating system's reason, leaves no `.tmp` and keeps the
   previous file loadable with its old values, and so does a `save` whose

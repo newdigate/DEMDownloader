@@ -1,10 +1,14 @@
 #include "demdl/Config.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace demdl {
 
 namespace {
+
+// 2^29 float32 pixels make a 2 GiB file, well under the 4 GiB that classic TIFF's 32-bit offsets reach.
+constexpr std::int64_t kMaxPixels = std::int64_t{1} << 29;
 
 // The character tests are ASCII only, so the result does not depend on the locale.
 bool isDigit(char c) { return c >= '0' && c <= '9'; }
@@ -86,10 +90,19 @@ std::optional<WmsEndpoint> parseWmsUrl(const std::string& url) {
 std::string Config::validate() const {
   if (const std::string err = box.validate(); !err.empty()) return err;
   if (width <= 0 || height <= 0) return "width and height must be positive";
+  if (std::int64_t{width} * height > kMaxPixels) {
+    return "width x height must be at most " + std::to_string(kMaxPixels) +
+           " pixels (a classic TIFF file holds at most 4 GiB)";
+  }
   if (output.empty()) return "output path must not be empty";
-  if (!output.has_filename()) return "output must name a file";
+  // "." and ".." name directories even without a trailing separator.
+  if (!output.has_filename() || output.filename() == "." || output.filename() == "..") {
+    return "output must name a file";
+  }
   if (!parseWmsUrl(wmsUrl)) {
-    return "wms-url must look like scheme://host[:port]/path with scheme http or https";
+    return "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
+           "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
+           "characters are not allowed";
   }
   if (layer.empty()) return "layer must not be empty";
   if (layer.find(';') != std::string::npos) return "layer must not contain ';'";

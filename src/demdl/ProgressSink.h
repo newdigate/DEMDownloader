@@ -52,7 +52,8 @@ struct RunSummary {
   std::uint64_t pixelsFetched = 0;
   std::uint64_t noData = 0;
   std::uint64_t failed = 0;
-  std::uint64_t remainingNaN = 0;  // NaN pixels in the last successfully written file
+  // NaN pixels as of the last successful save, or at the start of the run if none succeeded.
+  std::uint64_t remainingNaN = 0;
   int rowsSaved = 0;
   std::chrono::duration<double> elapsed{0.0};
   StopReason stopReason = StopReason::None;

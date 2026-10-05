@@ -85,11 +85,16 @@ std::string takeTiffError() {
 }
 
 // Throws what, then ": <libtiff text>" when libtiff reported errors since the last take, then
-// " (<reason>)" when osError, an errno value, is not zero.
+// " (<reason>)" when osError, an errno value, is not zero and libtiff's text does not already name that
+// reason, as it does when it cannot open a file.
 [[noreturn]] void fail(const std::string& what, int osError = 0) {
   std::string message = what;
-  if (const std::string text = takeTiffError(); !text.empty()) message += ": " + text;
-  if (osError != 0) message += " (" + std::generic_category().message(osError) + ")";
+  const std::string text = takeTiffError();
+  if (!text.empty()) message += ": " + text;
+  if (osError != 0) {
+    const std::string reason = std::generic_category().message(osError);
+    if (text.find(reason) == std::string::npos) message += " (" + reason + ")";
+  }
   throw std::runtime_error(message);
 }
 

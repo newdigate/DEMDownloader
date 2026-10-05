@@ -2,8 +2,10 @@
 
 // The including translation unit must include the OpenGL headers before this file.
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace demdl {
 
@@ -11,8 +13,8 @@ namespace demdl {
 // helper: no file loading, no GLM, only the one uniform setter the preview needs.
 class Shader {
  public:
-  // Throws std::runtime_error with the driver's log when a shader does not compile or the program
-  // does not link, after deleting the shader and program objects it created.
+  // Throws std::runtime_error with the driver's log on one line when a shader does not compile or the
+  // program does not link, after deleting the shader and program objects it created.
   Shader(const std::string& vertexSource, const std::string& fragmentSource) {
     const unsigned int vertex = compile(GL_VERTEX_SHADER, vertexSource, "vertex");
     unsigned int fragment = 0;
@@ -65,11 +67,22 @@ class Shader {
     return shader;
   }
 
-  // The driver's log without its trailing line break.
+  // The driver's log on one line, so that all of it stays on main's "error:" line: each line trimmed,
+  // blank lines dropped, the rest joined by "; ".
   static std::string tidy(const char* log) {
-    std::string text(log);
-    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
-    return text;
+    std::string joined;
+    std::string_view rest(log);
+    while (!rest.empty()) {
+      const std::size_t end = rest.find_first_of("\r\n");
+      std::string_view line = rest.substr(0, end);
+      rest = end == std::string_view::npos ? std::string_view() : rest.substr(end + 1);
+      const std::size_t first = line.find_first_not_of(" \t");
+      if (first == std::string_view::npos) continue;
+      line = line.substr(first, line.find_last_not_of(" \t") - first + 1);
+      if (!joined.empty()) joined += "; ";
+      joined += line;
+    }
+    return joined;
   }
 
   unsigned int id_ = 0;

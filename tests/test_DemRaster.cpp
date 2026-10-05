@@ -424,3 +424,21 @@ TEST_CASE("a checkpoint that cannot be created leaves no temp file behind", "[de
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
 }
+
+TEST_CASE("a checkpoint in a missing directory names the reason once", "[demraster]") {
+  TempDir dir;
+  const auto r = DemRaster::create(4, 3, kBox, {"LayerA", "https://example.test/wms"});
+  std::string error;
+  try {
+    r.save(dir.path / "absent" / "dem.tif");
+  } catch (const std::runtime_error& e) {
+    error = e.what();
+  }
+  // libtiff's own message already ends with the reason, so it is not appended a second time.
+  INFO(error);
+  const std::string reason = "No such file or directory";
+  const auto first = error.find(reason);
+  REQUIRE(first != std::string::npos);
+  CHECK_THAT(error, ContainsSubstring("cannot create"));
+  CHECK(error.find(reason, first + reason.size()) == std::string::npos);
+}

@@ -54,12 +54,18 @@ TEST_CASE("approxEquals honours the tolerance", "[boundingbox]") {
 }
 
 TEST_CASE("non-finite values are rejected", "[boundingbox]") {
-  BoundingBox nanNorth = simonsTown();
-  nanNorth.north = std::numeric_limits<double>::quiet_NaN();
-  CHECK(nanNorth.validate() == "bounding box values must be finite numbers");
-  BoundingBox infEast = simonsTown();
-  infEast.east = std::numeric_limits<double>::infinity();
-  CHECK(infEast.validate() == "bounding box values must be finite numbers");
+  const std::pair<const char*, double BoundingBox::*> edges[] = {
+      {"north", &BoundingBox::north}, {"south", &BoundingBox::south},
+      {"east", &BoundingBox::east},   {"west", &BoundingBox::west}};
+  const double values[] = {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()};
+  for (const auto& [name, edge] : edges) {
+    for (const double value : values) {
+      INFO(name << " = " << value);
+      BoundingBox b = simonsTown();
+      b.*edge = value;
+      CHECK(b.validate() == "bounding box values must be finite numbers");
+    }
+  }
 }
 
 TEST_CASE("equal edges are rejected and range limits are inclusive", "[boundingbox]") {

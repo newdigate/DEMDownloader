@@ -227,12 +227,18 @@ TEST_CASE("approxEquals honours the tolerance", "[boundingbox]") {
 }
 
 TEST_CASE("non-finite values are rejected", "[boundingbox]") {
-  BoundingBox nanNorth = simonsTown();
-  nanNorth.north = std::numeric_limits<double>::quiet_NaN();
-  CHECK(nanNorth.validate() == "bounding box values must be finite numbers");
-  BoundingBox infEast = simonsTown();
-  infEast.east = std::numeric_limits<double>::infinity();
-  CHECK(infEast.validate() == "bounding box values must be finite numbers");
+  const std::pair<const char*, double BoundingBox::*> edges[] = {
+      {"north", &BoundingBox::north}, {"south", &BoundingBox::south},
+      {"east", &BoundingBox::east},   {"west", &BoundingBox::west}};
+  const double values[] = {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()};
+  for (const auto& [name, edge] : edges) {
+    for (const double value : values) {
+      INFO(name << " = " << value);
+      BoundingBox b = simonsTown();
+      b.*edge = value;
+      CHECK(b.validate() == "bounding box values must be finite numbers");
+    }
+  }
 }
 
 TEST_CASE("equal edges are rejected and range limits are inclusive", "[boundingbox]") {
@@ -397,6 +403,8 @@ inline demdl::Config exampleConfig() {
 ```cpp
 #include <catch2/catch_test_macros.hpp>
 
+#include <limits>
+#include <string>
 #include <utility>
 
 #include "ExampleConfig.h"
@@ -478,7 +486,10 @@ TEST_CASE("validation reports the first problem", "[config]") {
 
   Config url = exampleConfig();
   url.wmsUrl = "not a url";
-  CHECK(url.validate() == "wms-url must look like scheme://host[:port]/path with scheme http or https");
+  CHECK(url.validate() ==
+        "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
+        "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
+        "characters are not allowed");
 
   Config retries = exampleConfig();
   retries.maxRetries = -1;
@@ -521,6 +532,34 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config directory = exampleConfig();
   directory.output = "out/";
   CHECK(directory.validate() == "output must name a file");
+  // "." and ".." name directories, alone or at the end of a path.
+  for (const char* name : {".", "..", "dir/.", "dir/.."}) {
+    CAPTURE(name);
+    directory.output = name;
+    CHECK(directory.validate() == "output must name a file");
+  }
+  directory.output = ".dem.tif";  // a name that only starts with a dot is a file
+  CHECK(directory.validate().empty());
+
+  // At most 2^29 pixels, counted in 64 bits, so 65536 x 65536 and INT_MAX x INT_MAX cannot wrap into range.
+  const std::string tooLarge =
+      "width x height must be at most 536870912 pixels (a classic TIFF file holds at most 4 GiB)";
+  Config size = exampleConfig();
+  size.width = 32768;
+  size.height = 16384;  // exactly 2^29
+  CHECK(size.validate().empty());
+  size.width = 536870913;  // one more
+  size.height = 1;
+  CHECK(size.validate() == tooLarge);
+  size.width = 65536;
+  size.height = 65536;
+  CHECK(size.validate() == tooLarge);
+  size.width = std::numeric_limits<int>::max();
+  size.height = std::numeric_limits<int>::max();
+  CHECK(size.validate() == tooLarge);
+  // The size is checked right after positivity, before the output path.
+  size.output.clear();
+  CHECK(size.validate() == tooLarge);
 
   // Two faults at once: the grid is checked before the thread count, which pins the check order.
   Config both = exampleConfig();
@@ -607,10 +646,14 @@ struct Config {
 #include "demdl/Config.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace demdl {
 
 namespace {
+
+// 2^29 float32 pixels make a 2 GiB file, well under the 4 GiB that classic TIFF's 32-bit offsets reach.
+constexpr std::int64_t kMaxPixels = std::int64_t{1} << 29;
 
 // The character tests are ASCII only, so the result does not depend on the locale.
 bool isDigit(char c) { return c >= '0' && c <= '9'; }
@@ -692,10 +735,19 @@ std::optional<WmsEndpoint> parseWmsUrl(const std::string& url) {
 std::string Config::validate() const {
   if (const std::string err = box.validate(); !err.empty()) return err;
   if (width <= 0 || height <= 0) return "width and height must be positive";
+  if (std::int64_t{width} * height > kMaxPixels) {
+    return "width x height must be at most " + std::to_string(kMaxPixels) +
+           " pixels (a classic TIFF file holds at most 4 GiB)";
+  }
   if (output.empty()) return "output path must not be empty";
-  if (!output.has_filename()) return "output must name a file";
+  // "." and ".." name directories even without a trailing separator.
+  if (!output.has_filename() || output.filename() == "." || output.filename() == "..") {
+    return "output must name a file";
+  }
   if (!parseWmsUrl(wmsUrl)) {
-    return "wms-url must look like scheme://host[:port]/path with scheme http or https";
+    return "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
+           "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
+           "characters are not allowed";
   }
   if (layer.empty()) return "layer must not be empty";
   if (layer.find(';') != std::string::npos) return "layer must not contain ';'";
@@ -1161,8 +1213,8 @@ struct RetryPolicy {
 
   // Delay before retry number `attempt` (0-based). Requires attempt >= 0, baseDelay > 0 and
   // 0 <= jitter <= 1; these are not checked. The caller supplies unitRandom in [0, 1], which keeps
-  // the schedule testable. The interval is closed on purpose: std::uniform_real_distribution can
-  // return exactly 1.0 on this standard library.
+  // the schedule testable. The interval is closed on purpose: libc++'s std::uniform_real_distribution
+  // can return its upper bound (LWG 2524), so delayFor accepts 1.0.
   [[nodiscard]] std::chrono::milliseconds delayFor(int attempt, double unitRandom) const;
 };
 
@@ -1880,6 +1932,24 @@ TEST_CASE("a checkpoint that cannot be created leaves no temp file behind", "[de
   const auto back = DemRaster::load(file);
   CHECK(back.at(1, 1) == 12.5f);
 }
+
+TEST_CASE("a checkpoint in a missing directory names the reason once", "[demraster]") {
+  TempDir dir;
+  const auto r = DemRaster::create(4, 3, kBox, {"LayerA", "https://example.test/wms"});
+  std::string error;
+  try {
+    r.save(dir.path / "absent" / "dem.tif");
+  } catch (const std::runtime_error& e) {
+    error = e.what();
+  }
+  // libtiff's own message already ends with the reason, so it is not appended a second time.
+  INFO(error);
+  const std::string reason = "No such file or directory";
+  const auto first = error.find(reason);
+  REQUIRE(first != std::string::npos);
+  CHECK_THAT(error, ContainsSubstring("cannot create"));
+  CHECK(error.find(reason, first + reason.size()) == std::string::npos);
+}
 ```
 
 - [ ] **Step 3: Build to verify it fails**
@@ -2078,11 +2148,16 @@ std::string takeTiffError() {
 }
 
 // Throws what, then ": <libtiff text>" when libtiff reported errors since the last take, then
-// " (<reason>)" when osError, an errno value, is not zero.
+// " (<reason>)" when osError, an errno value, is not zero and libtiff's text does not already name that
+// reason, as it does when it cannot open a file.
 [[noreturn]] void fail(const std::string& what, int osError = 0) {
   std::string message = what;
-  if (const std::string text = takeTiffError(); !text.empty()) message += ": " + text;
-  if (osError != 0) message += " (" + std::generic_category().message(osError) + ")";
+  const std::string text = takeTiffError();
+  if (!text.empty()) message += ": " + text;
+  if (osError != 0) {
+    const std::string reason = std::generic_category().message(osError);
+    if (text.find(reason) == std::string::npos) message += " (" + reason + ")";
+  }
   throw std::runtime_error(message);
 }
 
@@ -2369,7 +2444,7 @@ Notes for the engineer: `XTIFFOpen` registers the GeoTIFF tags with libtiff, whi
 - [ ] **Step 6: Build and run the tests**
 
 Run: `cmake --build build && ./build/demdl_tests "[demraster]"`
-Expected: `All tests passed (N assertions in 17 test cases)`.
+Expected: `All tests passed (N assertions in 18 test cases)`.
 
 - [ ] **Step 7: Commit**
 
@@ -2652,7 +2727,8 @@ struct RunSummary {
   std::uint64_t pixelsFetched = 0;
   std::uint64_t noData = 0;
   std::uint64_t failed = 0;
-  std::uint64_t remainingNaN = 0;  // NaN pixels in the last successfully written file
+  // NaN pixels as of the last successful save, or at the start of the run if none succeeded.
+  std::uint64_t remainingNaN = 0;
   int rowsSaved = 0;
   std::chrono::duration<double> elapsed{0.0};
   StopReason stopReason = StopReason::None;
@@ -3346,6 +3422,14 @@ struct DownloaderOptions {
 // job an exception from the InFlight callback or the fetch is recorded as a Failed pixel. Jobs are
 // noexcept, so any other exception in one (a sink callback reporting the result, or building the
 // error text under memory pressure) calls std::terminate instead of unwinding past the pool.
+// A failed save is caught: it stops the run and shows in the summary. From onRunStarted on, an
+// exception on the calling thread still leaves run(), without a summary: one thrown by a sink callback
+// made there (onRunStarted, Queued, onRowSaved or onRunFinished), the std::system_error of a pool
+// that cannot start its first thread (if a later one fails, ctpl ends the process), or an allocation
+// failure. No job outlives run(): an exception while a row's jobs are being queued drops the queued
+// ones and waits for the running ones before it leaves. The file keeps the rows saved before it.
+// main receives the exception through the run's std::promise, prints "error: <what>", or
+// "error: unknown exception" for a type not derived from std::exception, and exits 1.
 class Downloader {
  public:
   // Throws std::invalid_argument when threads or maxConsecutiveFailures is below 1.
@@ -6617,7 +6701,7 @@ Run: `./build/demdl_tests "[e2e]"`
 Expected: `All tests passed (N assertions in 11 test cases)` in about two seconds.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 148`.
+Expected: `100% tests passed out of 149`.
 
 - [ ] **Step 8: Smoke-test the dry run (no network)**
 
@@ -6871,8 +6955,10 @@ inline constexpr Rgb kFailedColour{255, 0, 255};
 
 // The including translation unit must include the OpenGL headers before this file.
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace demdl {
 
@@ -6880,8 +6966,8 @@ namespace demdl {
 // helper: no file loading, no GLM, only the one uniform setter the preview needs.
 class Shader {
  public:
-  // Throws std::runtime_error with the driver's log when a shader does not compile or the program
-  // does not link, after deleting the shader and program objects it created.
+  // Throws std::runtime_error with the driver's log on one line when a shader does not compile or the
+  // program does not link, after deleting the shader and program objects it created.
   Shader(const std::string& vertexSource, const std::string& fragmentSource) {
     const unsigned int vertex = compile(GL_VERTEX_SHADER, vertexSource, "vertex");
     unsigned int fragment = 0;
@@ -6934,11 +7020,22 @@ class Shader {
     return shader;
   }
 
-  // The driver's log without its trailing line break.
+  // The driver's log on one line, so that all of it stays on main's "error:" line: each line trimmed,
+  // blank lines dropped, the rest joined by "; ".
   static std::string tidy(const char* log) {
-    std::string text(log);
-    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
-    return text;
+    std::string joined;
+    std::string_view rest(log);
+    while (!rest.empty()) {
+      const std::size_t end = rest.find_first_of("\r\n");
+      std::string_view line = rest.substr(0, end);
+      rest = end == std::string_view::npos ? std::string_view() : rest.substr(end + 1);
+      const std::size_t first = line.find_first_not_of(" \t");
+      if (first == std::string_view::npos) continue;
+      line = line.substr(first, line.find_last_not_of(" \t") - first + 1);
+      if (!joined.empty()) joined += "; ";
+      joined += line;
+    }
+    return joined;
   }
 
   unsigned int id_ = 0;
@@ -7319,7 +7416,7 @@ Run: `cmake --build build && ./build/demdl_tests "[palette]"`
 Expected: builds `demdl_preview`, relinks `dl_elevation` and rebuilds `demdl_tests` with no warnings, then `All tests passed (N assertions in 5 test cases)`.
 
 Run: `ctest --test-dir build --output-on-failure`
-Expected: `100% tests passed out of 153`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
+Expected: `100% tests passed out of 154`. The end-to-end tests now run the preview-enabled binary, without `--preview`.
 
 Run: `./build/dl_elevation --north -34.18 --south -34.21 --west 18.41 --east 18.46 --width 16 --height 8 --output x.tif --preview --dry-run; echo "exit $?"`
 Expected: the dry-run plan and `exit 0`. The "no preview support" error from Task 12 is gone, which proves the define reached `main.cpp`. No window opens because a dry run returns before the sink is created.

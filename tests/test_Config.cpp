@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <limits>
+#include <string>
 #include <utility>
 
 #include "ExampleConfig.h"
@@ -81,7 +83,10 @@ TEST_CASE("validation reports the first problem", "[config]") {
 
   Config url = exampleConfig();
   url.wmsUrl = "not a url";
-  CHECK(url.validate() == "wms-url must look like scheme://host[:port]/path with scheme http or https");
+  CHECK(url.validate() ==
+        "wms-url must be http:// or https:// followed by a host name or [IPv6 address], an optional :port "
+        "(1 to 65535) and an optional path; user names, queries (?), fragments (#), spaces and control "
+        "characters are not allowed");
 
   Config retries = exampleConfig();
   retries.maxRetries = -1;
@@ -124,6 +129,34 @@ TEST_CASE("validation reports the first problem", "[config]") {
   Config directory = exampleConfig();
   directory.output = "out/";
   CHECK(directory.validate() == "output must name a file");
+  // "." and ".." name directories, alone or at the end of a path.
+  for (const char* name : {".", "..", "dir/.", "dir/.."}) {
+    CAPTURE(name);
+    directory.output = name;
+    CHECK(directory.validate() == "output must name a file");
+  }
+  directory.output = ".dem.tif";  // a name that only starts with a dot is a file
+  CHECK(directory.validate().empty());
+
+  // At most 2^29 pixels, counted in 64 bits, so 65536 x 65536 and INT_MAX x INT_MAX cannot wrap into range.
+  const std::string tooLarge =
+      "width x height must be at most 536870912 pixels (a classic TIFF file holds at most 4 GiB)";
+  Config size = exampleConfig();
+  size.width = 32768;
+  size.height = 16384;  // exactly 2^29
+  CHECK(size.validate().empty());
+  size.width = 536870913;  // one more
+  size.height = 1;
+  CHECK(size.validate() == tooLarge);
+  size.width = 65536;
+  size.height = 65536;
+  CHECK(size.validate() == tooLarge);
+  size.width = std::numeric_limits<int>::max();
+  size.height = std::numeric_limits<int>::max();
+  CHECK(size.validate() == tooLarge);
+  // The size is checked right after positivity, before the output path.
+  size.output.clear();
+  CHECK(size.validate() == tooLarge);
 
   // Two faults at once: the grid is checked before the thread count, which pins the check order.
   Config both = exampleConfig();

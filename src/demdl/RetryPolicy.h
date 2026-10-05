@@ -14,8 +14,8 @@ struct RetryPolicy {
 
   // Delay before retry number `attempt` (0-based). Requires attempt >= 0, baseDelay > 0 and
   // 0 <= jitter <= 1; these are not checked. The caller supplies unitRandom in [0, 1], which keeps
-  // the schedule testable. The interval is closed on purpose: std::uniform_real_distribution can
-  // return exactly 1.0 on this standard library.
+  // the schedule testable. The interval is closed on purpose: libc++'s std::uniform_real_distribution
+  // can return its upper bound (LWG 2524), so delayFor accepts 1.0.
   [[nodiscard]] std::chrono::milliseconds delayFor(int attempt, double unitRandom) const;
 };
 
