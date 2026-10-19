@@ -8,16 +8,14 @@
 
 #include <cerrno>
 #include <cmath>
-#include <cstdarg>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
 
+#include "demdl/TiffSetup.h"
 #include "demdl/WmsQuery.h"
 
 namespace demdl {
@@ -57,33 +55,6 @@ class TempFileGuard {
   bool complete_ = false;
 };
 
-// The libtiff errors raised on this thread since takeTiffError() last ran, joined by "; ".
-thread_local std::string lastTiffError;
-
-// Installed in place of libtiff's default handler, which prints to stderr, so that the text reaches
-// the user in an exception message instead of interrupting the progress output. errno is preserved
-// for the caller, which reports the operating system's reason for a failed write.
-void captureTiffError(const char* module, const char* fmt, va_list ap) {
-  const int savedErrno = errno;
-  char text[1024];
-  std::vsnprintf(text, sizeof text, fmt, ap);
-  try {
-    if (!lastTiffError.empty()) lastTiffError += "; ";
-    if (module != nullptr) lastTiffError += std::string(module) + ": ";
-    lastTiffError += text;
-  } catch (...) {
-    // Out of memory: the text is lost, but the caller still reports the failure itself.
-  }
-  errno = savedErrno;
-}
-
-// Returns the libtiff errors collected on this thread and forgets them.
-std::string takeTiffError() {
-  std::string text;
-  text.swap(lastTiffError);
-  return text;
-}
-
 // Throws what, then ": <libtiff text>" when libtiff reported errors since the last take, then
 // " (<reason>)" when osError, an errno value, is not zero and libtiff's text does not already name that
 // reason, as it does when it cannot open a file.
@@ -96,32 +67,6 @@ std::string takeTiffError() {
     if (text.find(reason) == std::string::npos) message += " (" + reason + ")";
   }
   throw std::runtime_error(message);
-}
-
-// libtiff does not know the GDAL_NODATA tag: TIFFSetField refuses it and a reader sees an anonymous
-// field. This tag extender registers it on every TIFF handle opened after ensureTagsRegistered(),
-// then calls the extender installed before it, libgeotiff's, which registers the GeoTIFF tags.
-TIFFExtendProc g_parentExtender = nullptr;
-
-void registerGdalTags(TIFF* tif) {
-  static const TIFFFieldInfo fields[] = {
-      {TIFFTAG_GDAL_NODATA, -1, -1, TIFF_ASCII, FIELD_CUSTOM, 1, 0, const_cast<char*>("GDALNoDataValue")},
-  };
-  TIFFMergeFieldInfo(tif, fields, 1);
-  if (g_parentExtender != nullptr) g_parentExtender(tif);
-}
-
-void ensureTagsRegistered() {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    // libgeotiff's first-time setup is not thread-safe, so it is forced to run here, once. The
-    // extender order is therefore fixed: ours runs first, then libgeotiff's.
-    XTIFFInitialize();
-    g_parentExtender = TIFFSetTagExtender(registerGdalTags);
-    TIFFSetErrorHandler(captureTiffError);
-    // Our own files raise no warnings; another program's file would otherwise print them during load.
-    TIFFSetWarningHandler(nullptr);
-  });
 }
 
 }  // namespace
@@ -160,7 +105,7 @@ DemRaster DemRaster::create(int width, int height, const BoundingBox& box, Raste
 
 DemRaster DemRaster::load(const std::filesystem::path& path) {
   ensureTagsRegistered();
-  takeTiffError();  // forget whatever earlier calls on this thread left behind
+  (void)takeTiffError();  // forget whatever earlier calls on this thread left behind
   TiffHandle tif(XTIFFOpen(path.string().c_str(), "r"));
   if (!tif) fail("cannot open " + path.string());
   TIFF* t = tif.get();
@@ -232,7 +177,7 @@ DemRaster DemRaster::load(const std::filesystem::path& path) {
 
 void DemRaster::save(const std::filesystem::path& path) const {
   ensureTagsRegistered();
-  takeTiffError();  // forget whatever earlier calls on this thread left behind
+  (void)takeTiffError();  // forget whatever earlier calls on this thread left behind
   const std::filesystem::path tmp = path.string() + ".tmp";
   // Declared before the TIFF handle, so that on failure the file is removed after the handle closes.
   TempFileGuard tmpGuard(tmp);
