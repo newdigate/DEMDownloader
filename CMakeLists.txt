@@ -129,6 +129,10 @@ add_library(demmesh_cli OBJECT src/app/MeshCli.cpp)
 target_link_libraries(demmesh_cli PUBLIC demmesh PRIVATE CLI11::CLI11)
 target_compile_options(demmesh_cli PRIVATE -Wall -Wextra)
 
+add_executable(dem2mesh src/app/dem2mesh_main.cpp)
+target_link_libraries(dem2mesh PRIVATE demmesh demmesh_cli)
+target_compile_options(dem2mesh PRIVATE -Wall -Wextra)
+
 if(DL_ELEVATION_TESTS)
   enable_testing()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
@@ -156,11 +160,13 @@ if(DL_ELEVATION_TESTS)
     tests/test_BasePlane.cpp
     tests/test_SolidMesh.cpp
     tests/test_MeshWriters.cpp
-    tests/test_MeshCli.cpp)
+    tests/test_MeshCli.cpp
+    tests/test_Dem2MeshEndToEnd.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl demmesh demdl_cli demmesh_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
-  # The end-to-end tests run the executable itself, so it is built first and its path is compiled in.
-  add_dependencies(demdl_tests dl_elevation)
-  target_compile_definitions(demdl_tests PRIVATE DL_ELEVATION_EXE="$<TARGET_FILE:dl_elevation>")
+  # The end-to-end tests run the executables themselves, so they are built first and their paths are compiled in.
+  add_dependencies(demdl_tests dl_elevation dem2mesh)
+  target_compile_definitions(demdl_tests PRIVATE DL_ELEVATION_EXE="$<TARGET_FILE:dl_elevation>"
+                                                 DEM2MESH_EXE="$<TARGET_FILE:dem2mesh>")
   catch_discover_tests(demdl_tests)
 endif()

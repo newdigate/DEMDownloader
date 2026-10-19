@@ -37,9 +37,11 @@ using demdl::mesh::AtomicFileWriter;
 using demdl::mesh::checkSolid;
 using demdl::mesh::Mesh;
 using demdl::mesh::MeshCheck;
+using demdl::mesh::plyFileBytes;
 using demdl::mesh::readBinaryStl;
 using demdl::mesh::solidMesh;
 using demdl::mesh::solidTriangleCount;
+using demdl::mesh::stlFileBytes;
 using demdl::mesh::surfaceMesh;
 using demdl::mesh::Triangle;
 using demdl::mesh::Vec3;
@@ -542,6 +544,28 @@ TEST_CASE("a mesh with nothing in it writes a valid empty file", "[writers]") {
   const Bytes ply = readFile(dir.path / "empty.ply");
   const std::string header = plyHeader(0, 0);
   CHECK(std::string(ply.begin(), ply.end()) == header);
+}
+
+TEST_CASE("the file sizes the writers give beforehand are the sizes of the files they write", "[writers]") {
+  TempDir dir;
+  const auto stl = dir.path / "sized.stl";
+  const auto ply = dir.path / "sized.ply";
+  const auto writtenSizesMatch = [&](const Mesh& surface, const Mesh& solid) {
+    writeBinaryPly(surface, ply, 1000, 800);
+    writeBinaryStl(solid, stl, "sizes");
+    CHECK(plyFileBytes(surface.vertices.size(), surface.triangles.size()) == std::filesystem::file_size(ply));
+    CHECK(stlFileBytes(solid.triangles.size()) == std::filesystem::file_size(stl));
+  };
+  writtenSizesMatch(boxSurface(), box());
+  const Mesh rough = roughSurface(200, 160);  // files of several staging buffers
+  writtenSizesMatch(rough, solidMesh(rough, 200, 160, -5.0f));
+  writtenSizesMatch(Mesh{}, Mesh{});
+
+  // At the 25,000,000-vertex limit, a 5000 x 5000 grid, which no test writes and the dry run states unwritten: sizes past
+  // 32 bits, and a solid of 2 x 4999 x 4999 + 2 x 10000 + 2 triangles.
+  CHECK(stlFileBytes(solidTriangleCount(5000, 5000)) == 84 + 50 * std::uint64_t{50'000'004});
+  CHECK(plyFileBytes(25'000'000, 49'980'002) ==
+        plyHeader(25'000'000, 49'980'002).size() + 20 * std::uint64_t{25'000'000} + 13 * std::uint64_t{49'980'002});
 }
 
 TEST_CASE("AtomicFileWriter writes numbers least significant byte first and splits long runs across its flushes",

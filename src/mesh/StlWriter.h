@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string_view>
 
@@ -26,6 +27,10 @@ namespace demdl::mesh {
 // directory, a full disk, a destination that cannot be replaced. Throws std::invalid_argument, creating no file, when a
 // triangle names a vertex the mesh does not have or the mesh has more triangles than a uint32 counts.
 void writeBinaryStl(const Mesh& mesh, const std::filesystem::path& path, std::string_view header);
+
+// The size in bytes of the file writeBinaryStl writes for a mesh of `triangles` triangles, 84 + 50 x triangles: for the
+// dry run and the summary, which give the size before the file is written or without writing it.
+[[nodiscard]] std::uint64_t stlFileBytes(std::uint64_t triangles) noexcept;
 
 // Reads a binary STL as writeBinaryStl writes it, for the tests and the end-to-end check (not a general importer). The
 // vertices of equal position are merged into one, numbered in order of first appearance, so that checkSolid can run on

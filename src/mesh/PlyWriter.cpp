@@ -13,6 +13,9 @@ namespace demdl::mesh {
 
 namespace {
 
+constexpr std::uint64_t kVertexBytes = 5 * 4;  // x, y, z, s and t as float32
+constexpr std::uint64_t kFaceBytes = 1 + 3 * 4;  // a uchar 3, then three uint32 vertex numbers
+
 std::string formatNumber(double value) {
   char text[40];
   std::snprintf(text, sizeof text, "%.15g", value);
@@ -34,7 +37,7 @@ void checkCorners(const Mesh& mesh) {
 }
 
 // The version is the project's, a PUBLIC define of demdl.
-std::string header(std::size_t vertices, std::size_t faces) {
+std::string header(std::uint64_t vertices, std::uint64_t faces) {
   std::string text;
   text += "ply\n";
   text += "format binary_little_endian 1.0\n";
@@ -77,6 +80,10 @@ void writeBinaryPly(const Mesh& surface, const std::filesystem::path& path, doub
     file.u32(t.c);
   }
   file.commit();
+}
+
+std::uint64_t plyFileBytes(std::uint64_t vertices, std::uint64_t faces) {
+  return header(vertices, faces).size() + kVertexBytes * vertices + kFaceBytes * faces;
 }
 
 }  // namespace demdl::mesh

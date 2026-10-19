@@ -123,6 +123,10 @@ void writeBinaryStl(const Mesh& mesh, const std::filesystem::path& path, std::st
   file.commit();
 }
 
+std::uint64_t stlFileBytes(std::uint64_t triangles) noexcept {
+  return kHeaderBytes + sizeof(std::uint32_t) + kTriangleBytes * triangles;
+}
+
 Mesh readBinaryStl(const std::filesystem::path& path) {
   errno = 0;
   std::ifstream in(path, std::ios::binary);
@@ -144,7 +148,7 @@ Mesh readBinaryStl(const std::filesystem::path& path) {
   in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
   if (!in) failToRead("read failed on " + path.string(), errno);
   const std::uint32_t count = u32At(head.data() + kHeaderBytes);
-  const std::uint64_t expected = head.size() + kTriangleBytes * std::uint64_t{count};
+  const std::uint64_t expected = stlFileBytes(count);
   if (size != expected) {
     failToRead(path.string() + " is not a binary STL: it declares " + std::to_string(count) +
                " triangles, which take " + std::to_string(expected) + " bytes, but the file has " +

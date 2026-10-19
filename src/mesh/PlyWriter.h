@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 
 #include "mesh/SolidMesh.h"
@@ -29,5 +30,10 @@ namespace demdl::mesh {
 // std::invalid_argument, creating no file, when widthUnits or heightUnits is not above 0 and finite, or a triangle
 // names a vertex the surface does not have.
 void writeBinaryPly(const Mesh& surface, const std::filesystem::path& path, double widthUnits, double heightUnits);
+
+// The size in bytes of the file writeBinaryPly writes for a surface of `vertices` vertices and `faces` triangles: the
+// header above for those counts, then 20 bytes a vertex and 13 a face. For the dry run and the summary, which give the
+// size before the file is written or without writing it.
+[[nodiscard]] std::uint64_t plyFileBytes(std::uint64_t vertices, std::uint64_t faces);
 
 }  // namespace demdl::mesh
