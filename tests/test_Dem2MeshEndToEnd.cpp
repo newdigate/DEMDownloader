@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -16,11 +17,13 @@
 #include <system_error>
 #include <vector>
 
+#include "FakeBlender.h"
 #include "GeoTiffFixtures.h"
 #include "SpawnedProcess.h"
 #include "TempDir.h"
 #include "demdl/BoundingBox.h"
 #include "demdl/DemRaster.h"
+#include "mesh/BlenderRunner.h"
 #include "mesh/CropWindow.h"
 #include "mesh/GeoTiffGrid.h"
 #include "mesh/PlyWriter.h"
@@ -29,10 +32,12 @@
 #include "mesh/TransverseMercator.h"
 
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::EndsWith;
 using Catch::Matchers::StartsWith;
 using Catch::Matchers::WithinAbs;
 using demdl::mesh::checkSolid;
 using demdl::mesh::extentInMetres;
+using demdl::mesh::findBlender;
 using demdl::mesh::GridGeometry;
 using demdl::mesh::inspectGeoTiff;
 using demdl::mesh::Mesh;
@@ -70,10 +75,15 @@ std::vector<double> fixtureHeights() {
   return heights;
 }
 
+// A run with the real Blender: its start-up alone takes six seconds on the owner's machine, and more under a parallel
+// ctest, which kDeadline is too short for.
+constexpr std::chrono::seconds kBlenderDeadline{120};
+
 // dem2mesh started with args and run to its end, its stdout and stderr captured in files in dir.
-Finished runDem2Mesh(const std::vector<std::string>& args, const Path& dir) {
+Finished runDem2Mesh(const std::vector<std::string>& args, const Path& dir,
+                     std::chrono::seconds limit = kDeadline) {
   Child child(kExecutable, args, dir);
-  return child.wait();
+  return child.wait(limit);
 }
 
 // The 8 x 6 fixture in a TempDir, and an empty directory out/ for the outputs, so that "nothing written" is "out/ is
@@ -88,6 +98,7 @@ struct Workspace {
 
   [[nodiscard]] Path stl() const { return stem.string() + ".stl"; }
   [[nodiscard]] Path ply() const { return stem.string() + ".ply"; }
+  [[nodiscard]] Path blend() const { return stem.string() + ".blend"; }
 
   // dem2mesh on the fixture with the outputs at stem and without Blender, then `extra`.
   [[nodiscard]] Finished run(const std::vector<std::string>& extra) const {
@@ -95,7 +106,22 @@ struct Workspace {
     args.insert(args.end(), extra.begin(), extra.end());
     return runDem2Mesh(args, dir.path);
   }
+
+  // The same with Blender, as a run goes without --no-blend.
+  [[nodiscard]] Finished runWithBlender(const std::vector<std::string>& extra) const {
+    std::vector<std::string> args{"-i", input.string(), "-o", stem.string()};
+    args.insert(args.end(), extra.begin(), extra.end());
+    return runDem2Mesh(args, dir.path, kBlenderDeadline);
+  }
 };
+
+// The names of the entries in dir, sorted.
+std::vector<std::string> filesIn(const Path& dir) {
+  std::vector<std::string> names;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) names.push_back(entry.path().filename().string());
+  std::sort(names.begin(), names.end());
+  return names;
+}
 
 // The window of the whole file in metres, as dem2mesh works it out.
 WindowExtent wholeFileExtent(const Path& input) {
@@ -423,4 +449,181 @@ TEST_CASE("verbose adds a timing line for each stage", "[mesh-e2e]") {
   const Finished quiet = w.run({"--overwrite"});
   CHECK(quiet.exitCode() == 0);
   CHECK(quiet.out.find("time: ") == std::string::npos);
+}
+
+TEST_CASE("with Blender installed, a run saves the scene and Blender's check of the STL passes", "[mesh-e2e]") {
+  const std::optional<Path> blender = findBlender(std::nullopt);
+  if (!blender) SKIP("Blender not installed");
+  const Workspace w;
+  // The same model without Blender, to show that Blender leaves the STL and the PLY as dem2mesh wrote them.
+  const Path reference = w.dir.path / "reference";
+  REQUIRE(runDem2Mesh({"-i", w.input.string(), "-o", reference.string(), "--grid", "4x4", "--no-blend"}, w.dir.path)
+              .exitCode() == 0);
+
+  const Finished result = w.runWithBlender({"--grid", "4x4"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  // Blender 3.0 and later compress a .blend with Zstandard; an uncompressed one begins "BLENDER".
+  const std::string scene = readFile(w.blend());
+  CHECK((scene.starts_with("BLENDER") || scene.starts_with("\x28\xb5\x2f\xfd")));
+  // A 4 x 4 grid's solid: 2 x 3 x 3 surface triangles, 2 x 8 in the walls and 2 in the base.
+  CHECK(solidTriangleCount(4, 4) == 36);
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + w.stl().string() + "\nwrote: " + w.ply().string() + "\nblender: " +
+                                  blender->string() + "\nwrote: " + w.blend().string() +
+                                  "\nstl check: 36 triangles, 0 non-manifold edges, 0 inverted faces\n"));
+  // Blender's log is captured, and shown only with --verbose.
+  CHECK(result.out.find("Blender quit") == std::string::npos);
+  CHECK(result.err.empty());
+  CHECK(fileHolds(w.stl(), readFile(reference.string() + ".stl")));
+  CHECK(fileHolds(w.ply(), readFile(reference.string() + ".ply")));
+  // Nothing else: no temporary file of Blender's, and no .blend1 (BlenderRunner's test saves over a scene).
+  CHECK(filesIn(w.outDir) == std::vector<std::string>{"model.blend", "model.ply", "model.stl"});
+}
+
+TEST_CASE("a Blender that cannot be started or fails leaves the STL and PLY, shows its output and exits 1",
+          "[mesh-e2e]") {
+  const Workspace w;
+  const TempDir bin;
+  const FakeBlender fake = writeFakeBlender(bin.path);
+  const ScopedEnv exit("FAKE_EXIT", std::nullopt);
+  // What each of these runs leaves: the summary down to the Blender it tried, the STL and the PLY, and no scene.
+  const auto checkKept = [&w](const Finished& result, const std::string& blenderShown) {
+    CHECK(result.exitCode() == 1);
+    CHECK_THAT(result.out, EndsWith("\nwrote: " + w.stl().string() + "\nwrote: " + w.ply().string() +
+                                    "\nblender: " + blenderShown + "\n"));
+    CHECK(readBinaryStl(w.stl()).triangles.size() == solidTriangleCount(kCols, kRows));
+    CHECK(std::filesystem::exists(w.ply()));
+    CHECK_FALSE(std::filesystem::exists(w.blend()));
+  };
+  SECTION("a path that names nothing") {
+    const Finished result = w.runWithBlender({"--blender", "/nonexistent/blender"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkKept(result, "/nonexistent/blender");
+    CHECK(result.err ==
+          "error: Blender failed (exit 127)\ncannot start '/nonexistent/blender': No such file or directory\n");
+  }
+  SECTION("an empty path, which is a path given and not none") {
+    const Finished result = w.runWithBlender({"--blender", ""});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkKept(result, "");
+    CHECK(result.err == "error: Blender failed (exit 127)\ncannot start '': No such file or directory\n");
+  }
+  SECTION("a Blender that exits 3, whose output is shown") {
+    const ScopedEnv code("FAKE_EXIT", "3");
+    const Finished result = w.runWithBlender({"--blender", fake.executable.string()});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkKept(result, fake.executable.string());
+    CHECK(result.err == "error: Blender failed (exit 3)\nfake blender: to stdout\nfake blender: to stderr\n");
+  }
+  SECTION("a Blender that exits 0 without checking the STL") {
+    const Finished result = w.runWithBlender({"--blender", fake.executable.string()});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkKept(result, fake.executable.string());
+    CHECK(result.err == "error: Blender exited 0 but did not report the STL check\nfake blender: to stdout\n"
+                        "fake blender: to stderr\n");
+  }
+  SECTION("a Blender that exits 0 and reports the check without saving the scene") {
+    const ScopedEnv check("FAKE_STL_CHECK", "stl check: 100 triangles, 0 non-manifold edges, 0 inverted faces");
+    const ScopedEnv noBlend("FAKE_NO_BLEND", "1");
+    const Finished result = w.runWithBlender({"--blender", fake.executable.string()});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkKept(result, fake.executable.string());
+    CHECK(result.err == "error: Blender exited 0 but did not write " + w.blend().string() +
+                            "\nfake blender: to stdout\nfake blender: to stderr\n"
+                            "stl check: 100 triangles, 0 non-manifold edges, 0 inverted faces\n");
+  }
+}
+
+TEST_CASE("dem2mesh reports the scene and the check Blender made, and shows Blender's log with --verbose",
+          "[mesh-e2e]") {
+  const Workspace w;
+  const TempDir bin;
+  const FakeBlender fake = writeFakeBlender(bin.path);
+  const ScopedEnv exit("FAKE_EXIT", std::nullopt);
+  const ScopedEnv check("FAKE_STL_CHECK", "stl check: 100 triangles, 0 non-manifold edges, 0 inverted faces");
+  const Finished result = w.runWithBlender({"--blender", fake.executable.string()});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + w.ply().string() + "\nblender: " + fake.executable.string() +
+                                  "\nwrote: " + w.blend().string() +
+                                  "\nstl check: 100 triangles, 0 non-manifold edges, 0 inverted faces\n"));
+  CHECK(occurrences(result.out, "wrote: ") == 3);
+  CHECK(result.out.find("fake blender:") == std::string::npos);  // the log is for --verbose
+  CHECK(result.err.empty());
+
+  const Finished verbose = w.runWithBlender({"--blender", fake.executable.string(), "--overwrite", "--verbose"});
+  INFO("verbose, stdout:\n" << verbose.out << "stderr:\n" << verbose.err);
+  REQUIRE(verbose.exitCode() == 0);
+  CHECK_THAT(verbose.out, ContainsSubstring("\nblender: " + fake.executable.string() +
+                                            "\nfake blender: to stdout\nfake blender: to stderr\nstl check: 100 "));
+  CHECK_THAT(verbose.out, ContainsSubstring("\ntime: blender "));
+  CHECK_THAT(verbose.out, EndsWith("\nwrote: " + w.blend().string() +
+                                   "\nstl check: 100 triangles, 0 non-manifold edges, 0 inverted faces\n"));
+}
+
+TEST_CASE("dem2mesh gives Blender the outputs, the stem's name, and the model's size and heights in model units",
+          "[mesh-e2e]") {
+  const Workspace w;
+  const TempDir bin;
+  const FakeBlender fake = writeFakeBlender(bin.path);
+  const ScopedEnv exit("FAKE_EXIT", std::nullopt);
+  const ScopedEnv check("FAKE_STL_CHECK", "stl check: 36 triangles, 0 non-manifold edges, 0 inverted faces");
+  const Finished result = w.runWithBlender(
+      {"--blender", fake.executable.string(), "--grid", "4x4", "--scale", "0.01", "--z-scale", "2"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  const std::vector<std::string> args = fake.recordedArguments();
+  REQUIRE(args.size() == 14);
+  CHECK(args[5] == "--ply=" + w.ply().string());
+  CHECK(args[6] == "--stl=" + w.stl().string());
+  CHECK(args[7] == "--blend=" + w.blend().string());
+  CHECK(args[8] == "--name=model");
+  const WindowExtent extent = wholeFileExtent(w.input);
+  CHECK_THAT(numberIn(args[9], "--width"), WithinAbs(0.01 * extent.widthM, 1e-9));
+  CHECK_THAT(numberIn(args[10], "--height"), WithinAbs(0.01 * extent.heightM, 1e-9));
+  // The surface's lowest and highest heights, 10 m and 60 m at the plane's corners, which the resampler keeps, times
+  // the z-scale and the scale. The base the plinth pushed down is not the surface's.
+  CHECK_THAT(numberIn(args[11], "--zmin"), WithinAbs(10 * 2 * 0.01, 1e-5));
+  CHECK_THAT(numberIn(args[12], "--zmax"), WithinAbs(60 * 2 * 0.01, 1e-5));
+  CHECK(numberIn(args[13], "--scale") == 0.01);
+}
+
+TEST_CASE("a dry run names the Blender a run would start and the scene it would save", "[mesh-e2e]") {
+  const Workspace w;
+  const Finished result = w.runWithBlender({"--dry-run", "--blender", "/opt/blender/blender"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 0);
+  CHECK_THAT(result.out, ContainsSubstring("\n  output: " + w.blend().string() + " (will be created)\n"));
+  CHECK_THAT(result.out, EndsWith("\n  blender: /opt/blender/blender (will be run)\n"));
+  CHECK(std::filesystem::is_empty(w.outDir));
+
+  const Finished without = w.run({"--dry-run"});
+  INFO("--no-blend, stdout:\n" << without.out << "stderr:\n" << without.err);
+  CHECK(without.exitCode() == 0);
+  CHECK(without.out.find(w.blend().string()) == std::string::npos);
+  CHECK_THAT(without.out, EndsWith("\n  blender: skipped (--no-blend)\n"));
+}
+
+TEST_CASE("with no Blender to be found, a run writes the STL and PLY and fails, naming the ways to give one",
+          "[mesh-e2e]") {
+  const ScopedEnv blender("BLENDER", std::nullopt);
+  const ScopedEnv path("PATH", "");
+  if (findBlender(std::nullopt)) SKIP("the Blender app is installed, so dem2mesh finds one whatever PATH and BLENDER say");
+  const Workspace w;
+  const std::string notFound =
+      "Blender not found: pass --blender, set BLENDER, or install it at /Applications/Blender.app";
+  const Finished result = w.runWithBlender({});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 1);
+  CHECK(result.err == "error: " + notFound + "\n");
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + w.ply().string() + "\nblender: not found\n"));
+  CHECK(std::filesystem::exists(w.stl()));
+  CHECK(std::filesystem::exists(w.ply()));
+  CHECK_FALSE(std::filesystem::exists(w.blend()));
+
+  const Finished plan = w.runWithBlender({"--dry-run", "--overwrite"});
+  INFO("dry run, stdout:\n" << plan.out << "stderr:\n" << plan.err);
+  CHECK(plan.exitCode() == 0);
+  CHECK_THAT(plan.out, EndsWith("\n  blender: not found (a run would fail after writing the STL and PLY: pass "
+                                "--blender, set BLENDER, or install it at /Applications/Blender.app)\n"));
 }

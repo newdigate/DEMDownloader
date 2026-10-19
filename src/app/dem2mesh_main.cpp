@@ -1,7 +1,7 @@
-// dem2mesh: an elevation GeoTIFF to a printable STL solid and the PLY surface a Blender scene is built from (spec 3 to
-// 6). main is the spec's pipeline as a sequence of named steps, each a call into the demmesh library, so that the order
-// can be read here and the work is tested there. The summary goes to stdout; every failure is one line on stderr,
-// "error: <message>", and exit code 1.
+// dem2mesh: an elevation GeoTIFF to a printable STL solid, the PLY surface, and the Blender scene built from it (spec 3
+// to 7). main is the spec's pipeline as a sequence of named steps, each a call into the demmesh library, so that the
+// order can be read here and the work is tested there. The summary goes to stdout; every failure is one line on stderr,
+// "error: <message>", followed by Blender's output when Blender failed, and exit code 1.
 
 #include <unistd.h>
 
@@ -18,6 +18,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include "app/MeshCli.h"
 #include "demdl/BoundingBox.h"
 #include "mesh/BasePlane.h"
+#include "mesh/BlenderRunner.h"
 #include "mesh/CropWindow.h"
 #include "mesh/GeoTiffGrid.h"
 #include "mesh/NoDataFill.h"
@@ -189,6 +191,7 @@ struct Facts {
   FillReport fill;
   double lowest = 0, highest = 0;  // the window's heights after the fill, before resampling
   double gridSummit = 0;           // the highest height of the resampled grid
+  double surfaceLowZ = 0, surfaceHighZ = 0;  // the surface's lowest and highest z in model units, for Blender's camera
   BasePlane base;
   MeshCheck check;
 };
@@ -298,11 +301,19 @@ std::string edgesNotCheckedLine() {
          " triangles; the count, the areas and the volume were";
 }
 
-// Task 11 runs Blender at this point; until then every run goes as if --no-blend were given.
-std::string blenderLine(const MeshOptions& options) {
-  return options.noBlend ? "blender: skipped (--no-blend)" : "blender: skipped (not built yet)";
+// What to do about a missing Blender (spec 7.1), for its error and for the dry run's plan.
+constexpr std::string_view kBlenderAdvice = "pass --blender, set BLENDER, or install it at /Applications/Blender.app";
+
+// The dry run's line for spec 3.1's "which Blender would be run"; blender is what findBlender gave.
+std::string plannedBlenderLine(const MeshOptions& options, const std::optional<fs::path>& blender) {
+  if (options.noBlend) return "blender: skipped (--no-blend)";
+  if (!blender) {
+    return "blender: not found (a run would fail after writing the STL and PLY: " + std::string(kBlenderAdvice) + ")";
+  }
+  return "blender: " + blender->string() + " (will be run)";
 }
 
+// The summary down to the files dem2mesh writes itself. A line about Blender follows, from run() or makeScene().
 void printSummary(const MeshOptions& options, const Outputs& outputs, const Facts& f) {
   std::cout << inputLine(options, f.geometry) << "\n"
             << windowLine(f) << "\n"
@@ -313,8 +324,7 @@ void printSummary(const MeshOptions& options, const Outputs& outputs, const Fact
             << solidLine(f) << "\n";
   if (!f.check.edgesChecked) std::cout << edgesNotCheckedLine() << "\n";
   std::cout << "wrote: " << outputs.stl.string() << "\n"
-            << "wrote: " << outputs.ply.string() << "\n"
-            << blenderLine(options) << "\n";
+            << "wrote: " << outputs.ply.string() << "\n";
 }
 
 // The plan of spec 3.1, after the "dry run" line that run() printed first: the summary's lines with what the summary
@@ -357,12 +367,78 @@ void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& 
   line(baseLine(options, f));
   line(solidLine(f));
   if (!f.check.edgesChecked) line(edgesNotCheckedLine());
-  for (const fs::path* path : {&outputs.stl, &outputs.ply}) {
+  const std::optional<fs::path> blender = options.noBlend ? std::nullopt : findBlender(options.blender);
+  std::vector<const fs::path*> written{&outputs.stl, &outputs.ply};
+  if (blender) written.push_back(&outputs.blend);
+  for (const fs::path* path : written) {
     std::error_code ignored;
     const bool exists = fs::exists(fs::symlink_status(*path, ignored));
     line("output: " + path->string() + (exists ? " (exists, will be overwritten)" : " (will be created)"));
   }
-  line(blenderLine(options));
+  line(plannedBlenderLine(options, blender));
+}
+
+// The first line of text that begins with prefix, without its newline.
+std::optional<std::string> lineStartingWith(const std::string& text, std::string_view prefix) {
+  for (std::size_t start = 0; start < text.size();) {
+    const std::size_t newline = text.find('\n', start);
+    const std::size_t end = newline == std::string::npos ? text.size() : newline;
+    const std::string_view line(text.data() + start, end - start);
+    if (line.starts_with(prefix)) return std::string(line);
+    start = end + 1;
+  }
+  return std::nullopt;
+}
+
+// text, then a newline if it does not end in one, so that what follows starts a line of its own.
+void printLines(std::ostream& out, const std::string& text) {
+  out << text;
+  if (!text.empty() && text.back() != '\n') out << "\n";
+}
+
+// The error, then what Blender printed, which says why; exit 1.
+int blenderFailed(const std::string& message, const std::string& output) {
+  std::cerr << "error: " << message << "\n";
+  printLines(std::cerr, output);
+  return demdl::cli::kExitError;
+}
+
+// Spec 7: once the STL and PLY are written, which stay whatever happens here, Blender builds the scene from the PLY,
+// saves it as the .blend and checks the STL. The owner asked for the .blend, so a Blender that is missing or fails
+// fails the run. Exit 0 alone does not prove that the script ran: Blender exits 0 when it cannot read the script, or
+// after an exception in it. So the run succeeds only when the output holds the script's "stl check:" line, which it
+// prints last, and the .blend is there.
+int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f, StageClock& clock) {
+  const std::optional<fs::path> blender = findBlender(options.blender);
+  if (!blender) {
+    std::cout << "blender: not found" << std::endl;
+    throw std::runtime_error("Blender not found: " + std::string(kBlenderAdvice));
+  }
+  // Flushed, as Blender takes seconds, or a minute on a large mesh, and this says what the wait is for.
+  std::cout << "blender: " << blender->string() << std::endl;
+  const BlenderJob job{outputs.ply,
+                       outputs.stl,
+                       outputs.blend,
+                       options.outputStem.filename().string(),
+                       f.extent.widthM * options.scale,
+                       f.extent.heightM * options.scale,
+                       f.surfaceLowZ,
+                       f.surfaceHighZ,
+                       options.scale};
+  const BlenderResult result = runBlender(*blender, job);
+  if (result.exitCode != 0) {
+    return blenderFailed("Blender failed (exit " + std::to_string(result.exitCode) + ")", result.output);
+  }
+  const std::optional<std::string> check = lineStartingWith(result.output, "stl check: ");
+  if (!check) return blenderFailed("Blender exited 0 but did not report the STL check", result.output);
+  std::error_code ignored;
+  if (!fs::is_regular_file(outputs.blend, ignored)) {
+    return blenderFailed("Blender exited 0 but did not write " + outputs.blend.string(), result.output);
+  }
+  if (options.verbose) printLines(std::cout, result.output);
+  clock.lap("blender");
+  std::cout << "wrote: " << outputs.blend.string() << "\n" << *check << "\n";
+  return demdl::cli::kExitComplete;
 }
 
 int run(int argc, char** argv) {
@@ -409,6 +485,10 @@ int run(int argc, char** argv) {
     printPlan(options, outputs, f);
     return demdl::cli::kExitComplete;
   }
+  const auto [low, high] = std::minmax_element(surface.vertices.begin(), surface.vertices.end(),
+                                               [](const Vec3& a, const Vec3& b) { return a.z < b.z; });
+  f.surfaceLowZ = low->z;
+  f.surfaceHighZ = high->z;
   writeBinaryPly(surface, outputs.ply, f.extent.widthM * options.scale, f.extent.heightM * options.scale);
   release(surface.vertices);
   release(surface.triangles);
@@ -416,7 +496,11 @@ int run(int argc, char** argv) {
   writeBinaryStl(solid, outputs.stl, stlHeader(options, f));
   clock.lap("write STL");
   printSummary(options, outputs, f);
-  return demdl::cli::kExitComplete;
+  if (options.noBlend) {
+    std::cout << "blender: skipped (--no-blend)\n";
+    return demdl::cli::kExitComplete;
+  }
+  return makeScene(options, outputs, f, clock);
 }
 
 }  // namespace

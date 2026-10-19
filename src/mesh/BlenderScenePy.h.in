@@ -1,0 +1,13 @@
+#pragma once
+
+// Made by CMake's configure step from src/mesh/BlenderScenePy.h.in and src/mesh/blender_scene.py; edit those, not the
+// copy in the build tree. kBlenderScenePy is the script's text byte for byte, which BlenderRunner writes to a temporary
+// file for Blender to run (spec 7.1), so the executable carries the script and needs nothing installed beside it.
+
+#include <string_view>
+
+namespace demdl::mesh {
+
+inline constexpr std::string_view kBlenderScenePy = R"PYSRC(@BLENDER_SCENE_PY@)PYSRC";
+
+}  // namespace demdl::mesh

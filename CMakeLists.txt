@@ -120,9 +120,21 @@ add_library(demmesh STATIC
   src/mesh/SolidMesh.cpp
   src/mesh/AtomicFileWriter.cpp
   src/mesh/StlWriter.cpp
-  src/mesh/PlyWriter.cpp)
+  src/mesh/PlyWriter.cpp
+  src/mesh/BlenderRunner.cpp)
 target_link_libraries(demmesh PUBLIC demdl)
 target_compile_options(demmesh PRIVATE -Wall -Wextra)
+# The Blender scene script (spec 7.1) is compiled into demmesh as the raw string kBlenderScenePy, so that dem2mesh needs
+# no file beside it: it writes the script out for Blender at run time. The configure step reads it, and runs again when
+# it changes. Its text must not hold the raw string's closing delimiter, which would end the string early.
+file(READ src/mesh/blender_scene.py BLENDER_SCENE_PY)
+string(FIND "${BLENDER_SCENE_PY}" ")PYSRC\"" _blender_scene_delimiter)
+if(NOT _blender_scene_delimiter EQUAL -1)
+  message(FATAL_ERROR "src/mesh/blender_scene.py contains )PYSRC\", which would end the C++ raw string it is embedded in")
+endif()
+configure_file(src/mesh/BlenderScenePy.h.in ${CMAKE_BINARY_DIR}/generated/mesh/BlenderScenePy.h @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/mesh/blender_scene.py)
+target_include_directories(demmesh PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
 # MeshCli.cpp is compiled once and shared by the dem2mesh executable and the tests; only it includes CLI11.
 add_library(demmesh_cli OBJECT src/app/MeshCli.cpp)
@@ -161,9 +173,12 @@ if(DL_ELEVATION_TESTS)
     tests/test_SolidMesh.cpp
     tests/test_MeshWriters.cpp
     tests/test_MeshCli.cpp
+    tests/test_BlenderRunner.cpp
     tests/test_Dem2MeshEndToEnd.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl demmesh demdl_cli demmesh_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
+  # The runner's test compares what Blender is given with the embedded script itself.
+  target_include_directories(demdl_tests PRIVATE ${CMAKE_BINARY_DIR}/generated)
   # The end-to-end tests run the executables themselves, so they are built first and their paths are compiled in.
   add_dependencies(demdl_tests dl_elevation dem2mesh)
   target_compile_definitions(demdl_tests PRIVATE DL_ELEVATION_EXE="$<TARGET_FILE:dl_elevation>"

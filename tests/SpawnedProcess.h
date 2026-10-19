@@ -142,16 +142,16 @@ class Child {
     awaitCondition([&gate, count] { return gate.waiting.load() >= count; });
   }
 
-  // Waits for the child to end. Past kDeadline it kills the child and fails the test.
-  Finished wait() {
-    const auto deadline = std::chrono::steady_clock::now() + kDeadline;
+  // Waits for the child to end. Past `limit` it kills the child and fails the test.
+  Finished wait(std::chrono::seconds limit = kDeadline) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
     while (!ended()) {
       if (std::chrono::steady_clock::now() > deadline) {
         kill(pid_, SIGKILL);
         waitpid(pid_, nullptr, 0);
         pid_ = -1;
         INFO("stderr:\n" << readFile(errPath_));
-        FAIL(name_ << " did not exit within " << kDeadline.count() << " s");
+        FAIL(name_ << " did not exit within " << limit.count() << " s");
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
