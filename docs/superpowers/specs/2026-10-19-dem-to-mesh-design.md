@@ -1,6 +1,7 @@
 # dem2mesh: GeoTIFF to printable solid and Blender scene
 
-Status: approved by the owner on 2026-10-19 after a builder check; the plan comes next.
+Status: approved by the owner on 2026-10-19 after a builder check; implemented on
+2026-10-19 through `docs/superpowers/plans/2026-10-19-dem-to-mesh.md`.
 Written from the brainstorming conversation of 2026-10-19.
 
 ## 1. Intent
@@ -335,7 +336,9 @@ model units, the height range, a name for the object.
    an elevation of 35 degrees above the terrain's centre, far enough that the
    whole window fits with a 5 percent margin, looking at the centre. Set as
    the scene camera. Clip end large enough for the model.
-5. World: light grey background, strength 1.
+5. World: light grey background, strength 1. The camera sees it at 0.8
+   grey, but the light it casts on the terrain is 0.25 grey, mixed by a
+   Light Path node's Is Camera Ray, so that the sun's shadows read.
 6. Render: EEVEE (whatever identifier the running Blender reports for it),
    1920 x 1080, 64 samples; Cycles is one click away.
 7. Scene units, metric: when `--scale` is below 0.1 (a print-sized model),
@@ -347,7 +350,12 @@ model units, the height range, a name for the object.
 9. STL check: import the STL into a scratch scene, run `mesh.validate()`,
    count non-manifold edges and inverted faces with bmesh, print one line
    `stl check: N triangles, M non-manifold edges, K inverted faces`, and
-   exit non-zero if M or K is not 0.
+   exit non-zero if M or K is not 0, or if `mesh.validate()` mended
+   anything. Blender's reader drops repeated and degenerate triangles with
+   only a warning, so the count the file declares (bytes 80 to 83) is held
+   against the count imported: when they differ, the line
+   `stl check: file declares D triangles, Blender imported N` comes first,
+   and the exit is non-zero too.
 
 The script prints one line per step; `--verbose` shows them.
 
