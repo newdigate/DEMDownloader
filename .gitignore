@@ -2,6 +2,12 @@ cmake-build-debug*
 build*/
 *.tif
 *.tif.tmp
+*.stl
+*.ply
+*.blend
+*.stl.tmp
+*.ply.tmp
+*.blend1
 
 # Scratch workspaces of the superpowers plan executor
 .superpowers/
