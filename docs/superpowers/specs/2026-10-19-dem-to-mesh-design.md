@@ -94,27 +94,34 @@ help text with ranges, usage errors exit 1).
 | `--dry-run` | no | off | print the plan (section 3.1) and write nothing |
 | `--verbose` | no | off | print per-stage timings and the Blender log |
 
-Validation, in order: the input exists and is readable; `--output` names a
-file stem in an existing writable directory; the four crop flags come
-together, each finite, north > south, east > west, within ±90 and ±180;
-`--grid` width and height at least 2; `--z-scale` and `--scale` positive and
-finite; `--base` finite; `--plinth` zero or positive and finite. The window must overlap the file by at least 2 x 2
-pixels. The output grid must not exceed 25 million vertices (an STL of about
-2.5 GB); above 4 million the tool prints a warning with the expected file
-sizes and continues. Full resolution on the City's whole file is 254 million
-pixels and is refused with the message to use `--grid` or a crop.
+Validation, in order: the options first (the four crop flags come together,
+each finite, north > south, east > west, within ±90 and ±180; `--grid` width
+and height at least 2; `--z-scale` and `--scale` positive and finite;
+`--base` finite; `--plinth` zero or positive and finite), then the input
+exists and is readable, then `--output` names a file stem in an existing
+writable directory, then, without `--overwrite`, that no output exists, then,
+when `--blender` or `$BLENDER` names a Blender, that it is an executable file
+(a bare name is looked up on `PATH`). The window must overlap the file by at
+least 2 x 2 pixels. The output grid must not exceed 25 million vertices (an
+STL of about 2.5 GB); above 4 million the tool prints a warning with the
+expected file sizes and, unless `--no-blend`, Blender's estimated memory, and
+continues. Full resolution on the City's whole file is 254 million pixels and
+is refused with the message to use `--grid` or a crop.
 
 ### 3.1 The dry run
 
 `--dry-run` prints: the input's projection (geographic or Transverse Mercator
-with its parameters), pixel size, raster type (point or area), no-data value,
-the pixel window chosen for the crop and its extent in degrees and metres,
-the output grid and cell size in metres, the height range in the window, the
-base plane chosen and why, the number of no-data pixels and how they are
-filled, the number of triangles and the sizes of the STL and PLY, and which
-Blender would be run. It reads the window's pixels to do so (a whole-file dry
-run on the City's model reads 1 GB, a few seconds from an SSD) and writes
-nothing.
+with its parameters); pixel size; raster type (point or area); no-data value;
+the pixel window chosen for the crop, in degrees for a geographic file and in
+projected metres for a Transverse Mercator one, its extent in metres, and the
+crop echoed in degrees; the output grid and cell size in metres; the height
+range in the window; the base plane chosen and why; the number of no-data
+pixels and how they are filled; the number of triangles and the sizes of the
+STL and PLY; and which Blender would be run and about how much memory it will
+need. It reads the window's pixels to do so (a whole-file dry run on the
+City's model reads 1 GB, about a minute in the Debug build on the owner's
+machine: 6 s to read, 36 s to fill, 14 s to resample at `--grid 400`) and
+writes nothing.
 
 ## 4. Reading the GeoTIFF
 
@@ -178,7 +185,13 @@ midpoints of its four edges with the forward Transverse Mercator formulas
 degrees of the central meridian), take the bounding rectangle of those eight
 points in projected metres, then the pixel window as above. The mesh covers
 the pixel window, which is slightly larger than the requested box; the dry
-run and the normal run print the window actually used, in degrees.
+run and the normal run print the window actually used, in the file's own
+units (degrees, or projected metres for a Transverse Mercator file), and echo
+the crop box in degrees.
+
+The crop's edges are WGS 84 degrees, applied on the file's own ellipsoid with
+no datum shift, which is within a metre for Hartebeesthoek94 and WGS 84
+files.
 
 Without a crop, the window is the whole file.
 
@@ -198,7 +211,7 @@ projection is needed for a relief model.
 
 No-data and NaN pixels are filled from the nearest pixel that has a height
 (the owner's choice, made when the builder check showed that in the City's
-file no-data also covers land outside the municipal boundary, up to 1,559 m
+file no-data also covers land outside the municipal boundary, up to 1,576.5 m
 at the Hottentots Holland edge). Sea therefore comes out flat at about coast
 level, land beyond the boundary continues as a plateau at the edge height
 instead of dropping to a cliff, and a gap in an unfinished `dl_elevation`
@@ -227,9 +240,10 @@ STL as millimetres, 2 m at `--scale 1`). The dry run reports the plinth's
 effect. The PLY and the Blender scene hold the surface only and are not
 affected.
 
-Heights are clamped to the base plane from below (a pixel below the plane
-cannot happen after the lowering, but a resampled value can undershoot a
-little at a cliff; clamping keeps the solid valid).
+Heights are clamped to the base plane from below as a guard only: after the
+lowering no height lies below the plane, and the B-spline never leaves the
+range of its samples, so the clamp does not act; it keeps the solid valid
+should either ever change.
 
 ### 5.4 Resampling
 
@@ -285,7 +299,8 @@ float32) and triangle faces, the hand-off to Blender and usable in any 3D
 tool. Written whether or not Blender runs.
 
 The STL and PLY are written to `STEM.stl.tmp` and `STEM.ply.tmp` and renamed
-into place when complete, as `DemRaster::save` does.
+into place after a checked close, without the fsync `DemRaster::save` makes,
+since a re-run regenerates them.
 
 ## 6. Verification
 
@@ -315,6 +330,14 @@ executable is `--blender` if given, else `$BLENDER`, else
 Target: Blender 4.2 LTS or later; the owner has 4.5.12 LTS (Intel build,
 Python 3.11). The script checks `bpy.app.version` and exits with a message
 on anything older.
+
+A `--blender` or `$BLENDER` that does not name an executable file is refused
+before anything is read, in dry runs too, with the flag or variable named;
+`--blender ""` is a usage error. Only the automatic search can find nothing,
+and then the run writes the STL and PLY first. An existing `STEM.blend`,
+which can be there only under `--overwrite`, is removed before Blender
+starts, so that a Blender that fails leaves no old scene beside the new STL
+and PLY.
 
 If Blender cannot be found or fails, the STL and PLY stay, the Blender error
 is printed, and the exit code is 1 (the owner asked for the `.blend`; a
@@ -370,8 +393,10 @@ means fetching one image for the window and connecting it; no mesh change.
 - `src/mesh/`: a static library `demmesh` depending on `demdl` (for
   `BoundingBox` and the libtiff setup): `GeoTiffGrid` (the reader, section 4),
   `TransverseMercator` (forward projection and the EPSG table),
-  `LocalMetres` (section 5.2), `Resampler` (section 5.4), `SolidMesh`
-  (section 5.5, including the self-check of section 6), `StlWriter`,
+  `CropWindow` (sections 5.1 and 5.2: the pixel window and the local metres),
+  `NoDataFill` (5.3), `Resampler` (section 5.4), `BasePlane` (5.3),
+  `SolidMesh` (section 5.5, including the self-check of section 6),
+  `AtomicFileWriter` (the .tmp-and-rename both writers use), `StlWriter`,
   `PlyWriter`, `BlenderRunner` (section 7.1), `blender_scene.py`.
 - `src/app/`: `MeshCli.cpp` (CLI11, same conventions as `Cli.cpp`) and
   `dem2mesh_main.cpp`.

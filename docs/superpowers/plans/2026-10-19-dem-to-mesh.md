@@ -55,6 +55,7 @@ Inputs the spec implies but no planned test would otherwise exercise; each has a
 | `src/mesh/Resampler.h/.cpp` | quadratic B-spline resampling |
 | `src/mesh/BasePlane.h/.cpp` | the base-plane rule (sea level, lowering, margin, plinth) |
 | `src/mesh/SolidMesh.h/.cpp` | surface and solid meshes, the self-check |
+| `src/mesh/AtomicFileWriter.h/.cpp` | little-endian binary output through `<path>.tmp` and a rename after a checked close, for both writers |
 | `src/mesh/StlWriter.h/.cpp`, `src/mesh/PlyWriter.h/.cpp` | binary writers, `.tmp` + rename |
 | `src/mesh/BlenderRunner.h/.cpp`, `src/mesh/blender_scene.py`, `src/mesh/BlenderScenePy.h.in` | find and run Blender with the embedded script |
 | `src/app/MeshCli.h/.cpp`, `src/app/dem2mesh_main.cpp` | argument parsing, the pipeline, the dry run |
@@ -337,3 +338,16 @@ Spec 8 (CLAUDE.md).
 - Spec coverage: 3 (Tasks 9, 10), 3.1 (10), 4 (3), 5.1–5.2 (4), 5.3 (5, 7), 5.4 (6), 5.5 (7, 8), 6 (7), 7 (11), 8 (2–12 as laid out), 9 (constraints, 10), 10–11 (nothing to build).
 - The spec's `--grid` height-from-aspect rule and the "at least 2" rule are pinned in Tasks 9 and 10; the warning and refusal thresholds in Task 10.
 - Type consistency: `PixelWindow` and `GridGeometry` (Task 3) are consumed unchanged by Tasks 4 and 10; `Mesh`/`Vec3`/`Triangle` (Task 7) by Tasks 8, 10, 11; `MeshOptions` (Task 9) by Task 10; `BlenderJob` (Task 11) only inside Task 11.
+
+## Follow-ups deferred at the final review (2026-10-19)
+
+- GeoTIFF reader: a Transverse Mercator file with a UTM EPSG code but no `ProjScaleAtNatOriginGeoKey` is read at scale 1, as GDAL reads it; it moves where a crop lands, not the mesh.
+- GeoTIFF reader: GDAL's scale and offset metadata (tag 42112) is ignored, so an integer DEM that relies on it would show absurd heights on the `heights:` line; a refusal is about ten lines.
+- Fill: nearest is 4-connected with scan-order ties, which extrudes plateaus along rows and columns beyond a diagonal boundary; if a render of the whole City looks wrong there, a Euclidean distance transform is the replacement.
+- Crop window: the Transverse Mercator perimeter sampling does not add the central-meridian crossing; the error is below about 1 m.
+- Resampler tests: the plane tolerance of 0.05 could be 0.005; a border-spike range test would guard the kernel.
+- Writers and SolidMesh: the corner check appears three times and the cross product twice, pinned by tests; single-source them when next touched. The `FileSizeLimit` test helper is copied.
+- `dem2mesh_main.cpp`: the summary texts live in main's anonymous namespace and are tested only by spawning; move them into a `MeshReport` unit in `demmesh_cli` when the summary next changes.
+- Memory: the window is 1 GB for the City's whole file but resident memory is 2 GB because libtiff maps the file; opening with mode "rm" would make them match. The PLY could be written from the solid's surface prefix so that surface and solid are never held together.
+- Tests: the two `[slow]` cases take about 32 s of the suite's 67 s; whether the suite is safe under `ctest -j` is untested.
+- Owner decision pending: render the whole City file before printing it (61 percent of its pixels are filled).
