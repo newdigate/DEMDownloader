@@ -21,11 +21,13 @@
 using Catch::Matchers::ContainsSubstring;
 using demdl::mesh::BlenderJob;
 using demdl::mesh::BlenderResult;
+using demdl::mesh::blenderStartProblem;
 using demdl::mesh::findBlender;
 using demdl::mesh::findOnPath;
 using demdl::mesh::kBlenderAppExecutable;
 using demdl::mesh::kBlenderScenePy;
 using demdl::mesh::Mesh;
+using demdl::mesh::namedBlender;
 using demdl::mesh::runBlender;
 
 namespace {
@@ -145,6 +147,67 @@ TEST_CASE("findOnPath takes the first executable file of the name in the list's 
   const ScopedCurrentPath here(first);
   CHECK_FALSE(findOnPath("blender", ":").has_value());
   CHECK_FALSE(findOnPath("blender", "").has_value());
+}
+
+TEST_CASE("namedBlender is the --blender path, else BLENDER unless it is empty, else none", "[blender]") {
+  {
+    const ScopedEnv blender("BLENDER", "/elsewhere/blender");
+    CHECK(namedBlender(Path("/opt/blender/blender")) == Path("/opt/blender/blender"));
+    CHECK(namedBlender(Path("blender")) == Path("blender"));
+    CHECK(namedBlender(std::nullopt) == Path("/elsewhere/blender"));
+  }
+  for (const std::optional<std::string>& value : {std::optional<std::string>(""), std::optional<std::string>()}) {
+    CAPTURE(value.has_value());
+    const ScopedEnv blender("BLENDER", value);
+    CHECK(namedBlender(Path("/opt/blender/blender")) == Path("/opt/blender/blender"));
+    CHECK_FALSE(namedBlender(std::nullopt).has_value());
+  }
+}
+
+TEST_CASE("blenderStartProblem says why a named Blender cannot be started, and nothing when it can", "[blender]") {
+  const TempDir dir;
+  const Path executable = dir.path / "blender";
+  writeExecutable(executable);
+  const Path plain = dir.path / "plain";  // a file that may not be run
+  writeFile(plain, "#!/bin/sh\nexit 0\n");
+  std::filesystem::permissions(plain, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  const Path folder = dir.path / "folder";
+  REQUIRE(std::filesystem::create_directory(folder));
+  const Path app = dir.path / "Blender.app";
+  REQUIRE(std::filesystem::create_directory(app));
+  const Path link = dir.path / "link";
+  std::filesystem::create_symlink(executable, link);
+  const Path dangling = dir.path / "dangling";
+  std::filesystem::create_symlink(dir.path / "missing", dangling);
+
+  CHECK_FALSE(blenderStartProblem(executable).has_value());
+  CHECK_FALSE(blenderStartProblem(link).has_value());  // a link to an executable file counts
+  CHECK(blenderStartProblem(dir.path / "missing") == "does not exist");
+  CHECK(blenderStartProblem(dir.path / "missing" / "blender") == "does not exist");
+  CHECK(blenderStartProblem(dangling) == "does not exist");
+  CHECK(blenderStartProblem(plain) == "is not executable");
+  CHECK(blenderStartProblem(folder) == "is not a regular file");
+  // The app is a directory; what runs is inside it. A trailing slash, as a shell's completion adds, changes nothing.
+  const std::string inside = "is the app bundle; its executable is " + app.string() + "/Contents/MacOS/Blender";
+  CHECK(blenderStartProblem(app) == inside);
+  CHECK(blenderStartProblem(app.string() + "/") == inside);
+
+  // A name without a slash is looked for on PATH, as a shell would look it up, and only an executable file counts.
+  {
+    const ScopedEnv path("PATH", dir.path.string());
+    CHECK_FALSE(blenderStartProblem("blender").has_value());
+    CHECK(blenderStartProblem("plain") == "not found on PATH");
+    CHECK(blenderStartProblem("folder") == "not found on PATH");
+    CHECK(blenderStartProblem("missing") == "not found on PATH");
+  }
+  {
+    const ScopedEnv path("PATH", std::nullopt);
+    CHECK(blenderStartProblem("blender") == "not found on PATH");
+  }
+  // A relative path with a slash in it is taken from the working directory.
+  const ScopedCurrentPath here(dir.path);
+  CHECK_FALSE(blenderStartProblem("./blender").has_value());
+  CHECK(blenderStartProblem("./folder") == "is not a regular file");
 }
 
 TEST_CASE("runBlender runs Blender in the background on the embedded script with the job after --", "[blender]") {

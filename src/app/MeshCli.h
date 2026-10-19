@@ -41,10 +41,10 @@ struct MeshOptions {
 // Does not call validateMeshOptions(); the caller does. After a usage error `options` may be partially filled and must
 // not be used.
 //
-// Numbers must be plain decimals and whole numbers, as in dl_elevation's parser (CliChecks.h), and the four crop flags
-// come together or not at all. Nothing is looked up on disk: that the input exists and that the output directory can
-// be written is for main to check. Text that CLI11 reads as infinity, such as 1e999, gets through here and is for
-// validateMeshOptions to refuse.
+// Numbers must be plain decimals and whole numbers, as in dl_elevation's parser (CliChecks.h), the four crop flags
+// come together or not at all, and --output and --blender must not be empty. Nothing is looked up on disk: that the
+// input exists, that the output directory can be written and that a Blender named can be started is for main to check.
+// Text that CLI11 reads as infinity, such as 1e999, gets through here and is for validateMeshOptions to refuse.
 [[nodiscard]] ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& options, std::ostream& out,
                                          std::ostream& err);
 

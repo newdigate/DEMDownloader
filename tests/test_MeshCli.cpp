@@ -563,6 +563,14 @@ TEST_CASE("the --output stem must end in a file name", "[meshcli]") {
   CHECK_THAT(p.err, ContainsSubstring(", not '" + stem + "'"));
 }
 
+TEST_CASE("an empty --blender is a usage error, as an empty --output is", "[meshcli]") {
+  // It names no file at all, so a run could only fail on it, and only after reading, meshing and writing.
+  const Parsed p = parse(requiredWith({"--blender", ""}));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, StartsWith("error: --blender: must name the Blender executable, not ''\n"));
+}
+
 TEST_CASE("the --output flag takes a stem with or without a directory", "[meshcli]") {
   const std::string stem = GENERATE(as<std::string>{}, "out", "dir/out", "/abs/dir/out", "../out", "./out", "out.v2");
   CAPTURE(stem);

@@ -246,6 +246,7 @@ TEST_CASE("a full-resolution run writes the closed solid over the window and the
   CHECK_THAT(topAt(solid, extent.widthM, extent.heightM), WithinAbs(40.0, 0.01));
 
   CHECK_THAT(result.out, ContainsSubstring("input: " + w.input.string() + ", geographic, 8 x 6 samples at "));
+  CHECK(result.out.find("crop: ") == std::string::npos);  // none was asked for
   CHECK_THAT(result.out, ContainsSubstring("\nheights: 10 to 60 m (2 no-data pixels filled with 40 to 43 m)\n"));
   CHECK_THAT(result.out, ContainsSubstring("\nsummit: 60 m in the window, 60 m in the mesh\n"));
   CHECK_THAT(result.out, ContainsSubstring("\nbase: -1 m (sea level minus a 1 m margin)\n"));
@@ -305,6 +306,10 @@ TEST_CASE("a crop narrows the window, and one beside the file is refused", "[mes
     CHECK(cols < kCols);
     // Columns 2 to 6 and rows 1 to 5 hold the box. Neither no-data pixel is among them, so nothing was filled.
     CHECK_THAT(result.out, ContainsSubstring("window: 5 x 5 pixels at (2, 1), "));
+    // The crop asked for, echoed in degrees between the input and the window, as the dry run echoes it.
+    CHECK_THAT(result.out, ContainsSubstring(" degrees\ncrop: north -34.19, south -34.21, east 18.45, west 18.42 "
+                                             "degrees\nwindow: 5 x 5 pixels at (2, 1), "));
+    CHECK_THAT(result.out, StartsWith("input: "));
     CHECK(result.out.find("filled") == std::string::npos);
     CHECK(readBinaryStl(w.stl()).triangles.size() == solidTriangleCount(5, 5));
   }
@@ -486,8 +491,56 @@ TEST_CASE("with Blender installed, a run saves the scene and Blender's check of 
   CHECK(filesIn(w.outDir) == std::vector<std::string>{"model.blend", "model.ply", "model.stl"});
 }
 
-TEST_CASE("a Blender that cannot be started or fails leaves the STL and PLY, shows its output and exits 1",
-          "[mesh-e2e]") {
+TEST_CASE("a --blender or BLENDER that names no executable file is refused before anything is read", "[mesh-e2e]") {
+  const Workspace w;
+  // Refused in the round of checks before the input is opened: nothing is written, and a dry run prints nothing, as
+  // its "dry run" line comes after those checks.
+  const auto checkRefused = [&w](const Finished& result, const std::string& problem) {
+    CHECK(result.exitCode() == 1);
+    CHECK(result.err == "error: " + problem + "\n");
+    CHECK(result.out.empty());
+    CHECK(std::filesystem::is_empty(w.outDir));
+  };
+  SECTION("a path that names nothing") {
+    const Finished result = w.runWithBlender({"--blender", "/nonexistent/blender"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "--blender /nonexistent/blender: does not exist");
+  }
+  SECTION("the same in a dry run") {
+    const Finished result = w.runWithBlender({"--dry-run", "--blender", "/nonexistent/blender"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "--blender /nonexistent/blender: does not exist");
+  }
+  SECTION("BLENDER naming nothing") {
+    const ScopedEnv blender("BLENDER", "/nonexistent/blender");
+    const Finished result = w.runWithBlender({});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "BLENDER=/nonexistent/blender: does not exist");
+  }
+  SECTION("a directory") {
+    const Path folder = w.dir.path / "bin";
+    REQUIRE(std::filesystem::create_directory(folder));
+    const Finished result = w.runWithBlender({"--blender", folder.string()});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "--blender " + folder.string() + ": is not a regular file");
+  }
+  SECTION("the app bundle, which holds the executable") {
+    const Path app = w.dir.path / "Blender.app";
+    REQUIRE(std::filesystem::create_directory(app));
+    const Finished result = w.runWithBlender({"--blender", app.string()});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "--blender " + app.string() + ": is the app bundle; its executable is " + app.string() +
+                             "/Contents/MacOS/Blender");
+  }
+  SECTION("not with --no-blend, which starts no Blender") {
+    const Finished result = w.run({"--blender", "/nonexistent/blender"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    CHECK(result.exitCode() == 0);
+    CHECK_THAT(result.out, EndsWith("\nblender: skipped (--no-blend)\n"));
+  }
+}
+
+TEST_CASE("a Blender that fails leaves the STL and PLY, shows its output and exits 1", "[mesh-e2e]") {
   const Workspace w;
   const TempDir bin;
   const FakeBlender fake = writeFakeBlender(bin.path);
@@ -501,19 +554,6 @@ TEST_CASE("a Blender that cannot be started or fails leaves the STL and PLY, sho
     CHECK(std::filesystem::exists(w.ply()));
     CHECK_FALSE(std::filesystem::exists(w.blend()));
   };
-  SECTION("a path that names nothing") {
-    const Finished result = w.runWithBlender({"--blender", "/nonexistent/blender"});
-    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
-    checkKept(result, "/nonexistent/blender");
-    CHECK(result.err ==
-          "error: Blender failed (exit 127)\ncannot start '/nonexistent/blender': No such file or directory\n");
-  }
-  SECTION("an empty path, which is a path given and not none") {
-    const Finished result = w.runWithBlender({"--blender", ""});
-    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
-    checkKept(result, "");
-    CHECK(result.err == "error: Blender failed (exit 127)\ncannot start '': No such file or directory\n");
-  }
   SECTION("a Blender that exits 3, whose output is shown") {
     const ScopedEnv code("FAKE_EXIT", "3");
     const Finished result = w.runWithBlender({"--blender", fake.executable.string()});
@@ -537,6 +577,25 @@ TEST_CASE("a Blender that cannot be started or fails leaves the STL and PLY, sho
     CHECK(result.err == "error: Blender exited 0 but did not write " + w.blend().string() +
                             "\nfake blender: to stdout\nfake blender: to stderr\n"
                             "stl check: 100 triangles, 0 non-manifold edges, 0 inverted faces\n");
+  }
+  SECTION("an old scene, which goes before Blender starts, so that a Blender that fails leaves none") {
+    writeFile(w.blend(), "an old scene");
+    const ScopedEnv code("FAKE_EXIT", "1");
+    const Finished result = w.runWithBlender({"--blender", fake.executable.string(), "--overwrite"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkKept(result, fake.executable.string());
+    CHECK(result.err == "error: Blender failed (exit 1)\nfake blender: to stdout\nfake blender: to stderr\n");
+  }
+  SECTION("an old scene that cannot be removed, which fails the run before Blender starts") {
+    // A directory with something in it, which a removal leaves where it is.
+    REQUIRE(std::filesystem::create_directory(w.blend()));
+    writeFile(w.blend() / "inside", "");
+    const Finished result = w.runWithBlender({"--blender", fake.executable.string(), "--overwrite"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    CHECK(result.exitCode() == 1);
+    CHECK(result.err == "error: cannot remove " + w.blend().string() + ": Directory not empty\n");
+    CHECK_THAT(result.out, EndsWith("\nwrote: " + w.ply().string() + "\nblender: " + fake.executable.string() + "\n"));
+    CHECK_FALSE(std::filesystem::exists(fake.arguments));  // never started
   }
 }
 
@@ -594,14 +653,20 @@ TEST_CASE("dem2mesh gives Blender the outputs, the stem's name, and the model's 
   CHECK(numberIn(args[13], "--scale") == 0.01);
 }
 
-TEST_CASE("a dry run names the Blender a run would start and the scene it would save", "[mesh-e2e]") {
+TEST_CASE("a dry run names the Blender a run would start, the memory it would take, and the scene it would save",
+          "[mesh-e2e]") {
   const Workspace w;
-  const Finished result = w.runWithBlender({"--dry-run", "--blender", "/opt/blender/blender"});
+  const TempDir bin;
+  const FakeBlender fake = writeFakeBlender(bin.path);
+  const Finished result = w.runWithBlender({"--dry-run", "--blender", fake.executable.string()});
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   CHECK(result.exitCode() == 0);
   CHECK_THAT(result.out, ContainsSubstring("\n  output: " + w.blend().string() + " (will be created)\n"));
-  CHECK_THAT(result.out, EndsWith("\n  blender: /opt/blender/blender (will be run)\n"));
+  // 250 MB and 670 bytes for each of the solid's 100 triangles: 0.250067 GB.
+  CHECK_THAT(result.out,
+             EndsWith("\n  blender: " + fake.executable.string() + " (will be run; about 0.3 GB of memory)\n"));
   CHECK(std::filesystem::is_empty(w.outDir));
+  CHECK_FALSE(std::filesystem::exists(fake.arguments));  // it was not started
 
   const Finished without = w.run({"--dry-run"});
   INFO("--no-blend, stdout:\n" << without.out << "stderr:\n" << without.err);

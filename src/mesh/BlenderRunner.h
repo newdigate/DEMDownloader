@@ -10,14 +10,29 @@ namespace demdl::mesh {
 // Where the Blender app keeps its executable on macOS: the third place findBlender looks.
 inline constexpr char kBlenderAppExecutable[] = "/Applications/Blender.app/Contents/MacOS/Blender";
 
+// The Blender the user named (spec 7.1): flag, which is --blender, when given, as it is; else $BLENDER when it is set
+// and not empty, also as it is; else nullopt. A Blender named is used with no fallback, so that a bad one fails with
+// its name rather than some other Blender running in its place.
+[[nodiscard]] std::optional<std::filesystem::path> namedBlender(const std::optional<std::filesystem::path>& flag);
+
 // The Blender to run (spec 7.1), in this order:
-// - flag, which is --blender, when given, as it is. An empty path counts as given: the user named it, so a bad one
-//   must fail with its name rather than fall through to some other Blender.
-// - $BLENDER when it is set and not empty, also as it is.
+// - the one the user named, as namedBlender gives it. An empty --blender counts as named, though the parser refuses
+//   one, so that it can never fall through to another Blender.
 // - kBlenderAppExecutable when it exists.
 // - the first blender on PATH, as findOnPath finds it.
-// nullopt when none of them gives one. Whether a path can be run is for runBlender to find out, and to report.
+// nullopt when none of them gives one. Whether a named one can be started is for blenderStartProblem to say before the
+// run reads anything; whether the one run does start is for runBlender to find out, and to report.
 [[nodiscard]] std::optional<std::filesystem::path> findBlender(const std::optional<std::filesystem::path>& flag);
+
+// Why the Blender the user named cannot be started, as far as can be told without starting it; nullopt when it can be.
+// The text completes "--blender <path>: " or "BLENDER=<path>: ":
+// - a name without a "/" is looked for on PATH with findOnPath: "not found on PATH";
+// - any other path, from the working directory when it is relative, must exist ("does not exist"), be a regular file
+//   once links are followed ("is not a regular file", or for a directory whose name ends in ".app" "is the app bundle;
+//   its executable is <path>/Contents/MacOS/Blender") and be one this process may execute ("is not executable"). A
+//   path that cannot be looked at, behind a directory this user may not search for instance, "cannot be looked at
+//   (<reason>)".
+[[nodiscard]] std::optional<std::string> blenderStartProblem(const std::filesystem::path& blender);
 
 // The first directory of searchPath, a list separated by ':' as PATH is, that holds `name` as a regular file this
 // process may execute (a link to one counts), joined to the name; nullopt when none does. An empty entry is skipped,

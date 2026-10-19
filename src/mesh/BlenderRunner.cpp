@@ -162,9 +162,14 @@ void endLine(std::string& text) {
 
 }  // namespace
 
-std::optional<fs::path> findBlender(const std::optional<fs::path>& flag) {
+std::optional<fs::path> namedBlender(const std::optional<fs::path>& flag) {
   if (flag) return flag;
   if (const char* env = std::getenv("BLENDER"); env != nullptr && *env != '\0') return fs::path(env);
+  return std::nullopt;
+}
+
+std::optional<fs::path> findBlender(const std::optional<fs::path>& flag) {
+  if (std::optional<fs::path> named = namedBlender(flag)) return named;
   std::error_code ignored;
   if (fs::exists(kBlenderAppExecutable, ignored)) return fs::path(kBlenderAppExecutable);
   const char* path = std::getenv("PATH");
@@ -182,6 +187,28 @@ std::optional<fs::path> findOnPath(std::string_view name, std::string_view searc
     if (colon == std::string_view::npos) return std::nullopt;
     searchPath.remove_prefix(colon + 1);
   }
+}
+
+std::optional<std::string> blenderStartProblem(const fs::path& blender) {
+  const std::string text = blender.string();
+  if (text.find('/') == std::string::npos) {
+    const char* path = std::getenv("PATH");
+    if (findOnPath(text, path != nullptr ? path : "")) return std::nullopt;
+    return "not found on PATH";
+  }
+  std::error_code ec;
+  const fs::file_status status = fs::status(blender, ec);  // through any links, as starting it would go
+  if (status.type() == fs::file_type::not_found) return "does not exist";
+  if (ec) return "cannot be looked at (" + ec.message() + ")";
+  if (fs::is_directory(status)) {
+    // The path as typed, without the slash that a shell's completion leaves after a directory.
+    std::string bundle = text;
+    while (bundle.size() > 1 && bundle.back() == '/') bundle.pop_back();
+    if (bundle.ends_with(".app")) return "is the app bundle; its executable is " + bundle + "/Contents/MacOS/Blender";
+  }
+  if (!fs::is_regular_file(status)) return "is not a regular file";
+  if (::access(blender.c_str(), X_OK) != 0) return "is not executable";
+  return std::nullopt;
 }
 
 BlenderResult runBlender(const fs::path& blender, const BlenderJob& job) {

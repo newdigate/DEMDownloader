@@ -65,6 +65,13 @@ std::string checkFileStem(const std::string& text) {
   return "must end in a file name (the stem of STEM.stl, STEM.ply and STEM.blend), not " + quoted(text);
 }
 
+// An empty --blender names no file, so a run could only fail on it, and only once it had read, meshed and written
+// everything; it is refused here, as an empty --output is.
+std::string checkBlenderName(const std::string& text) {
+  if (!text.empty()) return {};
+  return "must name the Blender executable, not " + quoted(text);
+}
+
 }  // namespace
 
 ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& options, std::ostream& out,
@@ -81,6 +88,7 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   const CLI::Validator notFlagLike(checkNotFlagLike, "");
   const CLI::Validator gridText([](const std::string& text) { return readGrid(text).problem; }, "");
   const CLI::Validator fileStem(checkFileStem, "");
+  const CLI::Validator blenderName(checkBlenderName, "");
 
   // Parsed into locals so that the paths, the optional values and the grid are assigned only when the whole command
   // line has parsed. Every flag sits in the order of the spec's table.
@@ -146,7 +154,8 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
                      "the Blender executable (default: $BLENDER, then /Applications/Blender.app, then blender on "
                      "PATH)")
           ->type_name("PATH")
-          ->check(notFlagLike);
+          ->check(notFlagLike)
+          ->check(blenderName);
   app.add_flag("--overwrite", options.overwrite,
                "replace existing output files (otherwise they are an error, raised before anything is read)");
   app.add_flag("--dry-run", options.dryRun, "read the input and print the plan; write nothing");

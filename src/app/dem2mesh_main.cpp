@@ -147,6 +147,17 @@ void checkNoOutputExists(const Outputs& outputs) {
   }
 }
 
+// A Blender the user named, with --blender or BLENDER, that cannot be started is refused before anything is read, in a
+// dry run too, rather than once the STL and PLY are written. The search that runs when none is named is left to find
+// what it finds; a run that finds nothing still writes the STL and PLY before it fails.
+void checkNamedBlender(const MeshOptions& options) {
+  const std::optional<fs::path> named = namedBlender(options.blender);
+  if (!named) return;
+  if (const std::optional<std::string> problem = blenderStartProblem(*named)) {
+    throw std::runtime_error((options.blender ? "--blender " : "BLENDER=") + named->string() + ": " + *problem);
+  }
+}
+
 // The output grid in vertices (spec 3).
 struct OutputGrid {
   int cols = 0, rows = 0;
@@ -196,18 +207,33 @@ struct Facts {
   MeshCheck check;
 };
 
-// "4000000 vertices" and up: the sizes in megabytes, which is what a user weighs before waiting for them.
-void warnOfLargeFiles(const Facts& f) {
-  std::cerr << "warning: the output grid is " << f.grid.vertices() << " vertices: the STL will take "
-            << fixed(static_cast<double>(f.stlBytes) / 1e6, 0) << " MB and the PLY "
-            << fixed(static_cast<double>(f.plyBytes) / 1e6, 0) << " MB\n";
+// Blender's peak resident memory, estimated from the solid's triangle count, as "<gigabytes> GB" to one decimal: about
+// 670 bytes a triangle over a floor of 250 MB, from Blender 4.5.12, which peaked at 583 MB with 511,004 triangles and
+// at 1,606 MB with 2,042,004. Just above the warning's 4,000,000 vertices that is about 5.6 GB, and at the limit about
+// 34 GB.
+std::string blenderMemory(std::uint64_t triangles) {
+  return fixed((250e6 + 670.0 * static_cast<double>(triangles)) / 1e9, 1) + " GB";
+}
+
+// "4000000 vertices" and up: the sizes in megabytes, which is what a user weighs before waiting for them, and the
+// memory Blender will want, which can be more than the machine has, unless --no-blend leaves Blender out.
+void warnOfLargeFiles(const MeshOptions& options, const Facts& f) {
+  const std::string stl = fixed(static_cast<double>(f.stlBytes) / 1e6, 0) + " MB";
+  const std::string ply = fixed(static_cast<double>(f.plyBytes) / 1e6, 0) + " MB";
+  std::cerr << "warning: the output grid is " << f.grid.vertices() << " vertices: the STL will take " << stl;
+  if (options.noBlend) {
+    std::cerr << " and the PLY " << ply << "\n";
+  } else {
+    std::cerr << ", the PLY " << ply << ", and Blender about " << blenderMemory(f.triangles)
+              << " of memory (--no-blend skips it)\n";
+  }
 }
 
 // Spec 5, steps 1 to 4, on the window: its heights, read once as float32; no-data filled from the nearest height; the
-// range after the fill, which the base plane is chosen from and which comes before resampling, so that surfaceMesh's
-// clamp to the level still catches a resampled value that undershoots it; the grid resampled to the output size,
-// always, even at full resolution, as the kernel's smoothing is part of the design. The window goes when this returns,
-// so that it is never held beside a mesh.
+// range after the fill, which the base plane is chosen from, and which the resampled grid never leaves, so that
+// surfaceMesh's clamp to the level is only a guard; the grid resampled to the output size, always, even at full
+// resolution, as the kernel's smoothing is part of the design. The window goes when this returns, so that it is never
+// held beside a mesh.
 std::vector<float> readTerrain(const MeshOptions& options, Facts& f, StageClock& clock) {
   std::vector<float> heights = readWindow(options.input, f.geometry, f.window);
   clock.lap("read");
@@ -250,6 +276,13 @@ std::string inputLine(const MeshOptions& options, const GridGeometry& g) {
   return "input: " + options.input.string() + ", " + (geographic ? "geographic" : "Transverse Mercator") + ", " +
          std::to_string(g.width) + " x " + std::to_string(g.height) + " samples at " + number(g.dx) + " x " +
          number(g.dy) + (geographic ? " degrees" : " m");
+}
+
+// The crop asked for, in degrees as given, which the window line cannot show for a Transverse Mercator file, its
+// window being in metres.
+std::string cropLine(const demdl::BoundingBox& crop) {
+  return "crop: north " + number(crop.north) + ", south " + number(crop.south) + ", east " + number(crop.east) +
+         ", west " + number(crop.west) + " degrees";
 }
 
 std::string windowLine(const Facts& f) { return "window: " + describeWindow(f.geometry, f.window); }
@@ -304,19 +337,21 @@ std::string edgesNotCheckedLine() {
 // What to do about a missing Blender (spec 7.1), for its error and for the dry run's plan.
 constexpr std::string_view kBlenderAdvice = "pass --blender, set BLENDER, or install it at /Applications/Blender.app";
 
-// The dry run's line for spec 3.1's "which Blender would be run"; blender is what findBlender gave.
-std::string plannedBlenderLine(const MeshOptions& options, const std::optional<fs::path>& blender) {
+// The dry run's line for spec 3.1's "which Blender would be run" and about how much memory it will need; blender is
+// what findBlender gave.
+std::string plannedBlenderLine(const MeshOptions& options, const Facts& f, const std::optional<fs::path>& blender) {
   if (options.noBlend) return "blender: skipped (--no-blend)";
   if (!blender) {
     return "blender: not found (a run would fail after writing the STL and PLY: " + std::string(kBlenderAdvice) + ")";
   }
-  return "blender: " + blender->string() + " (will be run)";
+  return "blender: " + blender->string() + " (will be run; about " + blenderMemory(f.triangles) + " of memory)";
 }
 
 // The summary down to the files dem2mesh writes itself. A line about Blender follows, from run() or makeScene().
 void printSummary(const MeshOptions& options, const Outputs& outputs, const Facts& f) {
-  std::cout << inputLine(options, f.geometry) << "\n"
-            << windowLine(f) << "\n"
+  std::cout << inputLine(options, f.geometry) << "\n";
+  if (options.crop) std::cout << cropLine(*options.crop) << "\n";
+  std::cout << windowLine(f) << "\n"
             << gridLine(f) << "\n"
             << heightsLine(f) << "\n"
             << summitLine(f) << "\n"
@@ -328,8 +363,8 @@ void printSummary(const MeshOptions& options, const Outputs& outputs, const Fact
 }
 
 // The plan of spec 3.1, after the "dry run" line that run() printed first: the summary's lines with what the summary
-// leaves out (the projection, where the samples sit, the no-data value, the vertical datum, the crop asked for, the
-// window in metres) and what would be written instead of "wrote:".
+// leaves out (the projection, where the samples sit, the no-data value, the vertical datum, the window in metres) and
+// what would be written instead of "wrote:".
 void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& f) {
   const GridGeometry& g = f.geometry;
   const auto line = [](const std::string& text) { std::cout << "  " << text << "\n"; };
@@ -354,11 +389,7 @@ void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& 
   line("no-data: " + (g.noData ? number(*g.noData) + " and NaN" : std::string("NaN only (no GDAL_NODATA)")) +
        ", each filled with the height of the nearest pixel that has one");
   line("vertical: heights taken as metres above sea level");
-  if (options.crop) {
-    const demdl::BoundingBox& c = *options.crop;
-    line("crop: north " + number(c.north) + ", south " + number(c.south) + ", east " + number(c.east) + ", west " +
-         number(c.west) + " degrees");
-  }
+  if (options.crop) line(cropLine(*options.crop));
   line(windowLine(f));
   line("extent: " + metres(f.extent.widthM) + " x " + metres(f.extent.heightM) + " m");
   line(gridLine(f));
@@ -375,7 +406,7 @@ void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& 
     const bool exists = fs::exists(fs::symlink_status(*path, ignored));
     line("output: " + path->string() + (exists ? " (exists, will be overwritten)" : " (will be created)"));
   }
-  line(plannedBlenderLine(options, blender));
+  line(plannedBlenderLine(options, f, blender));
 }
 
 // The first line of text that begins with prefix, without its newline.
@@ -407,7 +438,9 @@ int blenderFailed(const std::string& message, const std::string& output) {
 // saves it as the .blend and checks the STL. The owner asked for the .blend, so a Blender that is missing or fails
 // fails the run. Exit 0 alone does not prove that the script ran: Blender exits 0 when it cannot read the script, or
 // after an exception in it. So the run succeeds only when the output holds the script's "stl check:" line, which it
-// prints last, and the .blend is there.
+// prints last, and the .blend is there. An old .blend, there only under --overwrite, is removed before Blender starts,
+// so that the .blend found afterwards is this Blender's, and one that fails leaves no old scene beside the new STL
+// and PLY.
 int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f, StageClock& clock) {
   const std::optional<fs::path> blender = findBlender(options.blender);
   if (!blender) {
@@ -425,6 +458,9 @@ int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f
                        f.surfaceLowZ,
                        f.surfaceHighZ,
                        options.scale};
+  std::error_code removal;
+  fs::remove(outputs.blend, removal);  // no error when there is none
+  if (removal) throw std::runtime_error("cannot remove " + outputs.blend.string() + ": " + removal.message());
   const BlenderResult result = runBlender(*blender, job);
   if (result.exitCode != 0) {
     return blenderFailed("Blender failed (exit " + std::to_string(result.exitCode) + ")", result.output);
@@ -452,6 +488,7 @@ int run(int argc, char** argv) {
   checkOutputDirectory(options.outputStem);
   const Outputs outputs = outputsFor(options.outputStem);
   if (!options.overwrite) checkNoOutputExists(outputs);
+  if (!options.noBlend) checkNamedBlender(options);
   // First, so that it stays the first line when --verbose prints the stages' times.
   if (options.dryRun) std::cout << "dry run\n";
 
@@ -464,7 +501,7 @@ int run(int argc, char** argv) {
   f.triangles = solidTriangleCount(f.grid.cols, f.grid.rows);
   f.stlBytes = stlFileBytes(f.triangles);
   f.plyBytes = plyFileBytes(f.grid.vertices(), f.grid.surfaceTriangles());
-  if (f.grid.vertices() > kWarnVertices) warnOfLargeFiles(f);
+  if (f.grid.vertices() > kWarnVertices) warnOfLargeFiles(options, f);
   clock.lap("inspect");
 
   std::vector<float> grid = readTerrain(options, f, clock);
@@ -474,8 +511,9 @@ int run(int argc, char** argv) {
   release(grid);
   clock.lap("surface");
   // The surface and the solid, which starts with a copy of it, are both held from here until the PLY is written: at
-  // the 25,000,000-vertex limit about 1.8 GB.
-  const Mesh solid = solidMesh(surface, f.grid.cols, f.grid.rows, static_cast<float>(f.base.planeZ));
+  // the 25,000,000-vertex limit about 1.8 GB. The solid goes once the STL is written, before Blender starts, which
+  // needs memory of its own (blenderMemory).
+  Mesh solid = solidMesh(surface, f.grid.cols, f.grid.rows, static_cast<float>(f.base.planeZ));
   clock.lap("solid");
   f.check = checkSolid(solid);
   selfCheck(f.check, f.triangles);
@@ -494,6 +532,8 @@ int run(int argc, char** argv) {
   release(surface.triangles);
   clock.lap("write PLY");
   writeBinaryStl(solid, outputs.stl, stlHeader(options, f));
+  release(solid.vertices);
+  release(solid.triangles);
   clock.lap("write STL");
   printSummary(options, outputs, f);
   if (options.noBlend) {
