@@ -124,6 +124,11 @@ add_library(demmesh STATIC
 target_link_libraries(demmesh PUBLIC demdl)
 target_compile_options(demmesh PRIVATE -Wall -Wextra)
 
+# MeshCli.cpp is compiled once and shared by the dem2mesh executable and the tests; only it includes CLI11.
+add_library(demmesh_cli OBJECT src/app/MeshCli.cpp)
+target_link_libraries(demmesh_cli PUBLIC demmesh PRIVATE CLI11::CLI11)
+target_compile_options(demmesh_cli PRIVATE -Wall -Wextra)
+
 if(DL_ELEVATION_TESTS)
   enable_testing()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
@@ -150,8 +155,9 @@ if(DL_ELEVATION_TESTS)
     tests/test_Resampler.cpp
     tests/test_BasePlane.cpp
     tests/test_SolidMesh.cpp
-    tests/test_MeshWriters.cpp)
-  target_link_libraries(demdl_tests PRIVATE demdl demmesh demdl_cli Catch2::Catch2WithMain)
+    tests/test_MeshWriters.cpp
+    tests/test_MeshCli.cpp)
+  target_link_libraries(demdl_tests PRIVATE demdl demmesh demdl_cli demmesh_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
   # The end-to-end tests run the executable itself, so it is built first and its path is compiled in.
   add_dependencies(demdl_tests dl_elevation)
