@@ -2,3 +2,6 @@ cmake-build-debug*
 build*/
 *.tif
 *.tif.tmp
+
+# Scratch workspaces of the superpowers plan executor
+.superpowers/
