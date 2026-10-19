@@ -438,10 +438,13 @@ int blenderFailed(const std::string& message, const std::string& output) {
 // saves it as the .blend and checks the STL. The owner asked for the .blend, so a Blender that is missing or fails
 // fails the run. Exit 0 alone does not prove that the script ran: Blender exits 0 when it cannot read the script, or
 // after an exception in it. So the run succeeds only when the output holds the script's "stl check:" line, which it
-// prints last, and the .blend is there. An old .blend, there only under --overwrite, is removed before Blender starts,
-// so that the .blend found afterwards is this Blender's, and one that fails leaves no old scene beside the new STL
-// and PLY.
+// prints last, and the .blend is there. An old .blend, there only under --overwrite, is removed first, before Blender
+// is looked for, so that the .blend found afterwards is this Blender's, and a run whose Blender fails or is not found
+// leaves no old scene beside the new STL and PLY.
 int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f, StageClock& clock) {
+  std::error_code removal;
+  fs::remove(outputs.blend, removal);  // no error when there is none
+  if (removal) throw std::runtime_error("cannot remove " + outputs.blend.string() + ": " + removal.message());
   const std::optional<fs::path> blender = findBlender(options.blender);
   if (!blender) {
     std::cout << "blender: not found" << std::endl;
@@ -458,9 +461,6 @@ int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f
                        f.surfaceLowZ,
                        f.surfaceHighZ,
                        options.scale};
-  std::error_code removal;
-  fs::remove(outputs.blend, removal);  // no error when there is none
-  if (removal) throw std::runtime_error("cannot remove " + outputs.blend.string() + ": " + removal.message());
   const BlenderResult result = runBlender(*blender, job);
   if (result.exitCode != 0) {
     return blenderFailed("Blender failed (exit " + std::to_string(result.exitCode) + ")", result.output);

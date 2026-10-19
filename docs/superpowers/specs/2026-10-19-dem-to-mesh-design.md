@@ -335,9 +335,9 @@ A `--blender` or `$BLENDER` that does not name an executable file is refused
 before anything is read, in dry runs too, with the flag or variable named;
 `--blender ""` is a usage error. Only the automatic search can find nothing,
 and then the run writes the STL and PLY first. An existing `STEM.blend`,
-which can be there only under `--overwrite`, is removed before Blender
-starts, so that a Blender that fails leaves no old scene beside the new STL
-and PLY.
+which can be there only under `--overwrite`, is removed before Blender is
+looked for, so that a Blender that fails or is not found leaves no old scene
+beside the new STL and PLY.
 
 If Blender cannot be found or fails, the STL and PLY stay, the Blender error
 is printed, and the exit code is 1 (the owner asked for the `.blend`; a

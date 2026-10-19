@@ -586,7 +586,7 @@ TEST_CASE("a Blender that fails leaves the STL and PLY, shows its output and exi
     checkKept(result, fake.executable.string());
     CHECK(result.err == "error: Blender failed (exit 1)\nfake blender: to stdout\nfake blender: to stderr\n");
   }
-  SECTION("an old scene that cannot be removed, which fails the run before Blender starts") {
+  SECTION("an old scene that cannot be removed, which fails the run before Blender is looked for") {
     // A directory with something in it, which a removal leaves where it is.
     REQUIRE(std::filesystem::create_directory(w.blend()));
     writeFile(w.blend() / "inside", "");
@@ -594,7 +594,7 @@ TEST_CASE("a Blender that fails leaves the STL and PLY, shows its output and exi
     INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
     CHECK(result.exitCode() == 1);
     CHECK(result.err == "error: cannot remove " + w.blend().string() + ": Directory not empty\n");
-    CHECK_THAT(result.out, EndsWith("\nwrote: " + w.ply().string() + "\nblender: " + fake.executable.string() + "\n"));
+    CHECK_THAT(result.out, EndsWith("\nwrote: " + w.ply().string() + "\n"));  // no blender: line yet
     CHECK_FALSE(std::filesystem::exists(fake.arguments));  // never started
   }
 }
@@ -697,4 +697,14 @@ TEST_CASE("with no Blender to be found, a run writes the STL and PLY and fails, 
   CHECK(plan.exitCode() == 0);
   CHECK_THAT(plan.out, EndsWith("\n  blender: not found (a run would fail after writing the STL and PLY: pass "
                                 "--blender, set BLENDER, or install it at /Applications/Blender.app)\n"));
+
+  // An old scene goes before Blender is looked for, so that a run that finds none leaves none beside the new STL
+  // and PLY.
+  writeFile(w.blend(), "an old scene");
+  const Finished again = w.runWithBlender({"--overwrite"});
+  INFO("over an old scene, stdout:\n" << again.out << "stderr:\n" << again.err);
+  CHECK(again.exitCode() == 1);
+  CHECK(again.err == "error: " + notFound + "\n");
+  CHECK_THAT(again.out, EndsWith("\nwrote: " + w.ply().string() + "\nblender: not found\n"));
+  CHECK_FALSE(std::filesystem::exists(w.blend()));
 }
