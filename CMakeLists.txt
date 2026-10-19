@@ -115,7 +115,9 @@ add_library(demmesh STATIC
   src/mesh/GeoTiffGrid.cpp
   src/mesh/CropWindow.cpp
   src/mesh/NoDataFill.cpp
-  src/mesh/Resampler.cpp)
+  src/mesh/Resampler.cpp
+  src/mesh/BasePlane.cpp
+  src/mesh/SolidMesh.cpp)
 target_link_libraries(demmesh PUBLIC demdl)
 target_compile_options(demmesh PRIVATE -Wall -Wextra)
 
@@ -142,7 +144,9 @@ if(DL_ELEVATION_TESTS)
     tests/test_GeoTiffGrid.cpp
     tests/test_CropWindow.cpp
     tests/test_NoDataFill.cpp
-    tests/test_Resampler.cpp)
+    tests/test_Resampler.cpp
+    tests/test_BasePlane.cpp
+    tests/test_SolidMesh.cpp)
   target_link_libraries(demdl_tests PRIVATE demdl demmesh demdl_cli Catch2::Catch2WithMain)
   target_compile_options(demdl_tests PRIVATE -Wall -Wextra)
   # The end-to-end tests run the executable itself, so it is built first and its path is compiled in.

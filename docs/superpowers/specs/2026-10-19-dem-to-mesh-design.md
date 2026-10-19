@@ -258,11 +258,22 @@ metres from the south-west corner, so the mesh spans the window exactly.
 ### 5.5 The solid
 
 Top surface: the W x H vertices, 2 (W - 1)(H - 1) triangles, consistent
-winding with normals up. Walls: for each of the 2 (W - 1) + 2 (H - 1) boundary
-edges, two triangles down to the base plane, normals outward. Base: two
-triangles spanning the rectangle at the base plane, normal down. Shared
-vertices along every seam, so the mesh is closed and manifold by
-construction. Triangle count 2 (W - 1)(H - 1) + 4 (W + H - 2) + 2.
+winding with normals up. Base: two triangles over four bottom corner vertices
+at the base plane, normal down. Walls: each side is one flat polygon, its top
+vertices over the bottom corners under its two ends, cut into triangles with
+no new vertex and normals outward, so that its bottom edge is a single edge
+shared with the base (two triangles per boundary edge would leave T-junctions
+along the base, which the edge check of section 6 refuses). Walking the
+boundary counter-clockwise seen from above, the cut is a fan from the bottom
+corner under the side's first top vertex over the side's top vertices, plus
+one closing triangle to the next bottom corner, wherever that fan faces
+outward all along. Where the terrain's edge hides a valley from that corner,
+the fan would fold over itself and face inward, so the side is cut as a
+monotone polygon instead: the fan reaches as far as the corner sees,
+triangles between top vertices bridge each hidden valley, and a fan from the
+next bottom corner closes the rest. Shared vertices along every seam, so the
+mesh is closed and manifold by construction. Triangle count
+2 (W - 1)(H - 1) + 2 (W + H) + 2 (12 for a 2 x 2 grid, a box).
 
 STL: binary, 80-byte header naming the tool and the window, little-endian,
 per-triangle unit normals computed from the vertices, attribute bytes zero.
@@ -279,8 +290,11 @@ into place when complete, as `DemRaster::save` does.
 
 After writing, the tool checks its own STL: triangle count equals the
 formula; every edge is shared by exactly two triangles with opposite
-direction (a hash of directed edges); no triangle has zero area; the signed
-volume is positive. A failure is a bug and exits 1 with the counts. Blender's
+direction (each directed edge, a 64-bit key in one sorted list, found once
+and its reverse once, about 24 bytes per triangle); no triangle has zero
+area; the signed volume is positive. The edge check runs up to 10,000,000
+triangles; above that only the count, zero-area and volume checks run, and
+the output says so. A failure is a bug and exits 1 with the counts. Blender's
 check (section 7.2) is a second opinion, not the only one.
 
 ## 7. Blender
