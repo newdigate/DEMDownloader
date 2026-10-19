@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <filesystem>
 #include <optional>
@@ -208,6 +210,19 @@ TEST_CASE("blenderStartProblem says why a named Blender cannot be started, and n
   const ScopedCurrentPath here(dir.path);
   CHECK_FALSE(blenderStartProblem("./blender").has_value());
   CHECK(blenderStartProblem("./folder") == "is not a regular file");
+}
+
+TEST_CASE("blenderStartProblem gives the reason when a path cannot be looked at", "[blender]") {
+  if (::geteuid() == 0) SKIP("root ignores directory permissions");
+  const TempDir dir;
+  const Path locked = dir.path / "locked";
+  REQUIRE(std::filesystem::create_directory(locked));
+  writeExecutable(locked / "blender");
+  // Without search permission on its directory the file can be neither looked at nor run.
+  std::filesystem::permissions(locked, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  const std::optional<std::string> problem = blenderStartProblem(locked / "blender");
+  std::filesystem::permissions(locked, std::filesystem::perms::owner_all);  // so that TempDir can remove it
+  CHECK(problem == "cannot be looked at (Permission denied)");
 }
 
 TEST_CASE("runBlender runs Blender in the background on the embedded script with the job after --", "[blender]") {
