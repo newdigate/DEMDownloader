@@ -14,14 +14,15 @@ namespace demdl::mesh {
 // - a uint32 count of triangles;
 // - per triangle, 50 bytes: the unit normal as three float32, the three vertices in the triangle's order as nine
 //   float32, and a uint16 attribute byte count of 0. The normal is (b - a) x (c - a) scaled to length 1, worked out in
-//   double, so for a triangle wound counter-clockwise seen from outside, as Task 7's solid is, it points out of the
+//   double, so for a triangle wound counter-clockwise seen from outside, as solidMesh's output is, it points out of the
 //   solid. A triangle with no area, or with a coordinate that is not a number, has no direction to give and gets (0, 0,
 //   0), which readers usually take to mean "work it out from the vertices".
 // Every number is little-endian whatever the host. The format has no shared vertices, so each triangle repeats its
 // corners; readBinaryStl merges them again.
 //
-// The file is written to <path>.tmp and renamed over path once complete, as DemRaster::save does, so path is never half
-// a file and keeps what it held if the write fails; the .tmp does not outlive a failure.
+// The file is written to <path>.tmp and renamed over path after a checked close, without the fsync DemRaster::save
+// makes: a reader never meets a half-written file, path keeps what it held if the write fails and the .tmp does not
+// outlive a failure, but a power cut just after the rename can still leave a short file.
 //
 // Throws std::runtime_error naming the file and the operating system's reason when it cannot be written: a missing
 // directory, a full disk, a destination that cannot be replaced. Throws std::invalid_argument, creating no file, when a

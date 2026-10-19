@@ -329,7 +329,7 @@ TEST_CASE("the embedded scene script imports the PLY and checks the STL", "[blen
 
 TEST_CASE("the installed Blender sets the units from the scale and keeps the terrain in place, and its check fails "
           "each flawed solid",
-          "[blender]") {
+          "[blender][slow]") {
   const std::optional<Path> blender = findBlender(std::nullopt);
   if (!blender) SKIP("Blender not installed");
   const TempDir dir;

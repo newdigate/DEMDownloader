@@ -234,7 +234,7 @@ std::vector<Corners> planFan(Face side, int cols, int rows) {
   return fan;
 }
 
-// The brief's box: a 2 x 2 grid of heights 10 over 100 m by 50 m, no exaggeration or scaling, level 0, closed down to
+// The reference box: a 2 x 2 grid of heights 10 over 100 m by 50 m, no exaggeration or scaling, level 0, closed down to
 // z = -5.
 Mesh box() { return solidMesh(surfaceMesh(Grid(4, 10.0f), 2, 2, 100, 50, 1, 1, 0), 2, 2, -5.0f); }
 

@@ -110,43 +110,45 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   // CLI11 checks that required options and needs are met before it converts and checks the values of ordinary options.
   // An edge is converted first, so that a lone "--north 1,5" is told what is wrong with 1,5 rather than asked for
   // --south. Help and version are processed ahead of both.
-  const auto addEdge = [&app, &decimal](const char* name, double& edge) {
-    return app.add_option(name, edge, "crop window edge, WGS84 decimal degrees (all four or none)")
+  const auto addEdge = [&app, &decimal](const char* name, double& edge, const char* description) {
+    return app.add_option(name, edge, description)
         ->check(decimal)
         ->callback_priority(CLI::CallbackPriority::PreRequirementsCheck);
   };
-  CLI::Option* const north = addEdge("--north", crop.north);
-  CLI::Option* const south = addEdge("--south", crop.south);
-  CLI::Option* const east = addEdge("--east", crop.east);
-  CLI::Option* const west = addEdge("--west", crop.west);
+  const char* const latitude = "crop window edge, WGS84 decimal degrees, -90 to 90 (all four or none)";
+  const char* const longitude = "crop window edge, WGS84 decimal degrees, -180 to 180 (all four or none)";
+  CLI::Option* const north = addEdge("--north", crop.north, latitude);
+  CLI::Option* const south = addEdge("--south", crop.south, latitude);
+  CLI::Option* const east = addEdge("--east", crop.east, longitude);
+  CLI::Option* const west = addEdge("--west", crop.west, longitude);
   // Each edge needs the other three, so one edge alone, or three of the four, is a usage error that names a flag
   // still missing. Whether the box makes sense is validateMeshOptions' to say.
   north->needs(south, east, west);
   south->needs(north, east, west);
   east->needs(north, south, west);
   west->needs(north, south, east);
-  // The "at least 2" is stated for the user; validateMeshOptions alone enforces it.
+  // The bounds are stated for the user. validateMeshOptions enforces the 2, and main the 25,000,000, which needs the
+  // window's aspect when the height is left out.
   CLI::Option* const gridOption =
       app.add_option("--grid", gridArg,
-                     "output grid in vertices, W or WxH (at least 2; without xH the height follows the window's "
-                     "aspect)")
+                     "output grid in vertices, W or WxH, each at least 2 and at most 25,000,000 in all (without xH "
+                     "the height follows the window's aspect)")
           ->type_name("W[xH]")
           ->check(gridText);
-  app.add_option("--z-scale", options.zScale, "vertical exaggeration (default 1)")
-      ->capture_default_str()
-      ->check(decimal);
+  // The descriptions give the defaults and the ranges, which validateMeshOptions enforces; CLI11's captured default,
+  // a "[1]" after the type, would say the default twice.
+  app.add_option("--z-scale", options.zScale, "vertical exaggeration, above 0 (default 1)")->check(decimal);
   CLI::Option* const baseOption =
       app.add_option("--base", base,
-                     "base plane height in metres before exaggeration (default sea level, 0; lowered to the lowest "
-                     "point when needed)")
+                     "base plane height in metres before exaggeration, any finite number (default sea level, 0; "
+                     "lowered to the lowest point when needed)")
           ->check(decimal);
   app.add_option("--scale", options.scale,
-                 "model units per metre in the STL and PLY (0.02 makes a 10 km window 200 mm wide)")
-      ->capture_default_str()
+                 "model units per metre in the STL and PLY, above 0 (default 1; 0.02 makes a 10 km window 200 mm "
+                 "wide)")
       ->check(decimal);
   app.add_option("--plinth", options.plinth,
-                 "minimum thickness under the lowest point, model units after scaling (default 2)")
-      ->capture_default_str()
+                 "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)")
       ->check(decimal);
   app.add_flag("--no-blend", options.noBlend, "write the STL and PLY only; do not run Blender");
   CLI::Option* const blenderOption =

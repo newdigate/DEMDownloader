@@ -456,7 +456,7 @@ TEST_CASE("verbose adds a timing line for each stage", "[mesh-e2e]") {
   CHECK(quiet.out.find("time: ") == std::string::npos);
 }
 
-TEST_CASE("with Blender installed, a run saves the scene and Blender's check of the STL passes", "[mesh-e2e]") {
+TEST_CASE("with Blender installed, a run saves the scene and Blender's check of the STL passes", "[mesh-e2e][slow]") {
   const std::optional<Path> blender = findBlender(std::nullopt);
   if (!blender) SKIP("Blender not installed");
   const Workspace w;

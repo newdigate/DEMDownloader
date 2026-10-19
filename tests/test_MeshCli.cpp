@@ -181,7 +181,7 @@ TEST_CASE("the long forms --input and --output work as -i and -o", "[meshcli]") 
 }
 
 TEST_CASE("parsing and validating never look at the file system", "[meshcli]") {
-  // Task 10's main checks that the input exists and that the output directory can be written.
+  // dem2mesh's main checks that the input exists and that the output directory can be written.
   const Parsed p = parse({"-i", "/no/such/dir/in.tif", "-o", "/no/such/dir/out"});
   REQUIRE_FALSE(p.outcome.exitNow);
   CHECK(validateMeshOptions(p.options).empty());
@@ -223,24 +223,37 @@ TEST_CASE("the help lists every flag", "[meshcli]") {
 TEST_CASE("the help states the ranges and defaults", "[meshcli]") {
   const std::string help = squashed(parse({"--help"}).out);
   for (const char* description : {
-           "crop window edge, WGS84 decimal degrees (all four or none)",
-           "output grid in vertices, W or WxH (at least 2; without xH the height follows the window's aspect)",
-           "vertical exaggeration (default 1)",
-           "base plane height in metres before exaggeration (default sea level, 0; lowered to the lowest point when "
-           "needed)",
-           "model units per metre in the STL and PLY (0.02 makes a 10 km window 200 mm wide)",
-           "minimum thickness under the lowest point, model units after scaling (default 2)"}) {
+           "output grid in vertices, W or WxH, each at least 2 and at most 25,000,000 in all (without xH the height "
+           "follows the window's aspect)",
+           "vertical exaggeration, above 0 (default 1)",
+           "base plane height in metres before exaggeration, any finite number (default sea level, 0; lowered to the "
+           "lowest point when needed)",
+           "model units per metre in the STL and PLY, above 0 (default 1; 0.02 makes a 10 km window 200 mm wide)",
+           "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)"}) {
     CAPTURE(description);
     CHECK_THAT(help, ContainsSubstring(description));
   }
 }
 
-TEST_CASE("the help shows the defaults CLI11 captured", "[meshcli]") {
+TEST_CASE("the help gives each crop edge its own range", "[meshcli]") {
   const std::string help = squashed(parse({"--help"}).out);
-  for (const char* option : {"--z-scale FLOAT [1]", "--scale FLOAT [1]", "--plinth FLOAT [2]"}) {
-    CAPTURE(option);
-    CHECK_THAT(help, ContainsSubstring(option));
-  }
+  const auto [flag, range] = GENERATE(table<std::string, std::string>(
+      {{"--north", "-90 to 90"}, {"--south", "-90 to 90"}, {"--east", "-180 to 180"}, {"--west", "-180 to 180"}}));
+  CAPTURE(flag);
+  // The first description after the flag's own entry, whatever CLI11 prints between them.
+  const std::size_t entry = help.find(flag + " FLOAT");
+  REQUIRE(entry != std::string::npos);
+  const std::size_t description = help.find("crop window edge", entry);
+  REQUIRE(description != std::string::npos);
+  CHECK_THAT(help.substr(description),
+             StartsWith("crop window edge, WGS84 decimal degrees, " + range + " (all four or none)"));
+}
+
+TEST_CASE("the help gives each default once, in the descriptions", "[meshcli]") {
+  // CLI11 would add the value it captured, "[1]" or "[2]", after the type.
+  const std::string help = parse({"--help"}).out;
+  CHECK_THAT(help, !ContainsSubstring("[1]"));
+  CHECK_THAT(help, !ContainsSubstring("[2]"));
 }
 
 TEST_CASE("help wins over an invalid value", "[meshcli]") {

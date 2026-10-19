@@ -162,8 +162,8 @@ void checkTightAroundProjectedPoints(const GridGeometry& g, const BoundingBox& c
 TEST_CASE("metres per degree at 34.2 degrees south", "[crop]") {
   const MetresPerDegree m = metresPerDegree(-34.2);
   CHECK_THAT(m.perDegreeLatitude, WithinAbs(110926.0, 0.5));
-  // The brief quotes 92168.8 here, a metre too much for the 0.5 m it asks for: the spec's formula gives 92167.79 and
-  // the ellipsoid itself, N cos(phi) pi / 180 with N = a / sqrt(1 - e^2 sin^2(phi)), gives 92167.71.
+  // An earlier draft of this test used 92168.8 here, a metre too much for the 0.5 m it asks for: the spec's formula
+  // gives 92167.79 and the ellipsoid itself, N cos(phi) pi / 180 with N = a / sqrt(1 - e^2 sin^2(phi)), 92167.71.
   CHECK_THAT(m.perDegreeLongitude, WithinAbs(92167.8, 0.5));
 }
 

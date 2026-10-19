@@ -14,10 +14,11 @@ namespace demdl::mesh {
 // The files are defined as IEEE 754 single precision; a host with another float format would write garbage.
 static_assert(std::numeric_limits<float>::is_iec559 && sizeof(float) == sizeof(std::uint32_t));
 
-// A binary file written the way DemRaster::save writes the checkpoint, for the STL and PLY writers: everything goes to
-// <path>.tmp, and the file is renamed over <path> only once commit() has seen every byte written. So a reader never
-// meets half a file, an existing file survives a write that fails, and a failure leaves no .tmp behind: the destructor
-// removes it unless commit() finished.
+// A binary file for the STL and PLY writers: everything goes to <path>.tmp, which is renamed over <path> only once
+// commit() has seen every byte written and the file closed without error, without the fsync DemRaster::save makes for
+// its checkpoint. So a reader never meets a half-written file, an existing file survives a write that fails, and a
+// failure leaves no .tmp behind: the destructor removes it unless commit() finished. A power cut just after the rename
+// can still leave a short file, which a run made again replaces.
 //
 // A number is written least significant byte first whatever the host's byte order, and a float as the bytes of its
 // IEEE 754 single-precision bit pattern, so a file is the same bytes on every machine. Writes gather in a buffer of
