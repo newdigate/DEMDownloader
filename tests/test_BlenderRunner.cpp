@@ -264,31 +264,39 @@ TEST_CASE("the embedded scene script imports the PLY and checks the STL", "[blen
   CHECK_THAT(script, ContainsSubstring("stl check:"));
 }
 
-TEST_CASE("the installed Blender's check passes a closed solid and fails an open, a twisted and an inside-out one",
+TEST_CASE("the installed Blender sets the units from the scale and keeps the terrain in place, and its check fails "
+          "each flawed solid",
           "[blender]") {
   const std::optional<Path> blender = findBlender(std::nullopt);
   if (!blender) SKIP("Blender not installed");
   const TempDir dir;
   // A 2 x 2 grid, flat at 10 m, 100 m by 50 m: the surface is two triangles and the solid a box of twelve. Each run
-  // below takes Blender's start-up, six seconds on the owner's machine, so the cases share three runs.
+  // below takes Blender's start-up, six seconds on the owner's machine, so the cases share four runs, each with its
+  // own scale for the scene's units.
   const Mesh surface = demdl::mesh::surfaceMesh({10.0f, 10.0f, 10.0f, 10.0f}, 2, 2, 100.0, 50.0, 1.0, 1.0, 0.0);
   const Mesh box = demdl::mesh::solidMesh(surface, 2, 2, -1.0f);
   REQUIRE(box.triangles.size() == 12);
   const BlenderJob job{dir.path / "box.ply", dir.path / "box.stl", dir.path / "box.blend", "box",
                        100.0,               50.0,                10.0,                  10.0, 1.0};
   demdl::mesh::writeBinaryPly(surface, job.ply, 100.0, 50.0);
-  const auto check = [&blender, &job](const Mesh& mesh) {
+  const auto check = [&blender, &job](const Mesh& mesh, double scale) {
     demdl::mesh::writeBinaryStl(mesh, job.stl, "dem2mesh test box");
-    return runBlender(*blender, job);
+    BlenderJob scaled = job;
+    scaled.scale = scale;
+    return runBlender(*blender, scaled);
   };
-  const std::vector<std::string> made{"box.blend", "box.ply", "box.stl"};
 
   {
-    const BlenderResult result = check(box);
+    const BlenderResult result = check(box, 1.0);
     INFO("closed, output:\n" << result.output);
     CHECK(result.exitCode == 0);
     CHECK_THAT(result.output, ContainsSubstring("\nstl check: 12 triangles, 0 non-manifold edges, 0 inverted faces\n"));
     CHECK(readFile(job.blend).substr(0, 4) == "\x28\xb5\x2f\xfd");  // saved compressed, with Zstandard
+    // Where the PLY and the STL put it, so that the STL imported beside it lies on it; its origin in the middle.
+    CHECK_THAT(result.output,
+               ContainsSubstring(", in place at x 0 to 100, y 0 to 50, z 10 to 10, origin at the centre of its base\n"));
+    // At full size a unit is a metre.
+    CHECK_THAT(result.output, ContainsSubstring("\nblender: units: METRIC, scale_length 1, length_unit METERS\n"));
   }
   {
     // Without a triangle of the base, whose three edges are left with one face each, and with a triangle of the top
@@ -296,24 +304,42 @@ TEST_CASE("the installed Blender's check passes a closed solid and fails an open
     Mesh broken = box;
     broken.triangles.pop_back();
     std::swap(broken.triangles[0].b, broken.triangles[0].c);
-    const BlenderResult result = check(broken);
+    const BlenderResult result = check(broken, 0.5);
     INFO("open and twisted, output:\n" << result.output);
     CHECK(result.exitCode == 1);
     CHECK_THAT(result.output, ContainsSubstring("\nstl check: 11 triangles, 3 non-manifold edges, 1 inverted faces\n"));
+    // Half size: a unit is 2 m of terrain.
+    CHECK_THAT(result.output, ContainsSubstring("\nblender: units: METRIC, scale_length 2, length_unit METERS\n"));
   }
   {
     // Every triangle wound the other way is still closed and consistent, so only the turn to face outward catches it.
     Mesh insideOut = box;
     for (demdl::mesh::Triangle& t : insideOut.triangles) std::swap(t.b, t.c);
-    const BlenderResult result = check(insideOut);
+    const BlenderResult result = check(insideOut, 0.05);
     INFO("inside out, output:\n" << result.output);
     CHECK(result.exitCode == 1);
     CHECK_THAT(result.output,
                ContainsSubstring("\nstl check: 12 triangles, 0 non-manifold edges, 12 inverted faces\n"));
+    // A print: a unit shows as the millimetre the slicer prints it as.
+    CHECK_THAT(result.output,
+               ContainsSubstring("\nblender: units: METRIC, scale_length 0.001, length_unit MILLIMETERS\n"));
+  }
+  {
+    // A triangle twice over, which Blender's reader drops without failing; only the count in the file's header shows
+    // it. The rest of the check passes on what was read.
+    Mesh repeated = box;
+    repeated.triangles.push_back(repeated.triangles[0]);
+    const BlenderResult result = check(repeated, 0.1);
+    INFO("a triangle repeated, output:\n" << result.output);
+    CHECK(result.exitCode == 1);
+    CHECK_THAT(result.output, ContainsSubstring("\nstl check: file declares 13 triangles, Blender imported 12\n"));
+    CHECK_THAT(result.output, ContainsSubstring("\nstl check: 12 triangles, 0 non-manifold edges, 0 inverted faces\n"));
+    // A tenth is not yet print-sized: a unit is 10 m of terrain.
+    CHECK_THAT(result.output, ContainsSubstring("\nblender: units: METRIC, scale_length 10, length_unit METERS\n"));
   }
   // Each run after the first saved over the scene, which Blender would otherwise have kept as box.blend1.
   std::vector<std::string> names;
   for (const auto& entry : std::filesystem::directory_iterator(dir.path)) names.push_back(entry.path().filename().string());
   std::sort(names.begin(), names.end());
-  CHECK(names == made);
+  CHECK(names == std::vector<std::string>{"box.blend", "box.ply", "box.stl"});
 }

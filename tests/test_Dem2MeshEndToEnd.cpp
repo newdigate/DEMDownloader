@@ -455,27 +455,33 @@ TEST_CASE("with Blender installed, a run saves the scene and Blender's check of 
   const std::optional<Path> blender = findBlender(std::nullopt);
   if (!blender) SKIP("Blender not installed");
   const Workspace w;
-  // The same model without Blender, to show that Blender leaves the STL and the PLY as dem2mesh wrote them.
-  const Path reference = w.dir.path / "reference";
-  REQUIRE(runDem2Mesh({"-i", w.input.string(), "-o", reference.string(), "--grid", "4x4", "--no-blend"}, w.dir.path)
-              .exitCode() == 0);
+  // A print-sized model. The same without Blender, to show that Blender leaves the STL and the PLY as dem2mesh wrote
+  // them.
+  const std::vector<std::string> model{"--grid", "4x4", "--scale", "0.01"};
+  std::vector<std::string> plain{"-i", w.input.string(), "-o", (w.dir.path / "reference").string(), "--no-blend"};
+  plain.insert(plain.end(), model.begin(), model.end());
+  REQUIRE(runDem2Mesh(plain, w.dir.path).exitCode() == 0);
 
-  const Finished result = w.runWithBlender({"--grid", "4x4"});
+  std::vector<std::string> args = model;
+  args.push_back("--verbose");
+  const Finished result = w.runWithBlender(args);
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   REQUIRE(result.exitCode() == 0);
   // Blender 3.0 and later compress a .blend with Zstandard; an uncompressed one begins "BLENDER".
   const std::string scene = readFile(w.blend());
   CHECK((scene.starts_with("BLENDER") || scene.starts_with("\x28\xb5\x2f\xfd")));
+  CHECK_THAT(result.out, ContainsSubstring("\nwrote: " + w.stl().string() + "\nwrote: " + w.ply().string() +
+                                           "\nblender: " + blender->string() + "\n"));
+  // Blender's log, shown with --verbose: a scene of a print-sized model shows a unit as the millimetre it prints as.
+  CHECK_THAT(result.out,
+             ContainsSubstring("\nblender: units: METRIC, scale_length 0.001, length_unit MILLIMETERS\n"));
   // A 4 x 4 grid's solid: 2 x 3 x 3 surface triangles, 2 x 8 in the walls and 2 in the base.
   CHECK(solidTriangleCount(4, 4) == 36);
-  CHECK_THAT(result.out, EndsWith("\nwrote: " + w.stl().string() + "\nwrote: " + w.ply().string() + "\nblender: " +
-                                  blender->string() + "\nwrote: " + w.blend().string() +
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + w.blend().string() +
                                   "\nstl check: 36 triangles, 0 non-manifold edges, 0 inverted faces\n"));
-  // Blender's log is captured, and shown only with --verbose.
-  CHECK(result.out.find("Blender quit") == std::string::npos);
   CHECK(result.err.empty());
-  CHECK(fileHolds(w.stl(), readFile(reference.string() + ".stl")));
-  CHECK(fileHolds(w.ply(), readFile(reference.string() + ".ply")));
+  CHECK(fileHolds(w.stl(), readFile((w.dir.path / "reference.stl").string())));
+  CHECK(fileHolds(w.ply(), readFile((w.dir.path / "reference.ply").string())));
   // Nothing else: no temporary file of Blender's, and no .blend1 (BlenderRunner's test saves over a scene).
   CHECK(filesIn(w.outDir) == std::vector<std::string>{"model.blend", "model.ply", "model.stl"});
 }

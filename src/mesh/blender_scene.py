@@ -23,6 +23,7 @@ import argparse
 import math
 import sys
 import traceback
+from array import array
 
 import bmesh
 import bpy
@@ -42,7 +43,9 @@ SUN_ELEVATION_DEG = 40.0
 SUN_STRENGTH = 3.0
 TERRAIN_COLOUR = (0.55, 0.50, 0.45, 1.0)  # a warm grey
 TERRAIN_ROUGHNESS = 0.9
-WORLD_COLOUR = (0.8, 0.8, 0.8)
+WORLD_COLOUR = (0.8, 0.8, 0.8)  # the background the camera sees
+WORLD_LIGHT = (0.25, 0.25, 0.25)  # the light the world casts on the terrain
+PRINT_SIZED = 0.1  # a --scale below this is a model to print, in millimetres
 
 
 def say(text):
@@ -83,10 +86,11 @@ def facing(forward):
 
 
 def import_terrain(args):
-    """Step 1: the surface from the PLY, the object named after the output stem and shaded smooth. The PLY's origin is
-    the window's south-west corner at sea level (spec 5.2). The mesh is moved so that the centre of its base, the
-    lowest height under the middle of the window, is the object's origin and lies at the world's, which Blender's
-    views and tools turn and scale about."""
+    """Step 1: the surface from the PLY, the object named after the output stem and shaded smooth. The terrain stays
+    where the PLY and the STL put it, the window's south-west corner at the origin at sea level (spec 5.2), so that the
+    STL imported into the scene lies exactly on it. Its origin, which Blender's tools turn and scale about, is the
+    centre of its base, the lowest height under the middle of the window: the object is placed there, and the mesh's
+    own coordinates are made relative to it, as Blender's Set Origin does, which leaves every vertex where it was."""
     bpy.ops.wm.ply_import(filepath=args.ply, forward_axis='Y', up_axis='Z')
     objects = list(bpy.context.scene.objects)
     if len(objects) != 1 or objects[0].type != 'MESH' or len(objects[0].data.vertices) == 0:
@@ -95,12 +99,18 @@ def import_terrain(args):
     terrain.name = args.name
     terrain.data.name = args.name
     terrain.data.shade_smooth()
-    terrain.data.transform(Matrix.Translation((-args.width / 2, -args.height / 2, -args.zmin)))
-    terrain.location = (0.0, 0.0, 0.0)
+    base_centre = Vector((args.width / 2, args.height / 2, args.zmin))
+    terrain.data.transform(Matrix.Translation(-base_centre))
+    terrain.location = base_centre
+    bpy.context.view_layer.update()  # so that matrix_world has the new location
+    corners = [terrain.matrix_world @ Vector(corner) for corner in terrain.bound_box]
+    low = Vector(tuple(min(c[i] for c in corners) for i in range(3)))
+    high = Vector(tuple(max(c[i] for c in corners) for i in range(3)))
     uv = terrain.data.uv_layers.active
-    say("imported %s as %s: %d vertices, %d faces, UV map %s, shaded smooth, origin at the centre of its base"
+    say("imported %s as %s: %d vertices, %d faces, UV map %s, shaded smooth, in place at x %.6g to %.6g, y %.6g to "
+        "%.6g, z %.6g to %.6g, origin at the centre of its base"
         % (args.ply, terrain.name, len(terrain.data.vertices), len(terrain.data.polygons),
-           uv.name if uv else "missing"))
+           uv.name if uv else "missing", low.x, high.x, low.y, high.y, low.z, high.z))
     return terrain
 
 
@@ -156,11 +166,10 @@ def add_camera(scene, args, centre):
     # angle_x spans the frame's width (the sensor's 36 mm lie across a landscape frame); the height is its share of it.
     tan_x = math.tan(data.angle_x / 2)
     tan_y = tan_x * RESOLUTION[1] / RESOLUTION[0]
-    relief = args.zmax - args.zmin
     corners = [Vector((x, y, z)) - centre
-               for x in (-args.width / 2, args.width / 2)
-               for y in (-args.height / 2, args.height / 2)
-               for z in (0.0, relief)]
+               for x in (0.0, args.width)
+               for y in (0.0, args.height)
+               for z in (args.zmin, args.zmax)]
     # A corner c from the centre lies c . forward beyond it, so from distance d it is d + c . forward deep, and it is in
     # the frame while MARGIN |c . right| is within tan_x of that depth, and MARGIN |c . up| within tan_y. Never inside
     # the sphere round the box either, so that the camera stays out of it whatever the box's shape.
@@ -179,7 +188,8 @@ def add_camera(scene, args, centre):
             for space in area.spaces:
                 if space.type != 'VIEW_3D' or space.region_3d is None:
                     continue
-                space.clip_start = data.clip_start
+                # Nearer than the camera's, so that zooming in on the surface does not cut into it.
+                space.clip_start = distance / 10000
                 space.clip_end = data.clip_end
                 # The view orbiting returns to is the camera's own.
                 space.region_3d.view_location = centre
@@ -191,15 +201,29 @@ def add_camera(scene, args, centre):
 
 
 def set_world(scene):
-    """Step 5: a light grey background of strength 1, which also lights the shadows a little."""
+    """Step 5: a light grey background of strength 1 behind the terrain, which lights it more dimly. Lit by the world
+    at 0.8 the shadows would be nearly as bright as the sunlit slopes and the relief would wash out, so a Light Path
+    node's Is Camera Ray mixes the colour: 0.8 for what the camera sees, 0.25 for the light the world casts."""
     world = bpy.data.worlds.new("World")
     world.use_nodes = True
-    background = next(node for node in world.node_tree.nodes if node.type == 'BACKGROUND')
-    background.inputs["Color"].default_value = WORLD_COLOUR + (1.0,)
+    tree = world.node_tree
+    background = next(node for node in tree.nodes if node.type == 'BACKGROUND')
     background.inputs["Strength"].default_value = 1.0
+    path = tree.nodes.new("ShaderNodeLightPath")
+    path.location = (background.location.x - 400.0, background.location.y)
+    mix = tree.nodes.new("ShaderNodeMix")
+    mix.data_type = 'RGBA'
+    mix.location = (background.location.x - 200.0, background.location.y)
+    # The Mix node has a socket of each name for every data type; the colour ones are told apart by identifier.
+    inputs = {socket.identifier: socket for socket in mix.inputs}
+    inputs["A_Color"].default_value = WORLD_LIGHT + (1.0,)
+    inputs["B_Color"].default_value = WORLD_COLOUR + (1.0,)
+    tree.links.new(path.outputs["Is Camera Ray"], inputs["Factor_Float"])
+    result = next(socket for socket in mix.outputs if socket.identifier == "Result_Color")
+    tree.links.new(result, background.inputs["Color"])
     world.color = WORLD_COLOUR  # the viewport's
     scene.world = world
-    say("world: light grey, strength 1")
+    say("world: light grey, 0.8, behind the terrain, lighting it at 0.25, strength 1")
 
 
 def set_render(scene):
@@ -214,14 +238,18 @@ def set_render(scene):
 
 
 def set_units(scene, scale):
-    """Step 7: metric, one model unit being 1 / scale metres, since --scale is units per metre; millimetres for a
-    print-sized model, under a tenth of a unit per metre."""
+    """Step 7: metric. A print-sized model, --scale under a tenth, shows a unit as a millimetre, the size the slicer
+    prints it at. Otherwise a unit shows as the 1 / --scale metres of terrain it stands for, which is a metre at full
+    size. The line gives the settings as the scene holds them."""
     units = scene.unit_settings
     units.system = 'METRIC'
-    units.scale_length = 1.0 / scale
-    print_sized = scale < 0.1
-    units.length_unit = 'MILLIMETERS' if print_sized else 'METERS'
-    say("units: metric, one unit is %.6g m, lengths in %s" % (1.0 / scale, "millimetres" if print_sized else "metres"))
+    if scale < PRINT_SIZED:
+        units.scale_length = 0.001
+        units.length_unit = 'MILLIMETERS'
+    else:
+        units.scale_length = 1.0 / scale
+        units.length_unit = 'METERS'
+    say("units: %s, scale_length %.6g, length_unit %s" % (units.system, units.scale_length, units.length_unit))
 
 
 def save(path):
@@ -231,14 +259,28 @@ def save(path):
     say("saved " + path)
 
 
+def declared_triangles(path):
+    """The number of triangles a binary STL says it holds: bytes 80 to 83, little-endian."""
+    with open(path, "rb") as stl:
+        stl.seek(80)
+        count = stl.read(4)
+    if len(count) != 4:
+        raise RuntimeError("%s is too short for a binary STL" % path)
+    return int.from_bytes(count, "little")
+
+
 def check_stl(path):
     """Step 9, the second opinion on the STL (spec 6). Blender's own reader imports it into an empty scene, merging the
-    corners that the triangles share, with its validation off, so that what mesh.validate() finds to mend is seen here
-    and not mended unseen. Then:
+    corners that the triangles share. That reader drops a triangle that repeats another or has two corners at one
+    point, saying so only in a warning, so the count it imports is held against the count the file declares. Its
+    validation is off, so that what mesh.validate() finds to mend is seen here too. Then:
     - non-manifold edges are those not shared by exactly two faces: a hole, or a fin of three faces or more;
-    - inverted faces are those that Blender's recalculation of outward normals turns round, done on a copy so that
-      every face's normal can be compared with its own from before.
-    Prints the "stl check:" line, and returns whether the solid passed."""
+    - inverted faces are those that Blender's recalculation of outward normals turns round. Each face's normal is kept
+      beforehand, 12 bytes a face, and the recalculation is done in place: a copy of the mesh would double the memory,
+      several gigabytes on a large grid.
+    Prints the "stl check:" line, after the mismatch's own line when the counts differ, and returns whether the solid
+    passed."""
+    declared = declared_triangles(path)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.wm.stl_import(filepath=path, forward_axis='Y', up_axis='Z', use_mesh_validate=False)
     objects = list(bpy.context.scene.objects)
@@ -246,22 +288,23 @@ def check_stl(path):
         raise RuntimeError("importing %s gave %d objects, not one mesh" % (path, len(objects)))
     mesh = objects[0].data
     mended = mesh.validate(verbose=True)
+    normals = array('f', bytes(12 * len(mesh.polygons)))
+    mesh.polygons.foreach_get("normal", normals)
     solid = bmesh.new()
-    solid.from_mesh(mesh)
-    turned = solid.copy()
-    bmesh.ops.recalc_face_normals(turned, faces=turned.faces[:])
-    solid.normal_update()
-    turned.normal_update()
+    solid.from_mesh(mesh)  # the faces in the mesh's order, which the normals are in
     triangles = len(solid.faces)
     non_manifold = sum(1 for edge in solid.edges if len(edge.link_faces) != 2)
-    inverted = sum(1 for before, after in zip(solid.faces, turned.faces) if before.normal.dot(after.normal) < 0)
-    turned.free()
+    bmesh.ops.recalc_face_normals(solid, faces=solid.faces)
+    solid.normal_update()
+    inverted = sum(1 for i, face in enumerate(solid.faces) if face.normal.dot(normals[3 * i:3 * i + 3]) < 0)
     solid.free()
     say("imported %s into an empty scene; mesh.validate() %s"
         % (path, "mended invalid geometry" if mended else "found nothing to mend"))
+    if declared != triangles:
+        print("stl check: file declares %d triangles, Blender imported %d" % (declared, triangles), flush=True)
     print("stl check: %d triangles, %d non-manifold edges, %d inverted faces" % (triangles, non_manifold, inverted),
           flush=True)
-    return non_manifold == 0 and inverted == 0 and not mended
+    return declared == triangles and non_manifold == 0 and inverted == 0 and not mended
 
 
 def main():
@@ -272,7 +315,8 @@ def main():
     # An empty scene to build in, not --factory-startup's cube, light and camera. The screens stay.
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
-    centre = Vector((0.0, 0.0, (args.zmax - args.zmin) / 2))
+    # The middle of the terrain's box, which the camera looks at.
+    centre = Vector((args.width / 2, args.height / 2, (args.zmin + args.zmax) / 2))
     terrain = import_terrain(args)
     add_material(terrain)
     add_sun(scene, centre, max(args.width, args.height))

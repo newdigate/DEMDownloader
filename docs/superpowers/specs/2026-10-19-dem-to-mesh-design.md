@@ -338,9 +338,11 @@ model units, the height range, a name for the object.
 5. World: light grey background, strength 1.
 6. Render: EEVEE (whatever identifier the running Blender reports for it),
    1920 x 1080, 64 samples; Cycles is one click away.
-7. Scene unit scale: metres when `--scale` is 1, otherwise unit scale set so
-   that one model unit is 1/`--scale` metres, and the unit system shows
-   millimetres for print-sized models.
+7. Scene units, metric: when `--scale` is below 0.1 (a print-sized model),
+   unit scale 0.001 and lengths in millimetres, so one model unit shows as
+   1 mm, the size the slicer prints; when `--scale` is 1, unit scale 1 and
+   lengths in metres; otherwise unit scale 1/`--scale` and lengths in
+   metres, the terrain's real size.
 8. Save with `bpy.ops.wm.save_as_mainfile(filepath, compress=True)`.
 9. STL check: import the STL into a scratch scene, run `mesh.validate()`,
    count non-manifold edges and inverted faces with bmesh, print one line
