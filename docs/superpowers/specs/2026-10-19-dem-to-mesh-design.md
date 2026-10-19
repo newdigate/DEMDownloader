@@ -288,7 +288,7 @@ into place when complete, as `DemRaster::save` does.
 
 ## 6. Verification
 
-After writing, the tool checks its own STL: triangle count equals the
+Before writing, the tool checks the solid it is about to write: triangle count equals the
 formula; every edge is shared by exactly two triangles with opposite
 direction (each directed edge, a 64-bit key in one sorted list, found once
 and its reverse once, about 24 bytes per triangle); no triangle has zero
