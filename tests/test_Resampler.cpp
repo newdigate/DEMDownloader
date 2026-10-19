@@ -186,7 +186,7 @@ TEST_CASE("a constant surface stays constant", "[resample]") {
   struct Shape {
     int srcCols, srcRows, outCols, outRows;
   };
-  // The first is the plan's case. The others are the same size, finer, a grid of two (a kernel wider than the
+  // The first is the reference case. The others are the same size, finer, a grid of two (a kernel wider than the
   // source), and a very uneven one.
   for (const Shape s : {Shape{10, 10, 4, 3}, Shape{10, 10, 10, 10}, Shape{10, 10, 31, 17}, Shape{10, 10, 2, 2},
                         Shape{3, 200, 40, 2}}) {
@@ -282,8 +282,8 @@ TEST_CASE("a source more than 46340 samples long is positioned without overflowi
 TEST_CASE("the output never leaves the range of the source", "[resample]") {
   // A tap outside the source is folded onto its mirror image inside, which is nearer to the output's position and so
   // weighs at least as much; what is left on that sample is not negative, and every output is a weighted mean of source
-  // heights that cannot be above the highest or below the lowest. The plan's case is the first; the others are the same
-  // size, finer, small, and a kernel as wide as the source or wider.
+  // heights that cannot be above the highest or below the lowest. The reference case is the first; the others are the
+  // same size, finer, small, and a kernel as wide as the source or wider.
   struct Shape {
     int srcCols, srcRows, outCols, outRows;
   };
@@ -365,7 +365,7 @@ TEST_CASE("a row of alternating 0 and 100 down to 64 samples averages out instea
   const Grid out = resampleQuadratic(src, 2048, 2, 64, 2);
   REQUIRE(out.size() == 128);
   for (int row = 0; row < 2; ++row) {
-    // The plan's bound of 10, for every output but the two on the border, which are the end samples (see below).
+    // The bound of 10, for every output but the two on the border, which are the end samples (see below).
     for (int i = 1; i <= 62; ++i) {
       CAPTURE(row, i);
       CHECK(std::fabs(out[cell(64, i, row)] - 50.0f) < 10.0f);

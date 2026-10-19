@@ -54,17 +54,17 @@ struct Mesh {
 // per boundary edge would leave along the base. A side of n + 1 top vertices is cut into n + 1 triangles, so the solid
 // has solidTriangleCount(cols, rows) of them.
 //
-// Where it works, the cut is the plan's fan: from the bottom corner under the side's first top vertex to each pair of
-// neighbouring top vertices, then one triangle from the last top vertex to the next bottom corner. It works while each
-// top vertex, looked at from that corner, appears lower than the one before it. Past a valley that a nearer rise hides
-// from the corner the fan's triangles would face into the solid and lie over others, and where the corner and two top
-// vertices fall in line one would have no area. Terrain does that all the time: on random-walk sides of 500 heights
-// at --scale 0.02, over a third of the fan's triangles would face in. A folded fan is still closed and encloses the
-// right volume, so checkSolid would pass it; its faces would be wrong all the same. So each wall is cut as a monotone
-// polygon, with a stack: each top vertex in turn closes every triangle facing out that it can with the vertices
-// waiting on the stack, and whatever still waits at the end is a fan from the next bottom corner, which sees all of
-// it. Where every triangle of the plan's fan faces out, this cut is that fan exactly; elsewhere it bridges each hidden
-// valley with triangles between top vertices.
+// Where it works, the cut is the plain corner fan: from the bottom corner under the side's first top vertex to each
+// pair of neighbouring top vertices, then one triangle from the last top vertex to the next bottom corner. It works
+// while each top vertex, looked at from that corner, appears lower than the one before it. Past a valley that a nearer
+// rise hides from the corner the fan's triangles would face into the solid and lie over others, and where the corner
+// and two top vertices fall in line one would have no area. Terrain does that all the time: on random-walk sides of 500
+// heights at --scale 0.02, over a third of the fan's triangles would face in. A folded fan is still closed and encloses
+// the right volume, so checkSolid would pass it; its faces would be wrong all the same. So each wall is cut as a
+// monotone polygon, with a stack: each top vertex in turn closes every triangle facing out that it can with the
+// vertices waiting on the stack, and whatever still waits at the end is a fan from the next bottom corner, which sees
+// all of it. Where every triangle of the plain corner fan faces out, this cut is that fan exactly; elsewhere it bridges
+// each hidden valley with triangles between top vertices.
 //
 // surface is what surfaceMesh made for the same cols and rows. Throws std::invalid_argument when cols or rows is below
 // 2, when surface does not hold cols x rows vertices or holds more than 32-bit vertex numbers can count with the four

@@ -221,9 +221,9 @@ std::vector<Corners> trianglesOf(const Mesh& solid, int cols, Face face, float p
   return found;
 }
 
-// The plan's wall for a side, in the same form: a fan from the bottom corner under the side's first top vertex to each
+// The fan wall for a side, in the same form: a fan from the bottom corner under the side's first top vertex to each
 // pair of neighbouring top vertices, then one triangle from the last top vertex to the next bottom corner.
-std::vector<Corners> planFan(Face side, int cols, int rows) {
+std::vector<Corners> fanWall(Face side, int cols, int rows) {
   const std::vector<std::uint32_t> top = sideTop(side, cols, rows);
   const auto [start, end] = sideCorners(side, cols, rows);
   std::vector<Corners> fan;
@@ -408,10 +408,10 @@ TEST_CASE("a side in line with a bottom corner gets no triangle without area", "
   CHECK_THAT(check.signedVolume, WithinRel(prismVolume(solid, 6, -1.0f), 1e-12));
 }
 
-TEST_CASE("where the plan's fan faces outward all along, each wall is that fan", "[solid]") {
+TEST_CASE("where the plain corner fan faces outward all along, each wall is that fan", "[solid]") {
   // On a flat grid every top vertex, looked at from the side's first bottom corner, appears lower than the one before
-  // it, and on a plane too (each side is a straight line that does not pass through the corner), so the plan's fan is a
-  // proper cut there and is what solidMesh makes.
+  // it, and on a plane too (each side is a straight line that does not pass through the corner), so the plain corner
+  // fan is a proper cut there and is what solidMesh makes.
   struct Case {
     int cols, rows;
     Grid heights;
@@ -426,7 +426,7 @@ TEST_CASE("where the plan's fan faces outward all along, each wall is that fan",
     const Mesh solid = solidMesh(surfaceMesh(c.heights, c.cols, c.rows, 100, 60, 1, 1, 0), c.cols, c.rows, -5.0f);
     for (const Face side : kSides) {
       INFO(kFaceName[index(side)]);
-      CHECK(trianglesOf(solid, c.cols, side, -5.0f) == planFan(side, c.cols, c.rows));
+      CHECK(trianglesOf(solid, c.cols, side, -5.0f) == fanWall(side, c.cols, c.rows));
     }
   }
 }

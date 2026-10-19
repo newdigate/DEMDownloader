@@ -89,11 +89,11 @@ double areaFacingOut(const Mesh& mesh, const Side& side, std::uint32_t a, std::u
 //   from the end corner to any of its vertices passes under the rest of it. A fan from the end corner over the run
 //   closes the wall, and its first triangle holds the bottom edge.
 // The first new vertex always closes the triangle of the start corner and the first two top vertices, the start corner
-// being right under the first. So when every triangle of the plan's fan from the start corner faces out, each new
-// vertex closes just its own triangle of that fan, the stack is then the start corner and the newest vertex, and the
-// end fan is the plan's closing triangle. Every top vertex after the first closes as many triangles as it takes off the
-// stack, and the end fan one fewer than the stack holds, so a side of n + 1 top vertices gives n + 1 triangles whatever
-// the heights are.
+// being right under the first. So when every triangle of the fan from the start corner faces out, each new vertex
+// closes just its own triangle of that fan, the stack is then the start corner and the newest vertex, and the end fan
+// is that fan's closing triangle. Every top vertex after the first closes as many triangles as it takes off the stack,
+// and the end fan one fewer than the stack holds, so a side of n + 1 top vertices gives n + 1 triangles whatever the
+// heights are.
 void addWall(Mesh& mesh, const Side& side) {
   const auto top = [&](std::int64_t k) { return static_cast<std::uint32_t>(side.first + k * side.step); };
   std::vector<std::uint32_t> stack;
