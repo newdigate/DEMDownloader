@@ -122,6 +122,7 @@ if(DL_ELEVATION_TESTS)
     tests/test_ElevationClient.cpp
     tests/test_ConsoleReporter.cpp
     tests/test_Cli.cpp
+    tests/test_CliChecks.cpp
     tests/test_ExitCodes.cpp
     tests/test_EndToEnd.cpp
     tests/test_Palette.cpp)
