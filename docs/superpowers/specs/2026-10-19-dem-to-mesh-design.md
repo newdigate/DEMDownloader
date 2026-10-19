@@ -1,6 +1,7 @@
 # dem2mesh: GeoTIFF to printable solid and Blender scene
 
-Status: design for review. Written from the brainstorming conversation of 2026-10-19.
+Status: approved by the owner on 2026-10-19 after a builder check; the plan comes next.
+Written from the brainstorming conversation of 2026-10-19.
 
 ## 1. Intent
 
@@ -60,6 +61,9 @@ Non-goals (for now):
 
 Anti-goals (what would make it a failure even if it runs):
 
+- A cliff or a pit where the data merely ends: no-data must never read as
+  terrain.
+
 - A print that is not watertight or has inverted faces, so the slicer refuses
   it or prints it hollow.
 - A Blender file that opens to a grey blob or an empty viewport.
@@ -82,6 +86,7 @@ help text with ranges, usage errors exit 1).
 | `--z-scale F` | no | 1 | vertical exaggeration; heights and base are multiplied by F |
 | `--base M` | no | sea level, 0 | base plane height in metres before exaggeration; lowered automatically when the terrain goes below it (section 5.3) |
 | `--scale F` | no | 1 | model units per metre in the STL and PLY (0.02 makes a 10 km window 200 mm wide) |
+| `--plinth U` | no | 2 | minimum thickness of the solid under its lowest terrain point, in model units after scaling (section 5.3) |
 | `--no-blend` | no | off | write the STL and PLY only; do not run Blender |
 | `--blender PATH` | no | see 7.1 | the Blender executable |
 | `--overwrite` | no | off | replace existing output files; otherwise existing outputs are an error before anything is read |
@@ -92,7 +97,7 @@ Validation, in order: the input exists and is readable; `--output` names a
 file stem in an existing writable directory; the four crop flags come
 together, each finite, north > south, east > west, within ±90 and ±180;
 `--grid` width and height at least 2; `--z-scale` and `--scale` positive and
-finite; `--base` finite. The window must overlap the file by at least 2 x 2
+finite; `--base` finite; `--plinth` zero or positive and finite. The window must overlap the file by at least 2 x 2
 pixels. The output grid must not exceed 25 million vertices (an STL of about
 2.5 GB); above 4 million the tool prints a warning with the expected file
 sizes and continues. Full resolution on the City's whole file is 254 million
@@ -104,8 +109,11 @@ pixels and is refused with the message to use `--grid` or a crop.
 with its parameters), pixel size, raster type (point or area), no-data value,
 the pixel window chosen for the crop and its extent in degrees and metres,
 the output grid and cell size in metres, the height range in the window, the
-base plane chosen and why, the number of triangles and the sizes of the STL
-and PLY, and which Blender would be run.
+base plane chosen and why, the number of no-data pixels and how they are
+filled, the number of triangles and the sizes of the STL and PLY, and which
+Blender would be run. It reads the window's pixels to do so (a whole-file dry
+run on the City's model reads 1 GB, a few seconds from an SSD) and writes
+nothing.
 
 ## 4. Reading the GeoTIFF
 
@@ -125,11 +133,17 @@ did not write. The reader accepts:
   ellipsoid from the GeoKeys (semi-major axis and inverse flattening, or
   `GeogEllipsoidGeoKey` GRS 1980 or WGS 84). A projected file that gives only
   an EPSG code and no parameters is refused with the code in the message,
-  except codes the reader knows: EPSG:20482 (Lo19) and the other South
-  African Lo grids EPSG:2046 to 2055 (Lo15 to Lo33, Hartebeesthoek94), and
-  UTM zones 32601 to 32660 and 32701 to 32760 (WGS 84). This is a small
-  table; no PROJ dependency, because the Homebrew PROJ on the owner's machine
-  cannot find EPSG:20482 in its database and GDAL there is broken;
+  except the UTM zones 32601 to 32660 and 32701 to 32760 (WGS 84, central
+  meridian from the zone, scale 0.9996, false easting 500 km, false northing
+  10,000 km in the south), which a small table covers. The City's file names
+  code 20482 but also carries the full Transverse Mercator parameters, and
+  the reader uses the parameters, so no table entry is needed for it. The
+  EPSG South African grids 2046 to 2055 (Lo15 to Lo33) are south-oriented
+  (westing and southing) and are refused by code, because reading one as
+  east/north would rotate the model; a file with explicit
+  `CT_TransvMercator_SouthOriented` parameters is refused too. No PROJ
+  dependency: the Homebrew PROJ on the owner's machine cannot resolve these
+  codes and GDAL there is broken;
 - no-data from `GDAL_NODATA` (tag 42113) when present; NaN always counts as
   no data too.
 
@@ -140,9 +154,15 @@ sea level").
 Pixel geometry. For `RasterPixelIsPoint` a sample sits exactly at tiepoint +
 index x scale. For `RasterPixelIsArea` it sits at the pixel centre, half a
 pixel in. The mesh vertex for a source pixel is placed at the sample
-position, so area files are not shifted by half a pixel (the known
-half-pixel display offset in `dl_elevation`'s files is corrected here, not
-reproduced).
+position. One producer is special-cased: a file whose `ImageDescription`
+starts with `dl_elevation;` declares `RasterPixelIsArea` but its samples sit
+at the pixel's north-west corner (the WMS server samples that corner, as the
+recorded `Point:` lines in `tests/test_WmsQuery.cpp` show), so the reader
+places them there. Applying the area rule to those files would reproduce the
+half-pixel shift that GIS tools already show for them. A follow-up outside
+this project: make `dl_elevation` write `RasterPixelIsPoint`, which the
+earlier design's log left open; `DemRaster::load` does not check the raster
+type, so existing files keep resuming.
 
 ## 5. The pipeline
 
@@ -175,9 +195,18 @@ projection is needed for a relief model.
 
 ### 5.3 Heights, no data, the base plane
 
-No-data and NaN pixels are set to sea level, 0 m, before resampling, so
-coasts come out as flat water and gaps in a `dl_elevation` file become flat
-patches; the run reports how many pixels were filled.
+No-data and NaN pixels are filled from the nearest pixel that has a height
+(the owner's choice, made when the builder check showed that in the City's
+file no-data also covers land outside the municipal boundary, up to 1,559 m
+at the Hottentots Holland edge). Sea therefore comes out flat at about coast
+level, land beyond the boundary continues as a plateau at the edge height
+instead of dropping to a cliff, and a gap in an unfinished `dl_elevation`
+file takes its surroundings' height rather than becoming a pit. Nearest means
+nearest by distance in pixels, found with one breadth-first pass outward from
+every valid pixel (a multi-source distance transform), so the fill is
+deterministic and costs one pass over the window. A window with no valid
+pixel at all is an error. The run reports how many pixels were filled and
+the height range they were filled with. Filling happens before resampling.
 
 The base plane: the owner's choice is sea level by default, overridable with
 `--base`. To keep the solid closed, the plane is lowered to the lowest
@@ -186,6 +215,16 @@ says so. To avoid zero-height walls where terrain meets the plane, the plane
 sits a margin below that level: 1 percent of the window's height range, at
 least 1 m. After exaggeration, every z (heights and base) is multiplied by
 `--z-scale`; after that, everything is multiplied by `--scale`.
+
+A plinth keeps the print from having a paper-thin floor. In a window that
+reaches the sea the margin alone puts the base about 11 m below sea level for
+a Table Mountain window, which is 0.2 mm at `--scale 0.02`: the sea and the
+low coast would print one layer thick. So the base plane is pushed down,
+after scaling, until the solid is at least `--plinth` model units thick under
+its lowest terrain point; the default is 2 (2 mm when the slicer reads the
+STL as millimetres, 2 m at `--scale 1`). The dry run reports the plinth's
+effect. The PLY and the Blender scene hold the surface only and are not
+affected.
 
 Heights are clamped to the base plane from below (a pixel below the plane
 cannot happen after the lowering, but a resampled value can undershoot a
@@ -321,7 +360,10 @@ means fetching one image for the window and connecting it; no mesh change.
   strips and tiles, an int16 file); Transverse Mercator against known points
   (lon 18.44055175, lat -34.2111625310268 is x -51556.570, y -3787226.019 in
   Lo19; the City's file corner -64012.5, -3705051.806 is pixel 0,0); the crop
-  window mapping; the resampler properties of section 5.4; the solid's
+  window mapping; the no-data fill (a sea strip beside a 0 m coast fills at
+  0, a blank strip beside a 200 m plateau fills at 200, an inland hole takes
+  the height of its nearest neighbour, a fully blank window is an error); the
+  resampler properties of section 5.4; the solid's
   invariants of section 6 on several grids including 2 x 2; byte-level STL
   and PLY layout; the CLI (same style as `test_Cli.cpp`); an end-to-end run
   of the built `dem2mesh` on a small synthetic file with `--no-blend`,
@@ -342,7 +384,9 @@ means fetching one image for the window and connecting it; no mesh change.
 - Memory: the window's pixels as float32 plus the output grid; the City's
   whole file is 1 GB, so a run on it without a crop must read strip by strip
   and resample on the fly rather than hold the file twice. The builder
-  decides the streaming scheme; the dry run must not read the pixels.
+  decides the streaming scheme. The dry run reads the window the same way,
+because the height range, the base plane and the summit check need the
+pixels; it writes nothing and never holds more than the real run would.
 
 ## 10. Decisions and who made them
 
@@ -354,12 +398,17 @@ parameter; a second command in this repository; STL written in C++ directly
 with Blender only checking it; Blender scene for camera-and-sun renders, no
 textures yet.
 
+The owner also chose, after the builder check: no-data filled from the
+nearest real height.
+
 My calls (change any of them): mesh in metres with the south-west corner at
 the origin and `--scale` for print sizing; the base plane lowered
-automatically with a small margin; no-data filled at sea level; a quadratic
+automatically with a small margin; a quadratic
 B-spline (approximating) rather than an interpolating quadratic; the pixel
 window slightly larger than the crop box; the 4 million warning and 25
-million refusal; PLY as the hand-off format; the embedded script and the
+million refusal; the 2-unit plinth; placing `dl_elevation` samples at pixel
+corners; the dry run reading the window; refusing the south-oriented grids
+and keeping only UTM in the code table; PLY as the hand-off format; the embedded script and the
 Blender search order; a missing Blender is exit 1 unless `--no-blend`; the
 scene's light, camera and material choices; the small EPSG table instead of
 PROJ; refusing projections other than Transverse Mercator; local metres for
