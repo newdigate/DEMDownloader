@@ -100,8 +100,8 @@ and height at least 2; `--z-scale` and `--scale` positive and finite;
 `--base` finite; `--plinth` zero or positive and finite), then the input
 exists and is readable, then `--output` names a file stem in an existing
 writable directory, then, without `--overwrite`, that no output exists, then,
-when `--blender` or `$BLENDER` names a Blender, that it is an executable file
-(a bare name is looked up on `PATH`). The window must overlap the file by at
+when `--blender` or `$BLENDER` names a Blender and `--no-blend` is not given,
+that it is an executable file (a bare name is looked up on `PATH`). The window must overlap the file by at
 least 2 x 2 pixels. The output grid must not exceed 25 million vertices (an
 STL of about 2.5 GB); above 4 million the tool prints a warning with the
 expected file sizes and, unless `--no-blend`, Blender's estimated memory, and
@@ -332,7 +332,8 @@ Python 3.11). The script checks `bpy.app.version` and exits with a message
 on anything older.
 
 A `--blender` or `$BLENDER` that does not name an executable file is refused
-before anything is read, in dry runs too, with the flag or variable named;
+before anything is read, in dry runs too, with the flag or variable named
+(`--no-blend` skips this check with the rest of the Blender stage);
 `--blender ""` is a usage error. Only the automatic search can find nothing,
 and then the run writes the STL and PLY first. An existing `STEM.blend`,
 which can be there only under `--overwrite`, is removed before Blender is
