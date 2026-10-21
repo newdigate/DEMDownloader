@@ -11,6 +11,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mesh/BasePlane.h"
@@ -20,11 +21,14 @@ using Catch::Matchers::Message;
 using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 using demdl::mesh::BasePlane;
+using demdl::mesh::Boundary;
 using demdl::mesh::checkSolid;
 using demdl::mesh::chooseBasePlane;
+using demdl::mesh::gridBoundary;
 using demdl::mesh::kMostTrianglesForEdgeCheck;
 using demdl::mesh::Mesh;
 using demdl::mesh::MeshCheck;
+using demdl::mesh::solidFromSurface;
 using demdl::mesh::solidMesh;
 using demdl::mesh::solidTriangleCount;
 using demdl::mesh::surfaceMesh;
@@ -260,6 +264,69 @@ Grid walkGrid(std::mt19937& rng, int cols, int rows, bool along) {
     }
   }
   return grid;
+}
+
+// A triangle's three vertex numbers as the mesh has them, where their order says which way the triangle faces.
+using Wound = std::array<std::uint32_t, 3>;
+
+// The triangles of a mesh from the one numbered first on, as they stand.
+std::vector<Wound> woundFrom(const Mesh& mesh, std::size_t first) {
+  std::vector<Wound> found;
+  for (std::size_t k = first; k < mesh.triangles.size(); ++k) {
+    found.push_back({mesh.triangles[k].a, mesh.triangles[k].b, mesh.triangles[k].c});
+  }
+  return found;
+}
+
+// A surface that is not a grid, built by hand over a rectangle of 100 m by 50 m, and its outline: 3 vertices on the
+// south side (x = 0, 30, 100), 2 on the east side, 4 on the north side (x = 100, 70, 20, 0) and 2 on the west side. It
+// has 7 vertices, every one of them on the outline, and 5 triangles that face up and cover the rectangle once. Heights
+// are in model units, and the base plane is at kIrregularPlane, 4 under the zero:
+//
+//   vertex         0     1     2      3       4      5      6
+//   x, y           0, 0  30, 0 100, 0 100, 50 70, 50 20, 50 0, 50
+//   z              10    30    5      12      10     50     20
+//   above plane    14    34    9      16      14     54     24
+//
+// Vertices 0, 2, 3 and 6 are the south-west, south-east, north-east and north-west corners. Seen from the bottom corner
+// under vertex 0, vertex 1 appears lower than vertex 0 and vertex 2 lower than vertex 1, so the south wall is the plain
+// corner fan. The north wall is not: seen from the corner under vertex 3, vertex 5 (54 over 80) appears higher than
+// vertex 4 (14 over 30), so the fan would fold over the valley at vertex 4, and the cut bridges it with a triangle
+// between three top vertices. The areas and the volume in the tests below are worked out by hand from this table.
+constexpr float kIrregularPlane = -4.0f;
+constexpr std::array<std::uint32_t, 7> kInOrder = {0, 1, 2, 3, 4, 5, 6};
+
+struct Irregular {
+  Mesh surface;
+  Boundary boundary;
+};
+
+// The surface and outline above, with the table's vertex v numbered number[v] in the mesh: kInOrder numbers them as the
+// table does.
+Irregular irregular(const std::array<std::uint32_t, 7>& number = kInOrder) {
+  const std::array<Vec3, 7> table = {
+      {{0, 0, 10}, {30, 0, 30}, {100, 0, 5}, {100, 50, 12}, {70, 50, 10}, {20, 50, 50}, {0, 50, 20}}};
+  Irregular result;
+  result.surface.vertices.resize(table.size());
+  for (std::size_t v = 0; v < table.size(); ++v) result.surface.vertices[number[v]] = table[v];
+  for (const Wound& t : std::vector<Wound>{{0, 1, 6}, {1, 5, 6}, {1, 4, 5}, {1, 2, 4}, {2, 3, 4}}) {
+    result.surface.triangles.push_back({number[t[0]], number[t[1]], number[t[2]]});
+  }
+  const std::array<std::vector<std::uint32_t>, 4> sides = {{{0, 1, 2}, {2, 3}, {3, 4, 5, 6}, {6, 0}}};
+  for (std::size_t s = 0; s < sides.size(); ++s) {
+    for (const std::uint32_t v : sides[s]) result.boundary.sides[s].push_back(number[v]);
+  }
+  return result;
+}
+
+// What solidFromSurface says when it refuses with std::invalid_argument, or "" when it builds the solid.
+std::string refusal(const Mesh& surface, const Boundary& boundary, float planeZ) {
+  try {
+    static_cast<void>(solidFromSurface(surface, boundary, planeZ));
+  } catch (const std::invalid_argument& refused) {
+    return refused.what();
+  }
+  return "";
 }
 
 }  // namespace
@@ -664,4 +731,303 @@ TEST_CASE("solidMesh refuses a surface it cannot close", "[solid]") {
   holed.vertices[4].z = kNaN;
   REQUIRE_THROWS_MATCHES(solidMesh(holed, 3, 2, -5.0f), std::invalid_argument,
                          Message("the base plane at -5 is not below the surface: vertex 4 is at nan"));
+}
+
+TEST_CASE("gridBoundary walks the grid's outline counter-clockwise from the south-west corner", "[solid]") {
+  using Side = std::vector<std::uint32_t>;
+  const Boundary four = gridBoundary(4, 3);
+  CHECK(four.sides[0] == Side{8, 9, 10, 11});  // south, from west to east
+  CHECK(four.sides[1] == Side{11, 7, 3});      // east, from south to north
+  CHECK(four.sides[2] == Side{3, 2, 1, 0});    // north, from east to west
+  CHECK(four.sides[3] == Side{0, 4, 8});       // west, from north to south
+
+  // The same lists as sideTop works them out for the tests above, for a cell, for a row of cells and a column of them,
+  // and for grids long both ways; and each corner ends one side and starts the next, the west side's last being the
+  // south side's first.
+  for (const auto& [cols, rows] : std::vector<std::pair<int, int>>{{2, 2}, {2, 9}, {9, 2}, {6, 5}, {40, 30}}) {
+    INFO(cols << " x " << rows);
+    const Boundary b = gridBoundary(cols, rows);
+    for (std::size_t s = 0; s < 4; ++s) {
+      CHECK(b.sides[s] == sideTop(kSides[s], cols, rows));
+      CHECK(b.sides[s].back() == b.sides[(s + 1) % 4].front());
+    }
+  }
+
+  REQUIRE_THROWS_MATCHES(gridBoundary(1, 5), std::invalid_argument,
+                         Message("the grid must be at least 2 x 2 vertices, not 1 x 5"));
+  REQUIRE_THROWS_MATCHES(gridBoundary(5, 1), std::invalid_argument,
+                         Message("the grid must be at least 2 x 2 vertices, not 5 x 1"));
+  // 65536 x 65537 is 2^32 + 65536 vertices, more than 32-bit vertex numbers count, judged as surfaceMesh and solidMesh
+  // judge it, before any list is made.
+  REQUIRE_THROWS_MATCHES(gridBoundary(65536, 65537), std::invalid_argument,
+                         Message("a grid of 65536 x 65537 vertices is too large: 32-bit vertex numbers leave room "
+                                 "for 4294967292 besides the four bottom corners"));
+}
+
+TEST_CASE("solidFromSurface on a grid's boundary makes the solid solidMesh makes, vertex for vertex and triangle for "
+          "triangle",
+          "[solid]") {
+  // A rough 6 x 5 surface at print scale, each row a random walk from west to east, closed down to a margin under its
+  // lowest point (a plinth of 0, which a thicker one would not let the walls fold over).
+  std::mt19937 rng(20261021);
+  const Grid heights = walkGrid(rng, 6, 5, true);
+  const auto [lowest, highest] = std::minmax_element(heights.begin(), heights.end());
+  const BasePlane base = chooseBasePlane(*lowest, *highest, std::nullopt, 1, 0.02, 0);
+  const Mesh surface = surfaceMesh(heights, 6, 5, 125, 80, 1, 0.02, base.levelM);
+  const auto planeZ = static_cast<float>(base.planeZ);
+
+  const Mesh general = solidFromSurface(surface, gridBoundary(6, 5), planeZ);
+  const Mesh grid = solidMesh(surface, 6, 5, planeZ);
+  REQUIRE(general.vertices.size() == 6 * 5 + 4);
+  REQUIRE(general.vertices.size() == grid.vertices.size());
+  REQUIRE(general.triangles.size() == solidTriangleCount(6, 5));
+  REQUIRE(general.triangles.size() == grid.triangles.size());
+  for (std::size_t v = 0; v < general.vertices.size(); ++v) {
+    INFO("vertex " << v);
+    CHECK(xyz(general.vertices[v]) == xyz(grid.vertices[v]));
+  }
+  CHECK(woundFrom(general, 0) == woundFrom(grid, 0));
+  CHECK(faceProblem(general, 6, 5, planeZ) == "");
+
+  // The walls here are not all the plain corner fan: a wall triangle between three top vertices, none of them a bottom
+  // corner, bridges a valley, so the equality above covers the stack's cut as well.
+  const auto surfaceVertices = static_cast<std::uint32_t>(surface.vertices.size());
+  const auto bridges = std::count_if(general.triangles.begin() + static_cast<std::ptrdiff_t>(surface.triangles.size()),
+                                     general.triangles.end(), [surfaceVertices](const Triangle& t) {
+                                       return t.a < surfaceVertices && t.b < surfaceVertices && t.c < surfaceVertices;
+                                     });
+  CHECK(bridges > 0);
+}
+
+TEST_CASE("the walls of a grid are cut as they were when each side was a first vertex and a step", "[solid]") {
+  // The chessboard of 100 and 0 over 100 m by 40 m, 5 x 3, closed down to z = -5: the triangles after the surface's 16
+  // are what solidMesh made before it took its sides from a boundary, kept here as they came. On every side a peak
+  // hides the valley beyond it from the corner the fan starts at, so no wall is the plain corner fan, and the longer
+  // south and north walls each hold a triangle of three top vertices, (11, 13, 12) and (3, 1, 2). The heights are whole
+  // numbers over coordinates that are exact in a float, so no rounding can change a cut. The surface is vertices 0 to
+  // 14 and the bottom corners 15 to 18.
+  const Mesh surface = surfaceMesh(makeGrid(5, 3, [](int i, int j) { return (i + j) % 2 == 0 ? 100 : 0; }), 5, 3, 100,
+                                   40, 1, 1, 0);
+  REQUIRE(surface.triangles.size() == 16);
+  const std::vector<Wound> expected = {
+      {15, 11, 10}, {11, 13, 12}, {15, 13, 11}, {16, 13, 15}, {16, 14, 13},  // south
+      {16, 9, 14},  {17, 9, 16},  {17, 4, 9},                                // east
+      {17, 3, 4},   {3, 1, 2},    {17, 1, 3},   {18, 1, 17},  {18, 0, 1},    // north
+      {18, 5, 0},   {15, 5, 18},  {15, 10, 5},                               // west
+      {15, 18, 17}, {15, 17, 16},                                            // base
+  };
+  CHECK(woundFrom(solidFromSurface(surface, gridBoundary(5, 3), -5.0f), 16) == expected);
+  CHECK(woundFrom(solidMesh(surface, 5, 3, -5.0f), 16) == expected);
+}
+
+TEST_CASE("solidTriangleCount of a boundary is the surface's triangles, a wall triangle per top vertex and the base's "
+          "two",
+          "[solid]") {
+  static_assert(noexcept(solidTriangleCount(std::declval<const Boundary&>(), std::uint64_t{0})));
+  CHECK(solidTriangleCount(irregular().boundary, 5) == 5 + 3 + 2 + 4 + 2 + 2);
+  // On a grid's boundary it is the grid's count, 64 bits wide: 2 (cols - 1)(rows - 1) surface triangles.
+  for (const auto& [cols, rows] :
+       std::vector<std::pair<int, int>>{{2, 2}, {4, 3}, {8, 6}, {2, 7}, {65535, 65535}}) {
+    INFO(cols << " x " << rows);
+    const auto cellsAcross = static_cast<std::uint64_t>(cols - 1);
+    const auto cellsDown = static_cast<std::uint64_t>(rows - 1);
+    CHECK(solidTriangleCount(gridBoundary(cols, rows), 2 * cellsAcross * cellsDown) == solidTriangleCount(cols, rows));
+  }
+  // It only adds up sizes: an empty side counts for 0, though no solid is made of it.
+  CHECK(solidTriangleCount(Boundary{}, 0) == 2);
+  CHECK(solidTriangleCount(Boundary{}, 7) == 9);
+  CHECK(solidTriangleCount(Boundary{}, 8'589'934'592ULL) == 8'589'934'594ULL);
+}
+
+TEST_CASE("a surface with an irregular outline is closed with walls cut as monotone polygons and a base", "[solid]") {
+  // Once with the vertices numbered as the table of irregular() has them and once shuffled: nothing may depend on the
+  // numbers, which a simplified surface will have in no particular order.
+  constexpr std::array<std::uint32_t, 7> shuffled = {4, 0, 6, 2, 5, 1, 3};
+  for (const auto& number : {kInOrder, shuffled}) {
+    INFO("the table's vertex 0 is numbered " << number[0]);
+    const Irregular in = irregular(number);
+    const Mesh solid = solidFromSurface(in.surface, in.boundary, kIrregularPlane);
+
+    // 5 surface triangles, 3 + 2 + 4 + 2 wall triangles, one for each top vertex of a side, and the base's 2.
+    CHECK(solidTriangleCount(in.boundary, in.surface.triangles.size()) == 18);
+    REQUIRE(solid.vertices.size() == 7 + 4);
+    REQUIRE(solid.triangles.size() == 18);
+
+    // The surface comes first, unchanged, then four bottom corners under the first vertex of the south, east, north
+    // and west sides: vertices 0, 2, 3 and 6 of the table.
+    for (std::size_t v = 0; v < 7; ++v) CHECK(xyz(solid.vertices[v]) == xyz(in.surface.vertices[v]));
+    std::vector<Wound> firstFive = woundFrom(solid, 0);
+    firstFive.resize(5);
+    CHECK(firstFive == woundFrom(in.surface, 0));
+    CHECK(xyz(solid.vertices[7]) == std::array<float, 3>{0, 0, -4});
+    CHECK(xyz(solid.vertices[8]) == std::array<float, 3>{100, 0, -4});
+    CHECK(xyz(solid.vertices[9]) == std::array<float, 3>{100, 50, -4});
+    CHECK(xyz(solid.vertices[10]) == std::array<float, 3>{0, 50, -4});
+
+    // Every triangle faces the way its face must, and each face has the triangles it should.
+    std::array<std::size_t, 6> count{};
+    std::array<double, 6> area{};
+    for (std::size_t k = 0; k < solid.triangles.size(); ++k) {
+      const Face face = faceOf(solid, solid.triangles[k], 100.0f, 50.0f, kIrregularPlane);
+      const D3 n = normalOf(solid, solid.triangles[k]);
+      INFO("triangle " << k << " of the " << kFaceName[index(face)] << " faces " << describe(n));
+      switch (face) {
+        case Face::Surface: CHECK(n.z > 0); break;
+        case Face::South: CHECK((n.y < 0 && n.x == 0 && n.z == 0)); break;
+        case Face::East: CHECK((n.x > 0 && n.y == 0 && n.z == 0)); break;
+        case Face::North: CHECK((n.y > 0 && n.x == 0 && n.z == 0)); break;
+        case Face::West: CHECK((n.x < 0 && n.y == 0 && n.z == 0)); break;
+        case Face::Base: CHECK((n.z < 0 && n.x == 0 && n.y == 0)); break;
+      }
+      ++count[index(face)];
+      area[index(face)] += length(n) / 2.0;
+    }
+    CHECK(count == std::array<std::size_t, 6>{5, 3, 2, 4, 2, 2});
+    // The triangles of a wall cover the polygon under its side once, worked out by hand as the trapezoids between
+    // neighbouring top vertices, with the heights above the plane.
+    // South: 30 x (14 + 34) / 2 + 70 x (34 + 9) / 2. East: 50 x (9 + 16) / 2. North: 30 x (16 + 14) / 2 +
+    // 50 x (14 + 54) / 2 + 20 x (54 + 24) / 2. West: 50 x (24 + 14) / 2. The base: 100 x 50.
+    CHECK_THAT(area[index(Face::South)], WithinAbs(2225.0, 1e-9));
+    CHECK_THAT(area[index(Face::East)], WithinAbs(625.0, 1e-9));
+    CHECK_THAT(area[index(Face::North)], WithinAbs(2930.0, 1e-9));
+    CHECK_THAT(area[index(Face::West)], WithinAbs(950.0, 1e-9));
+    CHECK_THAT(area[index(Face::Base)], WithinAbs(5000.0, 1e-9));
+
+    // A closed solid facing out, whose volume is the prisms under the five surface triangles: areas 750, 500, 1250,
+    // 1750 and 750 at mean heights 24, 37 1/3, 34, 19 and 13 above the plane, 366500 / 3 in all.
+    const MeshCheck check = checkSolid(solid);
+    CHECK(check.triangles == 18);
+    CHECK(check.nonManifoldEdges == 0);
+    CHECK(check.zeroAreaTriangles == 0);
+    CHECK(check.ok());
+    CHECK_THAT(check.signedVolume, WithinRel(366500.0 / 3.0, 1e-9));
+    CHECK_THAT(check.signedVolume, WithinRel(prismVolume(solid, 5, kIrregularPlane), 1e-9));
+
+    // The cut itself, from the table's numbers (the bottom corners 7 to 10 keep theirs). South: the plain fan from the
+    // corner under vertex 0. East: two top vertices, a trapezoid in two. North: vertex 5 hides vertex 4 from the corner
+    // under vertex 3, so (4, 6, 5) closes the valley between top vertices before the rest is fanned. West: a trapezoid.
+    std::vector<Wound> expected = {
+        {7, 1, 0},  {7, 2, 1}, {8, 2, 7},               // south
+        {8, 3, 2},  {9, 3, 8},                          // east
+        {9, 4, 3},  {4, 6, 5}, {9, 6, 4}, {10, 6, 9},   // north
+        {10, 0, 6}, {7, 0, 10},                         // west
+        {7, 10, 9}, {7, 9, 8},                          // base
+    };
+    for (Wound& t : expected) {
+      for (std::uint32_t& v : t) {
+        if (v < 7) v = number[v];
+      }
+    }
+    CHECK(woundFrom(solid, 5) == expected);
+  }
+}
+
+TEST_CASE("solidFromSurface refuses an outline or a plane it cannot close a solid on", "[solid]") {
+  const Irregular in = irregular();
+  const float plane = kIrregularPlane;
+  CHECK(refusal(in.surface, in.boundary, plane) == "");
+
+  // A side needs a first and a last vertex, a wall being the polygon between them.
+  Boundary one = in.boundary;
+  one.sides[1] = {2};
+  CHECK(refusal(in.surface, one, plane) == "the east side must have at least 2 vertices, not 1");
+  Boundary none = in.boundary;
+  none.sides[0].clear();
+  CHECK(refusal(in.surface, none, plane) == "the south side must have at least 2 vertices, not 0");
+  CHECK(refusal(Mesh{}, Boundary{}, 0.0f) == "the south side must have at least 2 vertices, not 0");
+
+  // Consecutive sides share their corner: here the west side's last is not the south side's first, then the east
+  // side's is not the north side's.
+  Boundary apart = in.boundary;
+  apart.sides[3] = {6, 1};
+  CHECK(refusal(in.surface, apart, plane) ==
+        "the west side ends at vertex 1, but the south side starts at vertex 0: consecutive sides must share their "
+        "corner");
+  apart = in.boundary;
+  apart.sides[1] = {2, 4};
+  CHECK(refusal(in.surface, apart, plane) ==
+        "the east side ends at vertex 4, but the north side starts at vertex 3: consecutive sides must share their "
+        "corner");
+
+  // Every vertex number must be one of the surface's, which has vertices 0 to 6: the north-west corner as vertex 7, and
+  // as the largest number there is.
+  Boundary outside = in.boundary;
+  outside.sides[2] = {3, 4, 5, 7};
+  outside.sides[3] = {7, 0};
+  CHECK(refusal(in.surface, outside, plane) == "the north side names vertex 7, but the surface has 7 vertices");
+  outside.sides[2] = {3, 4, 5, 4294967295U};
+  outside.sides[3] = {4294967295U, 0};
+  CHECK(refusal(in.surface, outside, plane) ==
+        "the north side names vertex 4294967295, but the surface has 7 vertices");
+
+  // A wall is flat: the south and north sides keep their y and the east and west sides their x, exactly.
+  Mesh slanted = in.surface;
+  slanted.vertices[1].y = 1.0f;
+  CHECK(refusal(slanted, in.boundary, plane) ==
+        "the south side is not flat: vertex 1 is at y = 1, but vertex 0, the side's first, is at y = 0");
+  slanted = in.surface;
+  slanted.vertices[3].x = 99.0f;
+  CHECK(refusal(slanted, in.boundary, plane) ==
+        "the east side is not flat: vertex 3 is at x = 99, but vertex 2, the side's first, is at x = 100");
+  slanted = in.surface;
+  slanted.vertices[5].y = kNaN;
+  CHECK(refusal(slanted, in.boundary, plane) ==
+        "the north side is not flat: vertex 5 is at y = nan, but vertex 3, the side's first, is at y = 50");
+
+  // The vertices follow one another strictly along the side, in the order the boundary is walked: the south side's x
+  // increasing, so neither a vertex beyond the next nor one as far along as the one before is let through.
+  Mesh swapped = in.surface;
+  swapped.vertices[1].x = 120.0f;
+  CHECK(refusal(swapped, in.boundary, plane) ==
+        "the south side must run from west to east with x strictly increasing, but vertex 2 at x = 100 follows "
+        "vertex 1 at x = 120");
+  swapped.vertices[1].x = 0.0f;
+  CHECK(refusal(swapped, in.boundary, plane) ==
+        "the south side must run from west to east with x strictly increasing, but vertex 1 at x = 0 follows vertex "
+        "0 at x = 0");
+  // The north side's x decreases, and the east side goes by y, increasing.
+  swapped = in.surface;
+  swapped.vertices[4].x = 10.0f;
+  CHECK(refusal(swapped, in.boundary, plane) ==
+        "the north side must run from east to west with x strictly decreasing, but vertex 5 at x = 20 follows "
+        "vertex 4 at x = 10");
+  swapped = in.surface;
+  swapped.vertices[3].y = 0.0f;
+  CHECK(refusal(swapped, in.boundary, plane) ==
+        "the east side must run from south to north with y strictly increasing, but vertex 3 at y = 0 follows "
+        "vertex 2 at y = 0");
+  // An outline walked clockwise, the south side from east to west and so on round, has every corner and every wall flat
+  // and would turn each wall inside out: its first side is refused for running the wrong way.
+  Boundary clockwise;
+  clockwise.sides[0] = {2, 1, 0};
+  clockwise.sides[1] = {0, 6};
+  clockwise.sides[2] = {6, 5, 4, 3};
+  clockwise.sides[3] = {3, 2};
+  CHECK(refusal(in.surface, clockwise, plane) ==
+        "the south side must run from west to east with x strictly increasing, but vertex 1 at x = 30 follows "
+        "vertex 2 at x = 100");
+
+  // The plane is finite and below every vertex of the surface, on a side or not, a wall having to reach down from each
+  // top vertex: here it meets vertex 2, at 5; then an eighth vertex inside the outline lies under it; then one has no
+  // height at all.
+  CHECK(refusal(in.surface, in.boundary, kNaN) == "the base plane must be finite, not nan");
+  CHECK(refusal(in.surface, in.boundary, -std::numeric_limits<float>::infinity()) ==
+        "the base plane must be finite, not -inf");
+  CHECK(refusal(in.surface, in.boundary, 5.0f) == "the base plane at 5 is not below the surface: vertex 2 is at 5");
+  Mesh sunk = in.surface;
+  sunk.vertices.push_back({50, 25, -9});
+  CHECK(refusal(sunk, in.boundary, plane) == "the base plane at -4 is not below the surface: vertex 7 is at -9");
+  Mesh holed = in.surface;
+  holed.vertices[5].z = kNaN;
+  CHECK(refusal(holed, in.boundary, plane) == "the base plane at -4 is not below the surface: vertex 5 is at nan");
+}
+
+TEST_CASE("solidMesh refuses a grid surface whose sides were bent out of line", "[solid]") {
+  // surfaceMesh gives every side the same x or y all along it and makes them run in order; a surface moved afterwards
+  // is refused by the outline's checks, as solidFromSurface refuses it.
+  Mesh bent = surfaceMesh(Grid(6, 10.0f), 3, 2, 100, 50, 1, 1, 0);
+  bent.vertices[4].y = 1.0f;  // the middle of the south side, the last row
+  REQUIRE_THROWS_MATCHES(
+      solidMesh(bent, 3, 2, -5.0f), std::invalid_argument,
+      Message("the south side is not flat: vertex 4 is at y = 1, but vertex 3, the side's first, is at y = 0"));
 }

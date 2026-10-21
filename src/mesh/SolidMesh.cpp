@@ -1,11 +1,13 @@
 #include "mesh/SolidMesh.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,8 +16,8 @@ namespace demdl::mesh {
 
 namespace {
 
-// Vertex numbers are 32 bits, and the solid adds its four bottom corners to the grid's vertices.
-constexpr std::uint64_t kMostGridVertices = std::uint64_t{std::numeric_limits<std::uint32_t>::max()} + 1 - 4;
+// Vertex numbers are 32 bits, and the solid adds its four bottom corners to the surface's vertices.
+constexpr std::uint64_t kMostSurfaceVertices = std::uint64_t{std::numeric_limits<std::uint32_t>::max()} + 1 - 4;
 
 std::string formatNumber(double value, int digits) {
   char text[40];
@@ -33,10 +35,10 @@ std::uint64_t checkGrid(int cols, int rows) {
   }
   // Multiplied in 64 bits: 65536 x 65536 is past what an int or any 32-bit count holds.
   const std::uint64_t count = static_cast<std::uint64_t>(cols) * static_cast<std::uint64_t>(rows);
-  if (count > kMostGridVertices) {
+  if (count > kMostSurfaceVertices) {
     throw std::invalid_argument("a grid of " + gridSize(cols, rows) +
                                 " vertices is too large: 32-bit vertex numbers leave room for " +
-                                std::to_string(kMostGridVertices) + " besides the four bottom corners");
+                                std::to_string(kMostSurfaceVertices) + " besides the four bottom corners");
   }
   return count;
 }
@@ -48,9 +50,9 @@ struct Vec3d {
 Vec3d toDouble(const Vec3& v) { return {v.x, v.y, v.z}; }
 
 // (b - a) x (c - a), in double from the float coordinates: it points to the side the triangle faces, the side from
-// which its vertices run counter-clockwise, and its length is twice the triangle's area. solidMesh decides which way a
-// wall triangle faces with this very function, and checkSolid measures areas with it, so a triangle the walls were
-// cut with because it faces out is also one that checkSolid finds has an area.
+// which its vertices run counter-clockwise, and its length is twice the triangle's area. solidFromSurface decides which
+// way a wall triangle faces with this very function, and checkSolid measures areas with it, so a triangle the walls
+// were cut with because it faces out is also one that checkSolid finds has an area.
 Vec3d normalOf(const Vec3& a, const Vec3& b, const Vec3& c) {
   const Vec3d p = toDouble(a), q = toDouble(b), r = toDouble(c);
   const Vec3d u{q.x - p.x, q.y - p.y, q.z - p.z};
@@ -58,11 +60,11 @@ Vec3d normalOf(const Vec3& a, const Vec3& b, const Vec3& c) {
   return {u.y * w.z - u.z * w.y, u.z * w.x - u.x * w.z, u.x * w.y - u.y * w.x};
 }
 
-// One side of the solid, walked counter-clockwise seen from above: its top vertices are first + k step for k from 0 to
-// count - 1, startCorner and endCorner are the bottom corners under the first and the last, and the wall faces along
-// axis (0 for x, 1 for y) towards sign.
+// One side of the solid, walked counter-clockwise seen from above: its top vertices in that order, startCorner and
+// endCorner the bottom corners under the first and the last, and the wall faces along axis (0 for x, 1 for y) towards
+// sign.
 struct Side {
-  std::int64_t first, step, count;
+  std::span<const std::uint32_t> top;
   std::uint32_t startCorner, endCorner;
   int axis;
   double sign;
@@ -93,15 +95,14 @@ double areaFacingOut(const Mesh& mesh, const Side& side, std::uint32_t a, std::u
 // closes just its own triangle of that fan, the stack is then the start corner and the newest vertex, and the end fan
 // is that fan's closing triangle. Every top vertex after the first closes as many triangles as it takes off the stack,
 // and the end fan one fewer than the stack holds, so a side of n + 1 top vertices gives n + 1 triangles whatever the
-// heights are.
+// heights are, and however the top vertices are spaced along the side.
 void addWall(Mesh& mesh, const Side& side) {
-  const auto top = [&](std::int64_t k) { return static_cast<std::uint32_t>(side.first + k * side.step); };
   std::vector<std::uint32_t> stack;
-  stack.reserve(static_cast<std::size_t>(side.count) + 1);
+  stack.reserve(side.top.size() + 1);
   stack.push_back(side.startCorner);
-  stack.push_back(top(0));
-  for (std::int64_t k = 1; k < side.count; ++k) {
-    const std::uint32_t next = top(k);
+  stack.push_back(side.top.front());
+  for (std::size_t k = 1; k < side.top.size(); ++k) {
+    const std::uint32_t next = side.top[k];
     std::uint32_t waiting = stack.back();
     stack.pop_back();
     while (!stack.empty() && areaFacingOut(mesh, side, stack.back(), next, waiting) > 0) {
@@ -114,6 +115,81 @@ void addWall(Mesh& mesh, const Side& side) {
   }
   for (std::size_t i = 0; i + 1 < stack.size(); ++i) {
     mesh.triangles.push_back({side.endCorner, stack[i + 1], stack[i]});
+  }
+}
+
+// What tells the four sides apart, in the order of Boundary::sides.
+struct SideRule {
+  const char* name;    // in messages
+  const char* course;  // the way the side is walked, in messages
+  int axis;            // the coordinate across the wall, which all the side's vertices share: 0 for x, 1 for y
+  double sign;         // the wall faces along axis towards sign
+  double toward;       // along the other coordinate the vertices run towards increasing (1) or decreasing (-1)
+};
+
+constexpr std::array<SideRule, 4> kRules = {{
+    {"south", "from west to east", 1, -1.0, 1.0},
+    {"east", "from south to north", 0, 1.0, 1.0},
+    {"north", "from east to west", 1, 1.0, -1.0},
+    {"west", "from north to south", 0, -1.0, -1.0},
+}};
+
+float coordinate(const Vec3& p, int axis) { return axis == 0 ? p.x : p.y; }
+
+std::string axisName(int axis) { return axis == 0 ? "x" : "y"; }
+
+std::string theSide(std::size_t side) { return std::string("the ") + kRules[side].name + " side"; }
+
+// Checks the outline against the surface in the order the header of solidFromSurface lists and throws for the first
+// thing wrong. No vertex is looked at before its number has been checked, and no height is looked at here.
+void checkBoundary(const Mesh& surface, const Boundary& boundary) {
+  for (std::size_t s = 0; s < boundary.sides.size(); ++s) {
+    if (boundary.sides[s].size() < 2) {
+      throw std::invalid_argument(theSide(s) + " must have at least 2 vertices, not " +
+                                  std::to_string(boundary.sides[s].size()));
+    }
+  }
+  for (std::size_t s = 0; s < boundary.sides.size(); ++s) {
+    const std::size_t next = (s + 1) % boundary.sides.size();
+    if (boundary.sides[s].back() != boundary.sides[next].front()) {
+      throw std::invalid_argument(theSide(s) + " ends at vertex " + std::to_string(boundary.sides[s].back()) +
+                                  ", but " + theSide(next) + " starts at vertex " +
+                                  std::to_string(boundary.sides[next].front()) +
+                                  ": consecutive sides must share their corner");
+    }
+  }
+  for (std::size_t s = 0; s < boundary.sides.size(); ++s) {
+    for (const std::uint32_t v : boundary.sides[s]) {
+      if (v >= surface.vertices.size()) {
+        throw std::invalid_argument(theSide(s) + " names vertex " + std::to_string(v) + ", but the surface has " +
+                                    std::to_string(surface.vertices.size()) + " vertices");
+      }
+    }
+  }
+  for (std::size_t s = 0; s < boundary.sides.size(); ++s) {
+    const SideRule& rule = kRules[s];
+    const std::vector<std::uint32_t>& top = boundary.sides[s];
+    const int along = 1 - rule.axis;
+    const float across = coordinate(surface.vertices[top.front()], rule.axis);
+    for (std::size_t k = 1; k < top.size(); ++k) {
+      const Vec3& here = surface.vertices[top[k]];
+      // Both tests are asked this way round, so that a coordinate that is not a number fails them.
+      if (!(coordinate(here, rule.axis) == across)) {
+        throw std::invalid_argument(theSide(s) + " is not flat: vertex " + std::to_string(top[k]) + " is at " +
+                                    axisName(rule.axis) + " = " + formatNumber(coordinate(here, rule.axis), 9) +
+                                    ", but vertex " + std::to_string(top.front()) + ", the side's first, is at " +
+                                    axisName(rule.axis) + " = " + formatNumber(across, 9));
+      }
+      const float before = coordinate(surface.vertices[top[k - 1]], along);
+      const float after = coordinate(here, along);
+      if (!(rule.toward > 0 ? after > before : after < before)) {
+        throw std::invalid_argument(theSide(s) + " must run " + rule.course + " with " + axisName(along) +
+                                    " strictly " + (rule.toward > 0 ? "increasing" : "decreasing") + ", but vertex " +
+                                    std::to_string(top[k]) + " at " + axisName(along) + " = " +
+                                    formatNumber(after, 9) + " follows vertex " + std::to_string(top[k - 1]) +
+                                    " at " + axisName(along) + " = " + formatNumber(before, 9));
+      }
+    }
   }
 }
 
@@ -211,12 +287,32 @@ Mesh surfaceMesh(const std::vector<float>& heights, int cols, int rows, double w
   return mesh;
 }
 
-Mesh solidMesh(const Mesh& surface, int cols, int rows, float planeZ) {
-  const std::uint64_t count = checkGrid(cols, rows);
-  if (surface.vertices.size() != count) {
-    throw std::invalid_argument("a grid of " + gridSize(cols, rows) + " vertices needs a surface of " +
-                                std::to_string(count) + " vertices, not " + std::to_string(surface.vertices.size()));
+Boundary gridBoundary(int cols, int rows) {
+  checkGrid(cols, rows);
+  // Vertex (i, j) is number j c + i. checkGrid has seen that the c r vertices fit in 32-bit vertex numbers, so none of
+  // these products wraps.
+  const auto c = static_cast<std::uint32_t>(cols);
+  const auto r = static_cast<std::uint32_t>(rows);
+  Boundary boundary;
+  auto& [south, east, north, west] = boundary.sides;
+  for (std::uint32_t k = 0; k < c; ++k) {
+    south.push_back((r - 1) * c + k);  // the last row, from the first column to the last
+    north.push_back(c - 1 - k);        // the first row, from the last column to the first
   }
+  for (std::uint32_t k = 0; k < r; ++k) {
+    east.push_back((r - 1 - k) * c + c - 1);  // the last column, from the last row to the first
+    west.push_back(k * c);                    // the first column, from the first row to the last
+  }
+  return boundary;
+}
+
+Mesh solidFromSurface(const Mesh& surface, const Boundary& boundary, float planeZ) {
+  if (surface.vertices.size() > kMostSurfaceVertices) {
+    throw std::invalid_argument("a surface of " + std::to_string(surface.vertices.size()) +
+                                " vertices is too large: 32-bit vertex numbers leave room for " +
+                                std::to_string(kMostSurfaceVertices) + " besides the four bottom corners");
+  }
+  checkBoundary(surface, boundary);
   if (!std::isfinite(planeZ)) {
     throw std::invalid_argument("the base plane must be finite, not " + formatNumber(planeZ, 9));
   }
@@ -229,33 +325,39 @@ Mesh solidMesh(const Mesh& surface, int cols, int rows, float planeZ) {
     }
   }
 
-  const auto c = static_cast<std::int64_t>(cols);
-  const auto r = static_cast<std::int64_t>(rows);
-  const auto n = static_cast<std::uint32_t>(count);
+  const auto n = static_cast<std::uint32_t>(surface.vertices.size());
 
   Mesh solid;
   solid.vertices.reserve(surface.vertices.size() + 4);
   solid.vertices.insert(solid.vertices.end(), surface.vertices.begin(), surface.vertices.end());
-  // Vertices n to n + 3, under the south-west, south-east, north-east and north-west corners.
-  for (const std::int64_t corner : {(r - 1) * c, (r - 1) * c + c - 1, c - 1, std::int64_t{0}}) {
-    const Vec3& above = surface.vertices[static_cast<std::size_t>(corner)];
+  // Vertices n to n + 3, under the first vertex of the south, east, north and west sides: the south-west, south-east,
+  // north-east and north-west corners.
+  for (const std::vector<std::uint32_t>& side : boundary.sides) {
+    const Vec3& above = surface.vertices[side.front()];
     solid.vertices.push_back({above.x, above.y, planeZ});
   }
 
-  solid.triangles.reserve(surface.triangles.size() + static_cast<std::size_t>(2 * (c + r) + 2));
+  solid.triangles.reserve(static_cast<std::size_t>(solidTriangleCount(boundary, surface.triangles.size())));
   solid.triangles.insert(solid.triangles.end(), surface.triangles.begin(), surface.triangles.end());
-  addWall(solid, Side{.first = (r - 1) * c, .step = 1, .count = c, .startCorner = n, .endCorner = n + 1, .axis = 1,
-                      .sign = -1.0});  // south, west to east, facing south
-  addWall(solid, Side{.first = (r - 1) * c + c - 1, .step = -c, .count = r, .startCorner = n + 1, .endCorner = n + 2,
-                      .axis = 0, .sign = 1.0});  // east, south to north, facing east
-  addWall(solid, Side{.first = c - 1, .step = -1, .count = c, .startCorner = n + 2, .endCorner = n + 3, .axis = 1,
-                      .sign = 1.0});  // north, east to west, facing north
-  addWall(solid, Side{.first = 0, .step = c, .count = r, .startCorner = n + 3, .endCorner = n, .axis = 0,
-                      .sign = -1.0});  // west, north to south, facing west
+  // Each wall runs from the bottom corner under its side's first vertex to the one under the next side's first, which
+  // is under its own last.
+  for (std::uint32_t s = 0; s < 4; ++s) {
+    addWall(solid, Side{.top = boundary.sides[s], .startCorner = n + s, .endCorner = n + (s + 1) % 4,
+                        .axis = kRules[s].axis, .sign = kRules[s].sign});
+  }
   // The base, clockwise seen from above so that it faces down.
   solid.triangles.push_back({n, n + 3, n + 2});
   solid.triangles.push_back({n, n + 2, n + 1});
   return solid;
+}
+
+Mesh solidMesh(const Mesh& surface, int cols, int rows, float planeZ) {
+  const std::uint64_t count = checkGrid(cols, rows);
+  if (surface.vertices.size() != count) {
+    throw std::invalid_argument("a grid of " + gridSize(cols, rows) + " vertices needs a surface of " +
+                                std::to_string(count) + " vertices, not " + std::to_string(surface.vertices.size()));
+  }
+  return solidFromSurface(surface, gridBoundary(cols, rows), planeZ);
 }
 
 std::uint64_t solidTriangleCount(int cols, int rows) noexcept {
@@ -263,6 +365,12 @@ std::uint64_t solidTriangleCount(int cols, int rows) noexcept {
   const auto c = static_cast<std::uint64_t>(cols);
   const auto r = static_cast<std::uint64_t>(rows);
   return 2 * (c - 1) * (r - 1) + 2 * (c + r) + 2;
+}
+
+std::uint64_t solidTriangleCount(const Boundary& boundary, std::uint64_t surfaceTriangles) noexcept {
+  std::uint64_t count = surfaceTriangles + 2;
+  for (const std::vector<std::uint32_t>& side : boundary.sides) count += side.size();
+  return count;
 }
 
 bool MeshCheck::ok() const {
