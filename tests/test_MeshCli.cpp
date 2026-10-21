@@ -227,8 +227,8 @@ TEST_CASE("the help lists every flag", "[meshcli]") {
 TEST_CASE("the help states the ranges and defaults", "[meshcli]") {
   const std::string help = squashed(parse({"--help"}).out);
   for (const char* description : {
-           "output grid in vertices, W or WxH, each at least 2 and at most 25,000,000 in all (without xH the height "
-           "follows the window's aspect)",
+           "output grid in vertices, W or WxH, each at least 2 and at most 25,000,000 in all without --tolerance, "
+           "2,147,483,647 with it (without xH the height follows the window's aspect)",
            "vertical exaggeration, above 0 (default 1)",
            "base plane height in metres before exaggeration, any finite number (default sea level, 0; lowered to the "
            "lowest point when needed)",

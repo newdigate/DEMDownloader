@@ -128,12 +128,12 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   south->needs(north, east, west);
   east->needs(north, south, west);
   west->needs(north, south, east);
-  // The bounds are stated for the user. validateMeshOptions enforces the 2, and main the 25,000,000, which needs the
-  // window's aspect when the height is left out.
+  // The bounds are stated for the user. validateMeshOptions enforces the 2, and main the 25,000,000 or, with
+  // --tolerance, the 2,147,483,647, either of which needs the window's aspect when the height is left out.
   CLI::Option* const gridOption =
       app.add_option("--grid", gridArg,
-                     "output grid in vertices, W or WxH, each at least 2 and at most 25,000,000 in all (without xH "
-                     "the height follows the window's aspect)")
+                     "output grid in vertices, W or WxH, each at least 2 and at most 25,000,000 in all without "
+                     "--tolerance, 2,147,483,647 with it (without xH the height follows the window's aspect)")
           ->type_name("W[xH]")
           ->check(gridText);
   // The descriptions give the defaults and the ranges, which validateMeshOptions enforces; CLI11's captured default,

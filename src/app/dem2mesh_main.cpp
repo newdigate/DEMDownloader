@@ -1,7 +1,9 @@
 // dem2mesh: an elevation GeoTIFF to a printable STL solid, the PLY surface, and the Blender scene built from it (spec 3
-// to 7). main is the spec's pipeline as a sequence of named steps, each a call into the demmesh library, so that the
-// order can be read here and the work is tested there. The summary goes to stdout; every failure is one line on stderr,
-// "error: <message>", followed by Blender's output when Blender failed, and exit code 1.
+// to 7), the surface simplified to within a tolerance when asked (spec 4.1 to 4.7). A section numbered 4.1 to 4.7 is
+// the simplify-and-tiles design's, the only one of the two designs with such sections; the other numbers are the
+// dem-to-mesh design's. main is the spec's pipeline as a sequence of named steps, each a call into the demmesh library,
+// so that the order can be read here and the work is tested there. The summary goes to stdout; every failure is one
+// line on stderr, "error: <message>", followed by Blender's output when Blender failed, and exit code 1.
 
 #include <unistd.h>
 
@@ -15,11 +17,13 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "app/ExitCodes.h"
@@ -32,6 +36,7 @@
 #include "mesh/NoDataFill.h"
 #include "mesh/PlyWriter.h"
 #include "mesh/Resampler.h"
+#include "mesh/Simplifier.h"
 #include "mesh/SolidMesh.h"
 #include "mesh/StlWriter.h"
 #include "mesh/TransverseMercator.h"
@@ -42,10 +47,16 @@ namespace fs = std::filesystem;
 using demdl::cli::MeshOptions;
 using namespace demdl::mesh;
 
-// Spec 3: an output grid of more vertices than this is refused, its STL being about 2.5 GB at the limit, and one of
-// more than kWarnVertices is warned about, with the sizes of its files.
+// Spec 3 and 4.2: a mesh of more vertices than this is refused, its STL being about 2.5 GB at the limit, and one of
+// more than kWarnVertices is warned about, with the sizes of its files. Both count the mesh that is written: the output
+// grid, or with --tolerance the simplified mesh, whose size is known only once the grid has been simplified.
 constexpr std::uint64_t kMostVertices = 25'000'000;
 constexpr std::uint64_t kWarnVertices = 4'000'000;
+
+// With --tolerance the output grid is simplified, not written, so it may be as large as the window (spec 4.2): it is
+// refused only above the most an int holds, which still leaves both its sides within an int. At that limit its heights
+// are 8.6 GB of float32.
+constexpr std::uint64_t kMostVerticesToSimplify = std::numeric_limits<int>::max();
 
 // value with `decimals` decimals, sized by a first call so that no value, however large, is cut short.
 std::string fixed(double value, int decimals) {
@@ -173,9 +184,10 @@ struct OutputGrid {
 // --grid, or one vertex per sample of the window. A height left out follows the window's aspect in metres, so that the
 // cells come out square: rows = max(2, round((cols - 1) heightM / widthM) + 1). Worked out in double, because --grid
 // takes any int and an extreme aspect can ask for more rows than an int holds; refused, before anything is read, above
-// kMostVertices, which leaves both sides within an int.
+// kMostVertices, or when the grid is to be simplified (simplify) above kMostVerticesToSimplify, either of which leaves
+// both sides within an int.
 OutputGrid outputGridFor(const std::optional<demdl::cli::GridSize>& grid, const PixelWindow& window,
-                         const WindowExtent& extent) {
+                         const WindowExtent& extent, bool simplify) {
   double cols = window.cols;
   double rows = window.rows;
   if (grid) {
@@ -183,10 +195,12 @@ OutputGrid outputGridFor(const std::optional<demdl::cli::GridSize>& grid, const 
     rows = grid->rows != 0 ? grid->rows : std::max(2.0, std::round((cols - 1) * extent.heightM / extent.widthM) + 1);
   }
   const double vertices = cols * rows;
+  const std::uint64_t limit = simplify ? kMostVerticesToSimplify : kMostVertices;
   // Asked this way round so that a NaN is refused too.
-  if (!(vertices <= static_cast<double>(kMostVertices))) {
-    throw std::runtime_error("the output grid is " + fixed(vertices, 0) + " vertices; the limit is " +
-                             std::to_string(kMostVertices) + ": use --grid or crop");
+  if (!(vertices <= static_cast<double>(limit))) {
+    throw std::runtime_error("the output grid is " + fixed(vertices, 0) + " vertices; " +
+                             (simplify ? "with --tolerance " : "") + "the limit is " + std::to_string(limit) +
+                             ": use --grid or crop");
   }
   return {static_cast<int>(cols), static_cast<int>(rows)};
 }
@@ -197,11 +211,12 @@ struct Facts {
   PixelWindow window;
   WindowExtent extent;
   OutputGrid grid;
-  std::uint64_t triangles = 0;  // in the solid, from the formula
+  std::uint64_t surfaceVertices = 0, surfaceTriangles = 0;  // the surface written: the grid's, or the simplified one
+  std::uint64_t triangles = 0;                              // in the solid built on the surface
   std::uint64_t stlBytes = 0, plyBytes = 0;
   FillReport fill;
   double lowest = 0, highest = 0;  // the window's heights after the fill, before resampling
-  double gridSummit = 0;           // the highest height of the resampled grid
+  double meshSummit = 0;           // the surface's highest height: the resampled grid's, or the simplified mesh's
   double surfaceLowZ = 0, surfaceHighZ = 0;  // the surface's lowest and highest z in model units, for Blender's camera
   BasePlane base;
   MeshCheck check;
@@ -215,12 +230,23 @@ std::string blenderMemory(std::uint64_t triangles) {
   return fixed((250e6 + 670.0 * static_cast<double>(triangles)) / 1e9, 1) + " GB";
 }
 
+// What will be written: the surface of `vertices` and `triangles`, which is the PLY, and the solid of `solidTriangles`
+// built on it, which is the STL.
+void countOutputs(Facts& f, std::uint64_t vertices, std::uint64_t triangles, std::uint64_t solidTriangles) {
+  f.surfaceVertices = vertices;
+  f.surfaceTriangles = triangles;
+  f.triangles = solidTriangles;
+  f.stlBytes = stlFileBytes(solidTriangles);
+  f.plyBytes = plyFileBytes(vertices, triangles);
+}
+
 // "4000000 vertices" and up: the sizes in megabytes, which is what a user weighs before waiting for them, and the
-// memory Blender will want, which can be more than the machine has, unless --no-blend leaves Blender out.
-void warnOfLargeFiles(const MeshOptions& options, const Facts& f) {
+// memory Blender will want, which can be more than the machine has, unless --no-blend leaves Blender out. mesh names
+// what has that many vertices: "the output grid", or with --tolerance "the simplified mesh".
+void warnOfLargeFiles(const MeshOptions& options, std::string_view mesh, const Facts& f) {
   const std::string stl = fixed(static_cast<double>(f.stlBytes) / 1e6, 0) + " MB";
   const std::string ply = fixed(static_cast<double>(f.plyBytes) / 1e6, 0) + " MB";
-  std::cerr << "warning: the output grid is " << f.grid.vertices() << " vertices: the STL will take " << stl;
+  std::cerr << "warning: " << mesh << " is " << f.surfaceVertices << " vertices: the STL will take " << stl;
   if (options.noBlend) {
     std::cerr << " and the PLY " << ply << "\n";
   } else {
@@ -230,8 +256,8 @@ void warnOfLargeFiles(const MeshOptions& options, const Facts& f) {
 }
 
 // Spec 5, steps 1 to 4, on the window: its heights, read once as float32; no-data filled from the nearest height; the
-// range after the fill, which the base plane is chosen from, and which the resampled grid never leaves, so that
-// surfaceMesh's clamp to the level is only a guard; the grid resampled to the output size, always, even at full
+// range after the fill, which the base plane is chosen from, and which the resampled grid never leaves, so that the
+// surface's clamp to the level is only a guard; the grid resampled to the output size, always, even at full
 // resolution, as the kernel's smoothing is part of the design. The window goes when this returns, so that it is never
 // held beside a mesh.
 std::vector<float> readTerrain(const MeshOptions& options, Facts& f, StageClock& clock) {
@@ -243,9 +269,53 @@ std::vector<float> readTerrain(const MeshOptions& options, Facts& f, StageClock&
   f.lowest = *lowest;
   f.highest = *highest;
   std::vector<float> grid = resampleQuadratic(heights, f.window.cols, f.window.rows, f.grid.cols, f.grid.rows);
-  f.gridSummit = *std::max_element(grid.begin(), grid.end());
+  f.meshSummit = *std::max_element(grid.begin(), grid.end());  // the grid's, until it is simplified
   clock.lap("resample");
   return grid;
+}
+
+// --tolerance is in model units, after --z-scale and --scale (spec 4.1); the simplifier takes the heights' metres.
+double toleranceInMetres(const MeshOptions& options) { return *options.tolerance / (options.zScale * options.scale); }
+
+// The terrain's top surface and its outline, which the solid is built on.
+struct Surface {
+  Mesh mesh;
+  Boundary boundary;
+};
+
+// Spec 4.2: the grid becomes the surface as it stands (stage "surface"), or with --tolerance is simplified to a TIN
+// within it (stage "simplify"), and goes as soon as the surface is made, so that nothing per sample outlives this. What
+// will be written is counted from what was made. Only now is a simplified mesh's size known, so with --tolerance it is
+// refused here above kMostVertices and warned about above kWarnVertices, as a grid is before anything is read.
+Surface makeSurface(const MeshOptions& options, Facts& f, std::vector<float> grid, StageClock& clock) {
+  Surface surface;
+  if (options.tolerance) {
+    SimplifiedSurface tin = simplifyGrid(grid, f.grid.cols, f.grid.rows, toleranceInMetres(options), f.extent.widthM,
+                                         f.extent.heightM, options.zScale, options.scale, f.base.levelM);
+    // The grid's summit is a vertex only if the tolerance needs it there, so the mesh's summit is its highest vertex,
+    // back in metres.
+    const auto summit = std::max_element(tin.surface.vertices.begin(), tin.surface.vertices.end(),
+                                         [](const Vec3& a, const Vec3& b) { return a.z < b.z; });
+    f.meshSummit = static_cast<double>(summit->z) / (options.zScale * options.scale);
+    surface = {std::move(tin.surface), std::move(tin.boundary)};
+  } else {
+    surface = {surfaceMesh(grid, f.grid.cols, f.grid.rows, f.extent.widthM, f.extent.heightM, options.zScale,
+                           options.scale, f.base.levelM),
+               gridBoundary(f.grid.cols, f.grid.rows)};
+  }
+  release(grid);
+  const std::uint64_t triangles = surface.mesh.triangles.size();
+  countOutputs(f, surface.mesh.vertices.size(), triangles, solidTriangleCount(surface.boundary, triangles));
+  clock.lap(options.tolerance ? "simplify" : "surface");
+  if (options.tolerance) {
+    if (f.surfaceVertices > kMostVertices) {
+      throw std::runtime_error("the simplified mesh is " + std::to_string(f.surfaceVertices) +
+                               " vertices; the limit is " + std::to_string(kMostVertices) +
+                               ": raise --tolerance, or use --grid or crop");
+    }
+    if (f.surfaceVertices > kWarnVertices) warnOfLargeFiles(options, "the simplified mesh", f);
+  }
+  return surface;
 }
 
 // Spec 6: the solid is checked before anything is written. A failure is a bug in this program, not a fault of the
@@ -292,6 +362,26 @@ std::string gridLine(const Facts& f) {
          metres(f.extent.widthM / (f.grid.cols - 1)) + " x " + metres(f.extent.heightM / (f.grid.rows - 1)) + " m";
 }
 
+// The plan's memory with --tolerance (spec 4.2), where the grid can be far larger than the mesh written: the window and
+// the grid, each held once as float32, and both at once while the one is resampled into the other; the simplified mesh
+// grows with what it keeps, not with the grid. To the nearest megabyte, or once that is 1,000 or more, in gigabytes to
+// one decimal.
+std::string memoryLine(const Facts& f) {
+  const std::uint64_t samples = static_cast<std::uint64_t>(f.window.cols) * static_cast<std::uint64_t>(f.window.rows);
+  const double megabytes = 4.0 * static_cast<double>(samples + f.grid.vertices()) / 1e6;
+  const std::string about = megabytes < 999.5 ? fixed(megabytes, 0) + " MB" : fixed(megabytes / 1000, 1) + " GB";
+  return "memory: window " + std::to_string(samples) + " samples and grid " + std::to_string(f.grid.vertices()) +
+         " vertices, 4 bytes each: about " + about;
+}
+
+// Spec 4.7: the tolerance in model units as given and in the metres of terrain they stand for, then the grid's surface
+// against the simplified one.
+std::string simplifyLine(const MeshOptions& options, const Facts& f) {
+  return "simplify: tolerance " + number(*options.tolerance) + " units (" + metres(toleranceInMetres(options)) +
+         " m), " + std::to_string(f.grid.vertices()) + " grid vertices to " + std::to_string(f.surfaceVertices) + ", " +
+         std::to_string(f.grid.surfaceTriangles()) + " triangles to " + std::to_string(f.surfaceTriangles);
+}
+
 // The fill's part only when there was something to fill.
 std::string heightsLine(const Facts& f) {
   std::string line = "heights: " + metres(f.lowest) + " to " + metres(f.highest) + " m";
@@ -304,9 +394,10 @@ std::string heightsLine(const Facts& f) {
   return line;
 }
 
-// The B-spline lowers a sharp summit a little (spec 5.4); this shows by how much, so the owner can judge.
+// The B-spline lowers a sharp summit a little (spec 5.4), and a simplification may lower it by up to its tolerance;
+// this shows by how much, so the owner can judge.
 std::string summitLine(const Facts& f) {
-  return "summit: " + metres(f.highest) + " m in the window, " + metres(f.gridSummit) + " m in the mesh";
+  return "summit: " + metres(f.highest) + " m in the window, " + metres(f.meshSummit) + " m in the mesh";
 }
 
 std::string baseLine(const MeshOptions& options, const Facts& f) {
@@ -351,9 +442,9 @@ std::string plannedBlenderLine(const MeshOptions& options, const Facts& f, const
 void printSummary(const MeshOptions& options, const Outputs& outputs, const Facts& f) {
   std::cout << inputLine(options, f.geometry) << "\n";
   if (options.crop) std::cout << cropLine(*options.crop) << "\n";
-  std::cout << windowLine(f) << "\n"
-            << gridLine(f) << "\n"
-            << heightsLine(f) << "\n"
+  std::cout << windowLine(f) << "\n" << gridLine(f) << "\n";
+  if (options.tolerance) std::cout << simplifyLine(options, f) << "\n";
+  std::cout << heightsLine(f) << "\n"
             << summitLine(f) << "\n"
             << baseLine(options, f) << "\n"
             << solidLine(f) << "\n";
@@ -393,6 +484,10 @@ void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& 
   line(windowLine(f));
   line("extent: " + metres(f.extent.widthM) + " x " + metres(f.extent.heightM) + " m");
   line(gridLine(f));
+  if (options.tolerance) {
+    line(memoryLine(f));
+    line(simplifyLine(options, f));
+  }
   line(heightsLine(f));
   line(summitLine(f));
   line(baseLine(options, f));
@@ -497,23 +592,22 @@ int run(int argc, char** argv) {
   f.geometry = inspectGeoTiff(options.input);
   f.window = pixelWindowFor(f.geometry, options.crop);
   f.extent = extentInMetres(f.geometry, f.window);
-  f.grid = outputGridFor(options.grid, f.window, f.extent);
-  f.triangles = solidTriangleCount(f.grid.cols, f.grid.rows);
-  f.stlBytes = stlFileBytes(f.triangles);
-  f.plyBytes = plyFileBytes(f.grid.vertices(), f.grid.surfaceTriangles());
-  if (f.grid.vertices() > kWarnVertices) warnOfLargeFiles(options, f);
+  f.grid = outputGridFor(options.grid, f.window, f.extent, options.tolerance.has_value());
+  // Without --tolerance the grid is what will be written, so its files are known before anything is read and a large
+  // one is warned about first.
+  if (!options.tolerance) {
+    countOutputs(f, f.grid.vertices(), f.grid.surfaceTriangles(), solidTriangleCount(f.grid.cols, f.grid.rows));
+    if (f.surfaceVertices > kWarnVertices) warnOfLargeFiles(options, "the output grid", f);
+  }
   clock.lap("inspect");
 
   std::vector<float> grid = readTerrain(options, f, clock);
   f.base = chooseBasePlane(f.lowest, f.highest, options.base, options.zScale, options.scale, options.plinth);
-  Mesh surface = surfaceMesh(grid, f.grid.cols, f.grid.rows, f.extent.widthM, f.extent.heightM, options.zScale,
-                             options.scale, f.base.levelM);
-  release(grid);
-  clock.lap("surface");
+  Surface surface = makeSurface(options, f, std::move(grid), clock);
   // The surface and the solid, which starts with a copy of it, are both held from here until the PLY is written: at
   // the 25,000,000-vertex limit about 1.8 GB. The solid goes once the STL is written, before Blender starts, which
   // needs memory of its own (blenderMemory).
-  Mesh solid = solidMesh(surface, f.grid.cols, f.grid.rows, static_cast<float>(f.base.planeZ));
+  Mesh solid = solidFromSurface(surface.mesh, surface.boundary, static_cast<float>(f.base.planeZ));
   clock.lap("solid");
   f.check = checkSolid(solid);
   selfCheck(f.check, f.triangles);
@@ -523,13 +617,13 @@ int run(int argc, char** argv) {
     printPlan(options, outputs, f);
     return demdl::cli::kExitComplete;
   }
-  const auto [low, high] = std::minmax_element(surface.vertices.begin(), surface.vertices.end(),
+  const auto [low, high] = std::minmax_element(surface.mesh.vertices.begin(), surface.mesh.vertices.end(),
                                                [](const Vec3& a, const Vec3& b) { return a.z < b.z; });
   f.surfaceLowZ = low->z;
   f.surfaceHighZ = high->z;
-  writeBinaryPly(surface, outputs.ply, f.extent.widthM * options.scale, f.extent.heightM * options.scale);
-  release(surface.vertices);
-  release(surface.triangles);
+  writeBinaryPly(surface.mesh, outputs.ply, f.extent.widthM * options.scale, f.extent.heightM * options.scale);
+  release(surface.mesh.vertices);
+  release(surface.mesh.triangles);
   clock.lap("write PLY");
   writeBinaryStl(solid, outputs.stl, stlHeader(options, f));
   release(solid.vertices);
