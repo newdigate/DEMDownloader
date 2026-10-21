@@ -118,6 +118,7 @@ add_library(demmesh STATIC
   src/mesh/Resampler.cpp
   src/mesh/Predicates.cpp
   src/mesh/ProfileSimplifier.cpp
+  src/mesh/Simplifier.cpp
   src/mesh/BasePlane.cpp
   src/mesh/SolidMesh.cpp
   src/mesh/AtomicFileWriter.cpp
@@ -126,6 +127,10 @@ add_library(demmesh STATIC
   src/mesh/BlenderRunner.cpp)
 target_link_libraries(demmesh PUBLIC demdl)
 target_compile_options(demmesh PRIVATE -Wall -Wextra)
+# The simplifier's choices hang on comparing errors worked out in double, so it is built without fused multiply-adds,
+# which compilers form by default where the target has them (arm64 always does) and which round differently: the same
+# grid then gives the same TIN on every platform (spec 4.3).
+set_source_files_properties(src/mesh/Simplifier.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 # The Blender scene script (spec 7.1) is compiled into demmesh as the raw string kBlenderScenePy, so that dem2mesh needs
 # no file beside it: it writes the script out for Blender at run time. The configure step reads it, and runs again when
 # it changes. Its text must not hold the raw string's closing delimiter, which would end the string early.
@@ -173,6 +178,7 @@ if(DL_ELEVATION_TESTS)
     tests/test_Resampler.cpp
     tests/test_Predicates.cpp
     tests/test_ProfileSimplifier.cpp
+    tests/test_Simplifier.cpp
     tests/test_BasePlane.cpp
     tests/test_SolidMesh.cpp
     tests/test_MeshWriters.cpp
