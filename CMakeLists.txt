@@ -117,6 +117,7 @@ add_library(demmesh STATIC
   src/mesh/NoDataFill.cpp
   src/mesh/Resampler.cpp
   src/mesh/Predicates.cpp
+  src/mesh/ProfileSimplifier.cpp
   src/mesh/BasePlane.cpp
   src/mesh/SolidMesh.cpp
   src/mesh/AtomicFileWriter.cpp
@@ -171,6 +172,7 @@ if(DL_ELEVATION_TESTS)
     tests/test_NoDataFill.cpp
     tests/test_Resampler.cpp
     tests/test_Predicates.cpp
+    tests/test_ProfileSimplifier.cpp
     tests/test_BasePlane.cpp
     tests/test_SolidMesh.cpp
     tests/test_MeshWriters.cpp
