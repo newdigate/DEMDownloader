@@ -76,7 +76,8 @@ Anti-goals, which would make this a failure even if it ran:
 - C++20, the existing `demmesh` library and its conventions (`CLAUDE.md`). No new
   external dependency: the triangulation is written in-house, which is practical
   because every vertex sits on an integer grid, so orientation and in-circle tests
-  are exact in 64-bit integers for the block sizes used here (section 4.4).
+  are exact in 64-bit integers for chunk sides up to 16,384 cells (the bound is
+  about 29,000; section 4.5).
 - Memory: the window is held once as float32 (1 GB for the whole City) and the
   resampled grid once more; everything else is per block or proportional to the
   output. The dry run states the memory a run will need.
@@ -97,11 +98,11 @@ files, less Blender memory, and full-resolution crops that today's cap refuses.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--tolerance T` | off | simplify to a TIN; T is the largest vertical error allowed at any grid sample, in model units (after `--z-scale` and `--scale`), above 0 |
+| `--tolerance T` | off | simplify to a TIN; T is the largest vertical error allowed at any grid sample, in model units (after `--z-scale` and `--scale`), above 0; there is no default value, the flag is simply absent or given |
 
 T is in model units because that is what the printer can resolve: 0.05 on a
-1:50,000 print is 0.05 mm, which is 2.5 m of terrain. At `--scale 1` the unit is a
-metre. The equivalent in metres, T / (zScale x scale), is printed. Without
+1:50,000 print is 0.05 mm, which is 2.5 m of terrain, and is the value the
+owner's puzzle uses. At `--scale 1` the unit is a metre. The equivalent in metres, T / (zScale x scale), is printed. Without
 `--tolerance` nothing changes.
 
 ### 4.2 Where it sits in the pipeline
@@ -151,9 +152,10 @@ error of the final surface is checked at every sample exactly once.
 Two decisions make it exact and tileable:
 
 - **Integer coordinates.** Vertices are addressed by their grid column and row.
-  Orientation and in-circle predicates are evaluated in exact integer arithmetic.
-  The grid is processed in chunks of at most 1024 x 1024 samples (section 4.5), so
-  the predicates' intermediate values stay far inside 64 bits. No epsilon anywhere.
+  Orientation and in-circle predicates are evaluated in exact integer arithmetic
+  on coordinates local to a chunk. The grid is processed in chunks (section 4.5)
+  whose side never exceeds 16,384 cells, so the in-circle determinant, about
+  12 x side^4, stays inside 64 bits with margin. No epsilon anywhere.
 - **Boundaries first, in one dimension.** Before a chunk's interior is touched,
   each of its four sides is simplified on its own: the profile of heights along
   the side, with the two corners fixed, is reduced to the smallest set of samples
@@ -169,20 +171,25 @@ Left to the builder: the point-location and cavity-retriangulation scheme
 (incremental Delaunay with the boundary as fixed edges, or any equivalent that
 keeps the guarantees of 4.3); the tie rule when several samples share the largest
 error (it must be deterministic, for instance the first in scan order); how the
-heap and the per-triangle sample lists are stored. The plan pins the complexity
-target: the whole City (254 million samples) simplified at 2.5 m within the
-run-time budget of section 7.
+heap and the per-triangle sample lists are stored. Part A's plan pins a run-time
+target, measured rather than enforced: the whole City (254 million samples, sea
+included) simplified at 2.5 m in about five minutes in a Release build on the
+owner's machine, Blender excluded. Section 5.5 gives Part B's.
 
 ### 4.5 Chunks and the whole-window surface
 
-Without `--tile`, the window is still simplified in chunks of at most 1024 x 1024
-samples, laid out from the north-west corner, so memory for the triangulation is
-bounded and the predicates stay exact. Chunks share boundary vertices by
-construction (4.4), so their surfaces join into one sheet over the window: the
-builder merges chunk vertices along shared sides (they are identical samples) and
-keeps the outer boundary as the window's boundary loop, which the solid builder
-uses for its walls. The seams add a few triangles along chunk edges compared with
-one global triangulation; that is accepted.
+The simplifier works on a lattice of chunks: an origin and a chunk size in output
+cells. Without `--tile`, the lattice is 2048 x 2048 cells from the window's
+north-west corner (the last chunks cut short), so memory for the triangulation is
+bounded and the predicates stay exact. With `--tile` (Part B) each block is one
+chunk, so a block's sides are exactly the constraints that make shared edges
+identical; a block side above 16,384 cells is refused before anything is read,
+with a message suggesting a smaller `--tile` or a coarser `--grid`. Chunks share
+boundary vertices by construction (4.4), so their surfaces join into one sheet
+over the window: the builder merges chunk vertices along shared sides (they are
+identical samples) and keeps the outer boundary as the window's boundary loop,
+which the solid builder uses for its walls. The seams add a few triangles along
+chunk edges compared with one global triangulation; that is accepted.
 
 ### 4.6 The solid from a surface with a boundary
 
@@ -249,12 +256,22 @@ each output vertex, the status of the nearest source sample.
   does not punch a hole through a block. (With a crop, a bay whose mouth lies
   outside the window counts as enclosed and is filled; this is accepted and
   documented.)
-- Data that forms a separate piece, Robben Island for instance, is its own part
-  of the footprint and is written in whichever block holds it.
-- A connected piece of footprint smaller than `--min-piece` square model units
-  (1 mm², which is 20 x 20 m at 1:50,000) is dropped and listed, so a few stray
-  cells do not become slivers no printer can make. Pieces are measured after
-  tiling, per block.
+- Before the enclosed test, no-data slits one or two cells wide are closed: the
+  footprint is closed morphologically with a 3 x 3 neighbourhood, so an estuary or
+  vlei joined to the sea by a one-sample channel counts as enclosed and is filled
+  rather than cut as a 10 m slit into the land. Wider channels are real water and
+  stay cut.
+- A **piece** is a 4-connected set of footprint cells (cells sharing an edge).
+  Data that forms a separate piece, Robben Island for instance, is its own part of
+  the footprint and is written in whichever block holds it. Two pieces may touch
+  at a single vertex; the simplifier gives them that one shared vertex and both
+  shells keep it (an STL has no shared vertices anyway, and the PLY keeps one).
+  Such contacts pass the edge check and Blender's; the summary counts them,
+  `corner contacts: N`, so the owner can look at them if a printing service
+  objects.
+- A piece smaller than `--min-piece` square model units (1 mm², which is 50 x
+  50 m or 100 cells at 1:50,000) is dropped and listed, so a few stray cells do not
+  become slivers no printer can make. Pieces are measured after tiling, per block.
 
 Inside the footprint the simplifier of Part A runs with the footprint's outline as
 its boundary. The outline's vertices are the cells' corner samples; straight runs
@@ -271,14 +288,17 @@ the DEM's no-data specifically, so that addition would not change the design.
 
 ### 5.3 Tiles
 
-- The block grid is aligned to the window's north-west corner. A block is
-  `round(SIZE / (scale x dx))` samples wide and `round(SIZE / (scale x dy))`
-  samples tall, where dx and dy are the window's sample spacings in metres (equal
-  for a projected file, different for a geographic one), so each block is as close
-  to SIZE square as the grid allows; the actual block size in metres and model
-  units is printed. Blocks share their boundary samples: a 1000-sample block has
-  1001 vertices across, the last column being the next block's first. The east
-  and south edges may end in blocks cut short.
+- The block grid is aligned to the window's north-west corner and counted in
+  output-grid cells, since those are what the simplifier sees. A block is
+  `round(SIZE / (scale x cellX))` cells wide and `round(SIZE / (scale x cellY))`
+  cells tall, where cellX and cellY are the output grid's cell sizes in metres
+  (the window's extent over grid - 1; at full resolution the sample spacings,
+  equal for a projected file and different for a geographic one), so each block
+  is as close to SIZE square as the grid allows; the actual block size in cells,
+  metres and model units is printed. A block side above 16,384 cells is refused
+  (4.5). Blocks share their boundary vertices: a 1000-cell block has 1001
+  vertices across, the last column being the next block's first. The east and
+  south edges may end in blocks cut short.
 - Blocks are numbered from the north-west, row then column, from 1. Files are
   `STEM_rRR_cCC.stl` with as many digits as the counts need (`cape-town_r03_c05.stl`).
   Each block's STL is in its own local frame: x and y from the block's south-west
@@ -361,8 +381,11 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
 - Part B: a synthetic island file split into 2 x 2 blocks: every block closed and
   outward, shared edges identical, the island's outline on grid lines, the
   enclosed hole filled, the sea absent; the owner's puzzle command on the City
-  writes 146 files, each under the service's limit, Blender's check passes on all,
-  and two neighbouring blocks opened together in Blender show no step.
+  writes about 146 files (the map screens counted squares with any data sample;
+  the cell rule, the slit closing and `--min-piece` may move the count by a few,
+  and the summary's skipped and dropped lines account for each), each under the
+  service's limit, Blender's check passes on all, and two neighbouring blocks
+  opened together in Blender show no step.
 
 ## 8. Where it lives
 
@@ -382,11 +405,17 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
 
 ## 9. Decisions taken on the owner's behalf
 
-- Tolerance in model units, default 0.05 (= 2.5 m at 1:50,000); off unless given.
-- Chunks of 1024 samples; deterministic scan-order tie rule; Douglas and Peucker
-  with vertical distance for the sides.
-- Cells need all four corners for data; enclosed no-data is filled; edge-connected
-  no-data is cut; `--min-piece` 1 mm².
+- Tolerance in model units with no default: off unless given; 0.05 (2.5 m at
+  1:50,000) is the puzzle's value.
+- Chunks of 2048 cells without tiles, the block itself with them, 16,384 cells at
+  most; deterministic scan-order tie rule; Douglas and Peucker with vertical
+  distance for the sides.
+- Cells need all four corners for data; slits of one or two cells are closed;
+  enclosed no-data is filled; edge-connected no-data is cut; pieces are
+  4-connected and may touch at a vertex; `--min-piece` 1 mm² (50 x 50 m at
+  1:50,000).
+- Run-time targets of five minutes (Part A, whole City) and ten (Part B, the
+  puzzle, Blender included) in a Release build, measured rather than enforced.
 - Blocks numbered from the north-west, `STEM_rRR_cCC.stl`, local frames, one
   base plane from the whole window's data.
 - The dry run simplifies, so a whole-City dry run costs as much as the run minus
