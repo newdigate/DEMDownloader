@@ -97,6 +97,7 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   BoundingBox crop;
   std::string gridArg;
   double base = 0;
+  double tolerance = 0;
   std::string blender;
   app.add_option("-i,--input", input, "GeoTIFF elevation model to read")
       ->type_name("PATH")
@@ -150,6 +151,11 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   app.add_option("--plinth", options.plinth,
                  "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)")
       ->check(decimal);
+  CLI::Option* const toleranceOption =
+      app.add_option("--tolerance", tolerance,
+                     "simplify the mesh to a TIN whose vertical error at any grid sample is at most FLOAT model units "
+                     "(after --z-scale and --scale), above 0; absent, the full grid is written")
+          ->check(decimal);
   app.add_flag("--no-blend", options.noBlend, "write the STL and PLY only; do not run Blender");
   CLI::Option* const blenderOption =
       app.add_option("--blender", blender,
@@ -175,6 +181,7 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   if (north->count() > 0) options.crop = crop;
   if (gridOption->count() > 0) options.grid = readGrid(gridArg).size;
   if (baseOption->count() > 0) options.base = base;
+  if (toleranceOption->count() > 0) options.tolerance = tolerance;
   if (blenderOption->count() > 0) options.blender = std::filesystem::path(blender);
   return {false, 0};
 }
@@ -197,6 +204,10 @@ std::string validateMeshOptions(const MeshOptions& options) {
   if (options.base && !std::isfinite(*options.base)) return "base must be finite";
   if (!std::isfinite(options.plinth)) return "plinth must be finite";
   if (options.plinth < 0) return "plinth must be zero or positive";
+  if (options.tolerance) {
+    if (!std::isfinite(*options.tolerance)) return "tolerance must be finite";
+    if (!(*options.tolerance > 0)) return "tolerance must be positive";
+  }
   return {};
 }
 

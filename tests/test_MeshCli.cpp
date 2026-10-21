@@ -64,6 +64,7 @@ const std::vector<const char*> kExample = {
     "--base", "-5",
     "--scale", "0.02",
     "--plinth", "3",
+    "--tolerance", "0.05",
     "--no-blend",
     "--blender", "/x/blender",
     "--overwrite",
@@ -145,6 +146,8 @@ TEST_CASE("the example command line fills every MeshOptions field", "[meshcli]")
   CHECK_THAT(*p.options.base, WithinAbs(-5.0, 1e-12));
   CHECK_THAT(p.options.scale, WithinAbs(0.02, 1e-12));
   CHECK_THAT(p.options.plinth, WithinAbs(3.0, 1e-12));
+  REQUIRE(p.options.tolerance.has_value());
+  CHECK_THAT(*p.options.tolerance, WithinAbs(0.05, 1e-12));
   CHECK(p.options.noBlend);
   REQUIRE(p.options.blender.has_value());
   CHECK(*p.options.blender == "/x/blender");
@@ -165,6 +168,7 @@ TEST_CASE("the two required flags alone leave everything else at its default", "
   CHECK_FALSE(p.options.base.has_value());
   CHECK(p.options.scale == 1.0);
   CHECK(p.options.plinth == 2.0);
+  CHECK_FALSE(p.options.tolerance.has_value());
   CHECK_FALSE(p.options.noBlend);
   CHECK_FALSE(p.options.blender.has_value());
   CHECK_FALSE(p.options.overwrite);
@@ -213,8 +217,8 @@ TEST_CASE("the --help flag prints usage and exits successfully", "[meshcli]") {
 TEST_CASE("the help lists every flag", "[meshcli]") {
   const Parsed p = parse({"--help"});
   for (const char* flag : {"--input", "--output", "--north", "--south", "--east", "--west", "--grid", "--z-scale",
-                           "--base", "--scale", "--plinth", "--no-blend", "--blender", "--overwrite", "--dry-run",
-                           "--verbose", "--version"}) {
+                           "--base", "--scale", "--plinth", "--tolerance", "--no-blend", "--blender", "--overwrite",
+                           "--dry-run", "--verbose", "--version"}) {
     CAPTURE(flag);
     CHECK_THAT(p.out, ContainsSubstring(flag));
   }
@@ -229,7 +233,9 @@ TEST_CASE("the help states the ranges and defaults", "[meshcli]") {
            "base plane height in metres before exaggeration, any finite number (default sea level, 0; lowered to the "
            "lowest point when needed)",
            "model units per metre in the STL and PLY, above 0 (default 1; 0.02 makes a 10 km window 200 mm wide)",
-           "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)"}) {
+           "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)",
+           "simplify the mesh to a TIN whose vertical error at any grid sample is at most FLOAT model units (after "
+           "--z-scale and --scale), above 0; absent, the full grid is written"}) {
     CAPTURE(description);
     CHECK_THAT(help, ContainsSubstring(description));
   }
@@ -443,6 +449,49 @@ TEST_CASE("a --plinth of 0 is valid", "[meshcli]") {
   CHECK(validateMeshOptions(p.options).empty());
 }
 
+TEST_CASE("the --tolerance flag takes a positive decimal", "[meshcli]") {
+  const auto [text, expected] = GENERATE(table<const char*, double>(
+      {{"0.05", 0.05}, {"1", 1.0}, {"2.5", 2.5}, {".5", 0.5}, {"5e-2", 0.05}, {"1e-9", 1e-9}, {"1000", 1000.0}}));
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--tolerance", text));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  REQUIRE(p.options.tolerance.has_value());
+  CHECK_THAT(*p.options.tolerance, WithinAbs(expected, 1e-15));
+  CHECK(validateMeshOptions(p.options).empty());
+}
+
+TEST_CASE("a --tolerance of 0 or less parses and validate refuses it", "[meshcli]") {
+  const std::string text = GENERATE(as<std::string>{}, "0", "0.0", "-0", "-1", "-0.05");
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--tolerance", text.c_str()));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  REQUIRE(p.options.tolerance.has_value());
+  CHECK(validateMeshOptions(p.options) == "tolerance must be positive");
+}
+
+TEST_CASE("a --tolerance with a comma or without a value is a usage error naming --tolerance", "[meshcli]") {
+  // CLI11 alone would read "0,05" as 5, a hundred times the tolerance asked for.
+  const Parsed comma = parse(exampleWith("--tolerance", "0,05"));
+  CHECK(comma.outcome.exitNow);
+  CHECK(comma.outcome.exitCode == 1);
+  CHECK_THAT(comma.err, StartsWith("error: --tolerance: must be a decimal number such as -34.1845418"));
+  CHECK_THAT(comma.err, ContainsSubstring(", not '0,05'\n"));
+
+  // Nothing follows the flag to be read as its value.
+  const Parsed last = parse(requiredWith({"--tolerance"}));
+  CHECK(last.outcome.exitNow);
+  CHECK(last.outcome.exitCode == 1);
+  CHECK_THAT(last.err, StartsWith("error: --tolerance: "));
+  CHECK_THAT(last.err, ContainsSubstring("1 required FLOAT missing"));
+
+  // The next flag is taken for the value and refused, so that a forgotten value does not swallow it silently.
+  const Parsed beforeFlag = parse(requiredWith({"--tolerance", "--dry-run"}));
+  CHECK(beforeFlag.outcome.exitNow);
+  CHECK(beforeFlag.outcome.exitCode == 1);
+  CHECK_THAT(beforeFlag.err, StartsWith("error: --tolerance: must be a decimal number"));
+  CHECK_THAT(beforeFlag.err, ContainsSubstring(", not '--dry-run'\n"));
+}
+
 TEST_CASE("the --base flag may be negative, zero or positive", "[meshcli]") {
   const auto [text, expected] = GENERATE(table<const char*, double>({{"-5", -5.0}, {"0", 0.0}, {"1500.5", 1500.5}}));
   CAPTURE(text);
@@ -509,7 +558,7 @@ TEST_CASE("help still wins over a bad crop value", "[meshcli]") {
 
 TEST_CASE("each numeric flag runs the decimal check", "[meshcli]") {
   const std::string flag = GENERATE(as<std::string>{}, "--north", "--south", "--east", "--west", "--z-scale", "--base",
-                                    "--scale", "--plinth");
+                                    "--scale", "--plinth", "--tolerance");
   CAPTURE(flag);
   const Parsed p = parse(exampleWith(flag.c_str(), "1,5"));
   CHECK(p.outcome.exitNow);
@@ -526,6 +575,7 @@ TEST_CASE("a decimal beyond the range of a double parses as infinity and validat
        {"--scale", "-1e999", "scale must be finite"},
        {"--base", "1e999", "base must be finite"},
        {"--plinth", "1e999", "plinth must be finite"},
+       {"--tolerance", "1e999", "tolerance must be finite"},
        {"--north", "1e999", "bounding box values must be finite numbers"}}));
   CAPTURE(flag, value);
   const Parsed p = parse(exampleWith(flag, value));
@@ -702,6 +752,28 @@ TEST_CASE("validate wants a plinth that is zero or positive and finite", "[meshc
   }
 }
 
+TEST_CASE("validate wants a tolerance that is positive and finite, and lets it be absent", "[meshcli]") {
+  MeshOptions options = validOptions();
+  CHECK_FALSE(options.tolerance.has_value());
+  CHECK(validateMeshOptions(options).empty());
+  for (const double ok : {1e-9, 0.05, 2.5, 1e6}) {
+    CAPTURE(ok);
+    options.tolerance = ok;
+    CHECK(validateMeshOptions(options).empty());
+  }
+  for (const double bad : {0.0, -0.0, -0.05, -1e6}) {
+    CAPTURE(bad);
+    options.tolerance = bad;
+    CHECK(validateMeshOptions(options) == "tolerance must be positive");
+  }
+  // NaN is not positive either, and is called what it is.
+  for (const double bad : {kNaN, kInf, -kInf}) {
+    CAPTURE(bad);
+    options.tolerance = bad;
+    CHECK(validateMeshOptions(options) == "tolerance must be finite");
+  }
+}
+
 TEST_CASE("validate returns the first problem in the documented order", "[meshcli]") {
   MeshOptions options = validOptions();
   options.crop = BoundingBox{-34.0, -33.9, 18.5, 18.3};
@@ -710,6 +782,7 @@ TEST_CASE("validate returns the first problem in the documented order", "[meshcl
   options.scale = 0;
   options.base = kNaN;
   options.plinth = -1;
+  options.tolerance = 0;
   CHECK(validateMeshOptions(options) == "north must be greater than south");
   options.crop.reset();
   CHECK(validateMeshOptions(options) == "grid must be at least 2 x 2");
@@ -722,5 +795,7 @@ TEST_CASE("validate returns the first problem in the documented order", "[meshcl
   options.base.reset();
   CHECK(validateMeshOptions(options) == "plinth must be zero or positive");
   options.plinth = 0;
+  CHECK(validateMeshOptions(options) == "tolerance must be positive");
+  options.tolerance = 0.05;
   CHECK(validateMeshOptions(options).empty());
 }

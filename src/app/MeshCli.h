@@ -30,6 +30,7 @@ struct MeshOptions {
   std::optional<double> base;  // metres before exaggeration; nullopt for sea level
   double scale = 1;
   double plinth = 2;
+  std::optional<double> tolerance;  // model units after --z-scale and --scale; nullopt writes the full grid
   bool noBlend = false;
   std::optional<std::filesystem::path> blender;
   bool overwrite = false;
@@ -51,7 +52,7 @@ struct MeshOptions {
 // Empty when the options can be used, otherwise the first problem found, phrased for the user. Checked in this order:
 // the crop box (BoundingBox::validate: finite, in range, north above south, east above west); the grid (at least 2
 // vertices each way, a height of 0 aside); z-scale and scale (finite, then positive); base (finite); plinth (finite,
-// then zero or positive). Pure: it never touches the file system.
+// then zero or positive); tolerance, when given (finite, then positive). Pure: it never touches the file system.
 [[nodiscard]] std::string validateMeshOptions(const MeshOptions& options);
 
 }  // namespace demdl::cli
