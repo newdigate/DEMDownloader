@@ -34,11 +34,12 @@ struct Run {
 // h[last] - h[first] and length is last - first. The same length multiplies every distance in the run, so it changes
 // neither which is the largest nor which are equal; multiplied through, the distance is
 // |(h[k] - h[first]) length - rise (k - first)|, with nothing to divide, and it is compared with tolerance x length.
-// Each product is a statement of its own, so that no compiler can fuse it into the subtraction: a fused multiply-add
-// rounds once where the two operations round twice, and a platform that has one would find other errors, other ties
-// and so other indices than a platform that has not. Where the products are exact (whole-number heights, or any whose
-// differences times the length need 53 bits or fewer, as those of a DEM in metres usually do over a side of a few
-// thousand steps) nothing is rounded at all, and heights that are equally far off compare equal.
+// The build compiles this file with -ffp-contract=off (CMakeLists.txt), so that no compiler fuses a product into the
+// subtraction after it, however the statements are split: a fused multiply-add rounds once where the two operations
+// round twice, and a platform that has one would find other errors, other ties and so other indices than a platform
+// that has not. Where the products are exact (whole-number heights, or any whose differences times the length need 53
+// bits or fewer, as those of a DEM in metres usually do over a side of a few thousand steps) nothing is rounded at all,
+// and heights that are equally far off compare equal.
 std::optional<int> splitIndex(std::span<const float> heights, Run run, double tolerance) {
   const double length = static_cast<double>(run.last - run.first);
   const double base = heights[run.first];

@@ -25,8 +25,8 @@ namespace demdl::mesh {
 //   H (n - 1) / n over the sample beside it, nearly all of H unless n is small, so a spike is kept alone only when the
 //   tolerance is close to H.
 // - The same heights and tolerance give the same indices on every run, and are built to on every platform: the
-//   distances are worked in double without a division, and each product is rounded on its own so that a fused
-//   multiply-add cannot change an answer.
+//   distances are worked in double without a division, and the build turns floating-point contraction off for this
+//   file (-ffp-contract=off, in CMakeLists.txt), so that a fused multiply-add cannot change an answer.
 //
 // The cost is that of Douglas and Peucker's rule: about n log n when each split falls well inside its segment, and
 // O(n^2) when it falls beside an end every time, as in a zigzag growing by one a step, or among many equal heights (the
