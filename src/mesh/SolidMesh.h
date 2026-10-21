@@ -155,4 +155,15 @@ inline constexpr std::uint64_t kMostTrianglesForEdgeCheck = 10'000'000;
 // Throws std::invalid_argument when a triangle names a vertex the mesh does not have.
 [[nodiscard]] MeshCheck checkSolid(const Mesh& mesh);
 
+// How many triangles of a surface do not face up (spec 4.3, 6): those whose normal (b - a) x (c - a), in double from
+// the float coordinates, has z <= 0 or is not a number. That counts a triangle wound clockwise seen from above, one
+// with no area seen from above (its three points in line or on one another, or standing upright), one with a position
+// that is not a number, and one that names a vertex the surface does not have, which faces nowhere; a height that is
+// not a number does not enter z, and is for solidFromSurface to refuse. surfaceMesh and simplifyGrid wind every
+// triangle counter-clockwise seen from above, so a correct surface gives 0. checkSolid cannot tell: it wants every edge
+// paired, every triangle to have an area and the volume above 0, and a top triangle that float rounding has turned
+// over, though still wound the way its neighbours are, upsets none of the three; nor does it upset Blender's check of
+// the STL. This counts triangles, not faults, reads no edge, and cannot throw.
+[[nodiscard]] std::uint64_t downwardFacingTriangles(const Mesh& surface) noexcept;
+
 }  // namespace demdl::mesh

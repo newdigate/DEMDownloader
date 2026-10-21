@@ -407,4 +407,17 @@ MeshCheck checkSolid(const Mesh& mesh) {
   return check;
 }
 
+std::uint64_t downwardFacingTriangles(const Mesh& surface) noexcept {
+  const std::size_t vertexCount = surface.vertices.size();
+  std::uint64_t down = 0;
+  for (const Triangle& t : surface.triangles) {
+    // A triangle that names a vertex the surface lacks faces nowhere, so it counts, where checkSolid would throw:
+    // this is noexcept.
+    const bool named = t.a < vertexCount && t.b < vertexCount && t.c < vertexCount;
+    // Asked this way round so that a normal that is not a number counts as well.
+    if (!named || !(normalOf(surface.vertices[t.a], surface.vertices[t.b], surface.vertices[t.c]).z > 0)) ++down;
+  }
+  return down;
+}
+
 }  // namespace demdl::mesh

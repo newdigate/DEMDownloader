@@ -24,6 +24,7 @@ using demdl::mesh::BasePlane;
 using demdl::mesh::Boundary;
 using demdl::mesh::checkSolid;
 using demdl::mesh::chooseBasePlane;
+using demdl::mesh::downwardFacingTriangles;
 using demdl::mesh::gridBoundary;
 using demdl::mesh::kMostTrianglesForEdgeCheck;
 using demdl::mesh::Mesh;
@@ -676,6 +677,103 @@ TEST_CASE("checkSolid refuses a triangle that names a vertex the mesh does not h
   mesh.triangles = {{0, 1, 2}, {0, 2, 3}};
   REQUIRE_THROWS_MATCHES(checkSolid(mesh), std::invalid_argument,
                          Message("triangle 1 names vertex 3, but the mesh has 3 vertices"));
+}
+
+TEST_CASE("a surface wound counter-clockwise seen from above has no triangle facing down", "[solid]") {
+  // The box's two triangles; rough terrain at print scale, whose cells are cut along one diagonal whatever the heights
+  // are; and the hand-built irregular surface, numbered as its table has it and shuffled.
+  std::mt19937 rng(20261021);
+  CHECK(downwardFacingTriangles(surfaceMesh(Grid(4, 10.0f), 2, 2, 100, 50, 1, 1, 0)) == 0);
+  CHECK(downwardFacingTriangles(surfaceMesh(randomGrid(rng, 40, 30, -40, 1600), 40, 30, 975, 580, 2, 0.02, -40)) == 0);
+  CHECK(downwardFacingTriangles(surfaceMesh(walkGrid(rng, 400, 3, true), 400, 3, 9975, 40, 1, 0.02, 0)) == 0);
+  CHECK(downwardFacingTriangles(irregular().surface) == 0);
+  constexpr std::array<std::uint32_t, 7> shuffled = {4, 0, 6, 2, 5, 1, 3};
+  CHECK(downwardFacingTriangles(irregular(shuffled).surface) == 0);
+  // A surface with no triangle has none facing down.
+  CHECK(downwardFacingTriangles(Mesh{}) == 0);
+}
+
+TEST_CASE("a surface triangle turned over counts, and only it", "[solid]") {
+  // Swapping two corners of a triangle winds it clockwise seen from above, so that it faces down. Each triangle in
+  // turn, of the box, of rough terrain and of the irregular surface.
+  const auto turnEachOver = [](const Mesh& surface) {
+    REQUIRE(downwardFacingTriangles(surface) == 0);
+    for (std::size_t k = 0; k < surface.triangles.size(); ++k) {
+      INFO("triangle " << k << " of " << surface.triangles.size() << " turned over");
+      Mesh turned = surface;
+      std::swap(turned.triangles[k].b, turned.triangles[k].c);
+      CHECK(downwardFacingTriangles(turned) == 1);
+    }
+    // All of them turned over is a surface seen from below: each counts.
+    Mesh inside = surface;
+    for (Triangle& t : inside.triangles) std::swap(t.b, t.c);
+    CHECK(downwardFacingTriangles(inside) == surface.triangles.size());
+  };
+  std::mt19937 rng(20261021);
+  turnEachOver(surfaceMesh(Grid(4, 10.0f), 2, 2, 100, 50, 1, 1, 0));
+  turnEachOver(surfaceMesh(randomGrid(rng, 6, 5, 0, 1000), 6, 5, 125, 80, 1, 0.02, 0));
+  turnEachOver(irregular().surface);
+}
+
+TEST_CASE("a surface triangle with no area seen from above counts", "[solid]") {
+  // The up-facing triangle (0, 1, 2), then one more triangle that has no area seen from above, which alone is counted.
+  struct Case {
+    const char* name;
+    std::array<Vec3, 3> corners;
+  };
+  const std::vector<Case> cases = {
+      {"three points in line, at three heights", {{{20, 20, 5}, {30, 30, 7}, {40, 40, 9}}}},
+      {"two points in line with a third between them", {{{20, 20, 5}, {40, 40, 5}, {30, 30, 5}}}},
+      {"two points one above the other", {{{20, 20, 1}, {20, 20, 9}, {24, 23, 2}}}},
+      {"all three one above another", {{{20, 20, 1}, {20, 20, 5}, {20, 20, 9}}}},
+      {"a wall, upright in the plane x = 20", {{{20, 0, 0}, {20, 5, 0}, {20, 5, 7}}}},
+  };
+  for (const Case& c : cases) {
+    INFO(c.name);
+    Mesh surface;
+    surface.vertices = {{0, 0, 5}, {10, 0, 5}, {0, 10, 5}, c.corners[0], c.corners[1], c.corners[2]};
+    surface.triangles = {{0, 1, 2}, {3, 4, 5}};
+    CHECK(downwardFacingTriangles(surface) == 1);
+  }
+  // A triangle that names one vertex three times is the extreme case.
+  Mesh point;
+  point.vertices = {{0, 0, 5}, {10, 0, 5}, {0, 10, 5}};
+  point.triangles = {{0, 1, 2}, {1, 1, 1}};
+  CHECK(downwardFacingTriangles(point) == 1);
+}
+
+TEST_CASE("a triangle with a position that is not a number counts, one with a height that is not does not", "[solid]") {
+  // A 3 x 2 grid: row 0 is vertices 0, 1, 2 and row 1 is 3, 4, 5, and vertex 1 is in the triangles (0, 4, 1), (1, 4, 5)
+  // and (1, 5, 2).
+  const Mesh grid = surfaceMesh(Grid(6, 10.0f), 3, 2, 100, 50, 1, 1, 0);
+  REQUIRE(grid.triangles.size() == 4);
+  REQUIRE(downwardFacingTriangles(grid) == 0);
+
+  // A normal that is not a number is not above 0, so every triangle that uses the vertex counts.
+  Mesh noEast = grid;
+  noEast.vertices[1].x = kNaN;
+  CHECK(downwardFacingTriangles(noEast) == 3);
+  Mesh noNorth = grid;
+  noNorth.vertices[1].y = kNaN;
+  CHECK(downwardFacingTriangles(noNorth) == 3);
+
+  // A height does not enter the normal's z, which is the triangle's area seen from above, signed: a height that is not
+  // a number is for solidFromSurface to refuse, with the base plane.
+  Mesh noHeight = grid;
+  noHeight.vertices[1].z = kNaN;
+  CHECK(downwardFacingTriangles(noHeight) == 0);
+}
+
+TEST_CASE("a triangle that names a vertex the surface does not have counts", "[solid]") {
+  // A count that cannot throw, so a triangle that is nowhere to be found is one that does not face up.
+  Mesh surface = surfaceMesh(Grid(6, 10.0f), 3, 2, 100, 50, 1, 1, 0);
+  REQUIRE(surface.vertices.size() == 6);
+  surface.triangles.push_back({0, 3, 6});
+  CHECK(downwardFacingTriangles(surface) == 1);
+  surface.triangles.push_back({4294967295U, 3, 4});
+  CHECK(downwardFacingTriangles(surface) == 2);
+  surface.triangles.push_back({0, 4294967295U, 4});
+  CHECK(downwardFacingTriangles(surface) == 3);
 }
 
 TEST_CASE("surfaceMesh refuses a grid or a value it cannot make a surface of", "[solid]") {

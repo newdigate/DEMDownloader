@@ -421,6 +421,10 @@ TEST_CASE("a tolerance writes a simplified solid within it", "[mesh-e2e]") {
   const Finished result = w.run({"--tolerance", "0.5", "--grid", "32x24"});
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
   REQUIRE(result.exitCode() == 0);
+  // The check of the TIN's surface, made before the solid is built on it, found no triangle facing down; a failure would
+  // say "mesh self-check failed" on stderr.
+  CHECK(result.out.find("self-check") == std::string::npos);
+  CHECK(result.err.find("self-check") == std::string::npos);
 
   // The plane collapses, and the dent the fill left in the north-east corner keeps a few triangles more than the box's.
   const Mesh solid = readBinaryStl(w.stl());

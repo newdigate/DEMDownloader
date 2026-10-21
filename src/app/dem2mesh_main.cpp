@@ -330,6 +330,17 @@ void selfCheck(const MeshCheck& check, std::uint64_t expectedTriangles) {
   throw std::runtime_error("mesh self-check failed: " + counts);
 }
 
+// Spec 4.3 and 6: the surface is checked before the solid is built on it, on both paths, so that a bad one is refused
+// as early as possible. checkSolid sees the edges and the total volume, and a top triangle that float rounding has
+// turned over keeps both, so this counts the triangles that do not face up (downwardFacingTriangles). The regular grid
+// cannot fail it, so a failure is a bug in the simplifier, and the message gives the count for a report.
+void checkSurface(const Mesh& surface) {
+  const std::uint64_t down = downwardFacingTriangles(surface);
+  if (down == 0) return;
+  throw std::runtime_error("mesh self-check failed: " + std::to_string(down) +
+                           " surface triangles face down or have no area");
+}
+
 // The STL's 80-byte header names the tool and what was meshed (spec 5.5), the file name last since the header cuts
 // what does not fit, and so never begins "solid", which marks an ASCII STL to some readers.
 std::string stlHeader(const MeshOptions& options, const Facts& f) {
@@ -604,6 +615,7 @@ int run(int argc, char** argv) {
   std::vector<float> grid = readTerrain(options, f, clock);
   f.base = chooseBasePlane(f.lowest, f.highest, options.base, options.zScale, options.scale, options.plinth);
   Surface surface = makeSurface(options, f, std::move(grid), clock);
+  checkSurface(surface.mesh);
   // The surface and the solid, which starts with a copy of it, are both held from here until the PLY is written: at
   // the 25,000,000-vertex limit about 1.8 GB. The solid goes once the STL is written, before Blender starts, which
   // needs memory of its own (blenderMemory).
