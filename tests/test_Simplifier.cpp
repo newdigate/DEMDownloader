@@ -13,6 +13,7 @@
 #include <numbers>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -79,11 +80,12 @@ Grid randomGrid64x48() {
   return randomGrid(rng, 64, 48, 0, 100);
 }
 
-// The 64 x 48 "fractal" grid: three waves, 50 m high over 64 columns, 20 m over 48 rows and 5 m over 16 steps on the
-// diagonal. Its curvature asks for a vertex every few samples at a tolerance of 2 m, so most samples are left out.
-Grid fractalGrid() {
+// The 64 x 48 "fractal" grid, or a grid of another size from the same formula: three waves, 50 m high over 64 columns,
+// 20 m over 48 rows and 5 m over 16 steps on the diagonal. Its curvature asks for a vertex every few samples at a
+// tolerance of 2 m, so most samples are left out.
+Grid fractalGrid(int cols = 64, int rows = 48) {
   constexpr double pi = std::numbers::pi;
-  return makeGrid(64, 48, [](int i, int j) {
+  return makeGrid(cols, rows, [](int i, int j) {
     return 50 * std::sin(2 * pi * i / 64) + 20 * std::sin(2 * pi * j / 48) + 5 * std::sin(2 * pi * (i + j) / 16);
   });
 }
@@ -159,29 +161,54 @@ double turn(double ax, double ay, double bx, double by, double cx, double cy) {
 
 double turn(const Vec3& a, const Vec3& b, const Vec3& c) { return turn(a.x, a.y, b.x, b.y, c.x, c.y); }
 
-// The height of the surface over sample (i, j): the first triangle whose closed area holds the sample's position in the
-// test's frame, by barycentric weights in double that count a point on an edge as inside, and the plane through its
-// three corners there. NaN when no triangle holds it, which is a gap. The frame's coordinates are whole numbers, so
-// the test is exact.
-double surfaceHeightAt(const SimplifiedSurface& s, int cols, int rows, int i, int j) {
-  if (i < 0 || i >= cols || j < 0 || j >= rows) return std::numeric_limits<double>::quiet_NaN();
+// Which triangle holds each sample, sample (i, j) at j cols + i: the first, in the surface's order, whose closed area
+// holds the sample's position in the test's frame, by barycentric weights in double that count a point on an edge as
+// inside; -1 where none does, which is a gap. at[v] is the sample vertex v stands on, and a triangle is tried only on
+// the samples of its bounding box, so that a grid of some size is checked in time. The frame's coordinates are whole
+// numbers, so the test is exact.
+std::vector<std::int64_t> trianglesHolding(const SimplifiedSurface& s, const std::vector<Sample>& at, int cols,
+                                           int rows) {
+  std::vector<std::int64_t> holder(static_cast<std::size_t>(cols) * static_cast<std::size_t>(rows), -1);
+  for (std::size_t t = 0; t < s.surface.triangles.size(); ++t) {
+    const Triangle& tri = s.surface.triangles[t];
+    const Vec3& a = s.surface.vertices.at(tri.a);
+    const Vec3& b = s.surface.vertices.at(tri.b);
+    const Vec3& c = s.surface.vertices.at(tri.c);
+    if (!(turn(a, b, c) > 0)) continue;
+    const Sample& p = at.at(tri.a);
+    const Sample& q = at.at(tri.b);
+    const Sample& r = at.at(tri.c);
+    for (int j = std::min({p.j, q.j, r.j}); j <= std::max({p.j, q.j, r.j}); ++j) {
+      for (int i = std::min({p.i, q.i, r.i}); i <= std::max({p.i, q.i, r.i}); ++i) {
+        std::int64_t& holding = holder[cell(cols, i, j)];
+        const double x = kCellX * i;
+        const double y = kCellY * (rows - 1 - j);
+        if (holding < 0 && turn(x, y, b.x, b.y, c.x, c.y) >= 0 && turn(a.x, a.y, x, y, c.x, c.y) >= 0 &&
+            turn(a.x, a.y, b.x, b.y, x, y) >= 0) {
+          holding = static_cast<std::int64_t>(t);
+        }
+      }
+    }
+  }
+  return holder;
+}
+
+// The height of the surface over sample (i, j): the plane through the corners of the triangle that holds it, as
+// trianglesHolding found it, there. NaN when no triangle holds it.
+double surfaceHeightAt(const SimplifiedSurface& s, const std::vector<std::int64_t>& holder, int cols, int rows, int i,
+                       int j) {
+  const std::int64_t t = holder.at(cell(cols, i, j));
+  if (t < 0) return std::numeric_limits<double>::quiet_NaN();
+  const Triangle& tri = s.surface.triangles[static_cast<std::size_t>(t)];
+  const Vec3& a = s.surface.vertices[tri.a];
+  const Vec3& b = s.surface.vertices[tri.b];
+  const Vec3& c = s.surface.vertices[tri.c];
   const double x = kCellX * i;
   const double y = kCellY * (rows - 1 - j);
-  for (const Triangle& t : s.surface.triangles) {
-    const Vec3& a = s.surface.vertices.at(t.a);
-    const Vec3& b = s.surface.vertices.at(t.b);
-    const Vec3& c = s.surface.vertices.at(t.c);
-    if (x < std::min({a.x, b.x, c.x}) || x > std::max({a.x, b.x, c.x}) || y < std::min({a.y, b.y, c.y}) ||
-        y > std::max({a.y, b.y, c.y})) {
-      continue;
-    }
-    const double area = turn(a, b, c);
-    const double wa = turn(x, y, b.x, b.y, c.x, c.y);
-    const double wb = turn(a.x, a.y, x, y, c.x, c.y);
-    const double wc = turn(a.x, a.y, b.x, b.y, x, y);
-    if (area > 0 && wa >= 0 && wb >= 0 && wc >= 0) return (wa * a.z + wb * b.z + wc * c.z) / area;
-  }
-  return std::numeric_limits<double>::quiet_NaN();
+  const double wa = turn(x, y, b.x, b.y, c.x, c.y);
+  const double wb = turn(a.x, a.y, x, y, c.x, c.y);
+  const double wc = turn(a.x, a.y, b.x, b.y, x, y);
+  return (wa * a.z + wb * b.z + wc * c.z) / turn(a, b, c);
 }
 
 // Whether sample `at` lies on side `side` of the rectangle (0 south, 1 east, 2 north, 3 west), and whether `next`
@@ -304,9 +331,11 @@ void checkGuarantees(const SimplifiedSurface& s, const Grid& g, int cols, int ro
   CHECK(doubledArea == 2.0 * kCellX * (cols - 1) * kCellY * (rows - 1));
   CHECK(std::count(used.begin(), used.end(), false) == 0);
 
+  const std::vector<std::int64_t> holder =
+      problem.empty() ? trianglesHolding(s, sample, cols, rows) : std::vector<std::int64_t>{};
   for (int j = 0; j < rows && problem.empty(); ++j) {
     for (int i = 0; i < cols && problem.empty(); ++i) {
-      const double z = surfaceHeightAt(s, cols, rows, i, j);
+      const double z = surfaceHeightAt(s, holder, cols, rows, i, j);
       const double h = g[cell(cols, i, j)];
       if (!(std::fabs(z - h) <= tol + 1e-6)) {
         problem = "the surface over " + describe({i, j}) + " is at " + std::to_string(z) + ", " +
@@ -327,10 +356,11 @@ void checkGuarantees(const SimplifiedSurface& s, const Grid& g, int cols, int ro
   CHECK(check.ok());
 }
 
-// Says how the sides of the boundary differ from what simplifyProfile keeps of the grid's outer rows and columns at the
-// tolerance, or returns "" when they do not: each row simplified from west to east and each column from north to
-// south, as two chunks must for a side they share to keep the same samples from both. The boundary lists the north
-// side from east to west and the east side from south to north, so their samples are compared reversed.
+// Says how the sides of the boundary of a grid that is one chunk differ from what simplifyProfile keeps of the grid's
+// outer rows and columns at the tolerance, or returns "" when they do not: each row simplified from west to east and
+// each column from north to south, as two chunks must for a side they share to keep the same samples from both. The
+// boundary lists the north side from east to west and the east side from south to north, so their samples are
+// compared reversed.
 std::string sideProblem(const SimplifiedSurface& s, const Grid& g, int cols, int rows, double tol) {
   const auto row = [&](int j) {
     std::vector<float> line;
@@ -392,6 +422,160 @@ std::string delaunayProblem(const SimplifiedSurface& s, int cols, int rows) {
     }
   }
   return "";
+}
+
+// Where the lattice of chunks cuts a run of `cells` cells: every chunkCells cells from the start, and at the end, where
+// the last chunk is cut short. 19 cells in chunks of 8 are cut at 0, 8, 16 and 19.
+std::vector<int> cuts(int cells, int chunkCells) {
+  std::vector<int> at;
+  for (int k = 0; k < cells; k += chunkCells) at.push_back(k);
+  at.push_back(cells);
+  return at;
+}
+
+// A chunk of the lattice simplifyGrid cuts a grid into, chunkCells cells a side from the north-west corner (spec 4.5):
+// the samples from column west to column east and from row north to row south, its sides included. It is chunk (a, b)
+// of the lattice, a counted from the west and b from the north.
+struct Chunk {
+  int a, b;
+  int west, north, east, south;
+};
+
+// The chunks of a grid of cols x rows samples, row by row from the north and along each row from the west, the order
+// simplifyGrid takes them in.
+std::vector<Chunk> latticeOf(int cols, int rows, int chunkCells) {
+  const std::vector<int> across = cuts(cols - 1, chunkCells);
+  const std::vector<int> down = cuts(rows - 1, chunkCells);
+  std::vector<Chunk> chunks;
+  for (std::size_t b = 0; b + 1 < down.size(); ++b) {
+    for (std::size_t a = 0; a + 1 < across.size(); ++a) {
+      chunks.push_back({static_cast<int>(a), static_cast<int>(b), across[a], down[b], across[a + 1], down[b + 1]});
+    }
+  }
+  return chunks;
+}
+
+std::string chunkName(const Chunk& c) { return "chunk (" + std::to_string(c.a) + ", " + std::to_string(c.b) + ")"; }
+
+// Whether chunk c holds sample `at`, on its sides or inside them.
+bool holds(const Chunk& c, const Sample& at) {
+  return c.west <= at.i && at.i <= c.east && c.north <= at.j && at.j <= c.south;
+}
+
+// What the triangles of each chunk have along each of its sides: by chunk, in the order of `chunks`, and by side (0
+// south, 1 east, 2 north, 3 west), the samples their corners stand on there, as "(i, j) (i, j) ...", from west to east
+// along a row and from north to south along a column, whichever way the chunk's outline walks the side. A triangle is
+// the chunk's that holds its three corners; `problem` names a triangle with a corner on no sample, or that no one
+// chunk holds, which crosses a seam.
+struct ChunkSideVertices {
+  std::vector<std::array<std::string, 4>> along;
+  std::string problem;
+};
+
+ChunkSideVertices verticesAlongChunkSides(const SimplifiedSurface& s, int cols, int rows,
+                                          const std::vector<Chunk>& chunks) {
+  ChunkSideVertices found;
+  std::vector<std::array<std::set<int>, 4>> on(chunks.size());  // the columns along a row, the rows along a column
+  for (std::size_t t = 0; t < s.surface.triangles.size() && found.problem.empty(); ++t) {
+    const Triangle& tri = s.surface.triangles[t];
+    const std::array<std::uint32_t, 3> vertex = {tri.a, tri.b, tri.c};
+    std::array<Sample, 3> corner{};
+    for (std::size_t k = 0; k < 3 && found.problem.empty(); ++k) {
+      const std::optional<Sample> at = sampleOf(s.surface.vertices.at(vertex[k]), cols, rows);
+      if (at) {
+        corner[k] = *at;
+      } else {
+        found.problem = "triangle " + std::to_string(t) + " has a corner on no sample";
+      }
+    }
+    if (!found.problem.empty()) break;
+    const auto chunk = std::find_if(chunks.begin(), chunks.end(), [&](const Chunk& c) {
+      return holds(c, corner[0]) && holds(c, corner[1]) && holds(c, corner[2]);
+    });
+    if (chunk == chunks.end()) {
+      found.problem = "triangle " + std::to_string(t) + " of " + describe(corner[0]) + ", " + describe(corner[1]) +
+                      " and " + describe(corner[2]) + " lies in no one chunk";
+      break;
+    }
+    std::array<std::set<int>, 4>& sides = on[static_cast<std::size_t>(chunk - chunks.begin())];
+    for (const Sample& at : corner) {
+      if (at.j == chunk->south) sides[0].insert(at.i);
+      if (at.i == chunk->east) sides[1].insert(at.j);
+      if (at.j == chunk->north) sides[2].insert(at.i);
+      if (at.i == chunk->west) sides[3].insert(at.j);
+    }
+  }
+  found.along.resize(chunks.size());
+  for (std::size_t k = 0; k < chunks.size(); ++k) {
+    const std::array<int, 4> line = {chunks[k].south, chunks[k].east, chunks[k].north, chunks[k].west};
+    for (std::size_t side = 0; side < 4; ++side) {
+      std::string& text = found.along[k][side];
+      for (const int position : on[k][side]) {
+        const Sample at = side % 2 == 0 ? Sample{position, line[side]} : Sample{line[side], position};
+        text += (text.empty() ? "" : " ") + describe(at);
+      }
+    }
+  }
+  return found;
+}
+
+// What simplifyProfile keeps of side `side` of chunk c (0 south, 1 east, 2 north, 3 west) at the tolerance, as "(i, j)
+// (i, j) ...": the side's segment of its row simplified from west to east, or of its column from north to south.
+std::string keptAlong(const Grid& g, int cols, const Chunk& c, std::size_t side, double tol) {
+  const bool alongRow = side % 2 == 0;
+  const int line = std::array{c.south, c.east, c.north, c.west}[side];
+  const int first = alongRow ? c.west : c.north;
+  const int last = alongRow ? c.east : c.south;
+  std::vector<float> heights;
+  for (int k = first; k <= last; ++k) heights.push_back(g[alongRow ? cell(cols, k, line) : cell(cols, line, k)]);
+  std::string kept;
+  for (const int k : simplifyProfile(heights, tol)) {
+    kept += (kept.empty() ? "" : " ") + describe(alongRow ? Sample{first + k, line} : Sample{line, first + k});
+  }
+  return kept;
+}
+
+// Says where the chunks of the lattice do not meet as spec 4.4 and 4.5 have them meet, or returns "" when they do:
+// every triangle lies in one chunk; two chunks that share a side have the very same vertices along it, so that the seam
+// between them closes with no T-junction; and those vertices, like the ones along a side on the window's edge, are the
+// samples simplifyProfile keeps of the side, its segment of a row simplified from west to east and of a column from
+// north to south, whichever way the chunks' outlines walk it.
+std::string chunkSideProblem(const SimplifiedSurface& s, const Grid& g, int cols, int rows, double tol,
+                             int chunkCells) {
+  const std::vector<Chunk> chunks = latticeOf(cols, rows, chunkCells);
+  const ChunkSideVertices found = verticesAlongChunkSides(s, cols, rows, chunks);
+  if (!found.problem.empty()) return found.problem;
+  constexpr std::array<const char*, 4> name = {"south", "east", "north", "west"};
+  const auto across = static_cast<std::size_t>(chunks.back().a) + 1;
+  for (std::size_t k = 0; k < chunks.size(); ++k) {
+    const Chunk& c = chunks[k];
+    // Its east side is the west side of the next chunk along the row, and its south side the north side of the chunk
+    // below it.
+    if (k % across + 1 < across && found.along[k][1] != found.along[k + 1][3]) {
+      return chunkName(c) + " has " + found.along[k][1] + " along its east side, and " + chunkName(chunks[k + 1]) +
+             " has " + found.along[k + 1][3] + " along the same side";
+    }
+    if (k + across < chunks.size() && found.along[k][0] != found.along[k + across][2]) {
+      return chunkName(c) + " has " + found.along[k][0] + " along its south side, and " +
+             chunkName(chunks[k + across]) + " has " + found.along[k + across][2] + " along the same side";
+    }
+    for (std::size_t side = 0; side < 4; ++side) {
+      const std::string kept = keptAlong(g, cols, c, side, tol);
+      if (found.along[k][side] != kept) {
+        return chunkName(c) + " has " + found.along[k][side] + " along its " + name[side] +
+               " side, where the side's profile keeps " + kept;
+      }
+    }
+  }
+  return "";
+}
+
+// Whether a vertex stands on sample (i, j).
+bool isVertexAt(const SimplifiedSurface& s, int cols, int rows, int i, int j) {
+  return std::any_of(s.surface.vertices.begin(), s.surface.vertices.end(), [&](const Vec3& v) {
+    const std::optional<Sample> at = sampleOf(v, cols, rows);
+    return at && at->i == i && at->j == j;
+  });
 }
 
 }  // namespace
@@ -564,23 +748,27 @@ TEST_CASE("grids of two columns or two rows give a box or a ribbon", "[simplify]
   }
 }
 
-TEST_CASE("the same grid and tolerance give the same surface", "[simplify]") {
+TEST_CASE("the same grid, tolerance and chunk size give the same surface", "[simplify]") {
+  // Chunks of another size make another surface, but each size makes the same one every time.
   const Grid fractal = fractalGrid();
-  const SimplifiedSurface first = simplify(fractal, 64, 48, 2);
-  const SimplifiedSurface second = simplify(fractal, 64, 48, 2);
-  REQUIRE(first.surface.vertices.size() == second.surface.vertices.size());
-  REQUIRE(first.surface.triangles.size() == second.surface.triangles.size());
-  for (std::size_t v = 0; v < first.surface.vertices.size(); ++v) {
-    const Vec3& a = first.surface.vertices[v];
-    const Vec3& b = second.surface.vertices[v];
-    CHECK((a.x == b.x && a.y == b.y && a.z == b.z));
+  for (const int chunkCells : {kChunkCells, 16, 7}) {
+    INFO("chunks of " << chunkCells << " cells");
+    const SimplifiedSurface first = simplify(fractal, 64, 48, 2, chunkCells);
+    const SimplifiedSurface second = simplify(fractal, 64, 48, 2, chunkCells);
+    REQUIRE(first.surface.vertices.size() == second.surface.vertices.size());
+    REQUIRE(first.surface.triangles.size() == second.surface.triangles.size());
+    for (std::size_t v = 0; v < first.surface.vertices.size(); ++v) {
+      const Vec3& a = first.surface.vertices[v];
+      const Vec3& b = second.surface.vertices[v];
+      CHECK((a.x == b.x && a.y == b.y && a.z == b.z));
+    }
+    for (std::size_t t = 0; t < first.surface.triangles.size(); ++t) {
+      const Triangle& a = first.surface.triangles[t];
+      const Triangle& b = second.surface.triangles[t];
+      CHECK((a.a == b.a && a.b == b.b && a.c == b.c));
+    }
+    CHECK(first.boundary.sides == second.boundary.sides);
   }
-  for (std::size_t t = 0; t < first.surface.triangles.size(); ++t) {
-    const Triangle& a = first.surface.triangles[t];
-    const Triangle& b = second.surface.triangles[t];
-    CHECK((a.a == b.a && a.b == b.b && a.c == b.c));
-  }
-  CHECK(first.boundary.sides == second.boundary.sides);
 }
 
 TEST_CASE("every side is simplified from west to east or from north to south, whichever way the boundary walks it",
@@ -701,6 +889,171 @@ TEST_CASE("the vertices stand where surfaceMesh puts the same samples, and the t
   CHECK(check.ok());
 }
 
+TEST_CASE("a plane over a lattice of chunks is two triangles a chunk", "[simplify]") {
+  // 20 x 20 samples are 19 cells each way, in chunks of 8, 8 and 3 cells: 3 x 3 chunks. Each chunk's sides are
+  // straight, so they keep their ends, and its interior lies on the plane of its corners, so each chunk is its four
+  // corners and two triangles: the 4 x 4 corners of the lattice, each once, and 9 x 2 triangles. Spec 4.3's two
+  // triangles in all are for a grid that is one chunk; the seams cost the rest (spec 4.5).
+  const Grid plane = makeGrid(20, 20, [](int i, int j) { return 2 * i + 3 * j; });
+  const SimplifiedSurface s = simplify(plane, 20, 20, 0.5, 8);
+  CHECK(s.surface.vertices.size() == 16);
+  CHECK(s.surface.triangles.size() == 18);
+  std::set<std::string> found;
+  for (std::size_t v = 0; v < s.surface.vertices.size(); ++v) found.insert(whereIs(s, v, 20, 20));
+  CHECK(found.size() == s.surface.vertices.size());  // no two vertices on one sample
+  std::set<std::string> lattice;
+  for (const int j : {0, 8, 16, 19}) {
+    for (const int i : {0, 8, 16, 19}) lattice.insert(describe({i, j}));
+  }
+  CHECK(found == lattice);
+  checkGuarantees(s, plane, 20, 20, 0.5);
+  CHECK(chunkSideProblem(s, plane, 20, 20, 0.5, 8) == "");
+}
+
+TEST_CASE("chunks of 16 and 7 cells keep every guarantee across their seams, with at most twice one chunk's vertices",
+          "[simplify]") {
+  // The fractal grid's 63 x 47 cells are 4 x 3 chunks of 16 cells, or 9 x 7 of 7. Every seam closes and the tolerance
+  // holds across it. A seam's profile keeps a sample every few, as the interior around it would have, so the chunks
+  // cost vertices over one triangulation of the whole grid, but fewer than as many again.
+  const Grid fractal = fractalGrid();
+  const std::size_t whole = simplify(fractal, 64, 48, 2).surface.vertices.size();
+  for (const int chunkCells : {16, 7}) {
+    INFO("chunks of " << chunkCells << " cells");
+    const SimplifiedSurface s = simplify(fractal, 64, 48, 2, chunkCells);
+    checkGuarantees(s, fractal, 64, 48, 2);
+    CHECK(chunkSideProblem(s, fractal, 64, 48, 2, chunkCells) == "");
+    CHECK(s.surface.vertices.size() <= 2 * whole);
+  }
+}
+
+TEST_CASE("two chunks that share a side have the same vertices on it, those its profile keeps from the west or north",
+          "[simplify]") {
+  // A 9 x 9 grid in chunks of 4 cells, 2 x 2 of them, with seams along column 4 and row 4. Along every side of every
+  // chunk, shared or on the window's edge, the heights are 0 10 0 10 0, as in the case of one chunk above, and 0
+  // inside. At 9.9 a side keeps its first two samples and its last, counted from the west or the north, and would keep
+  // its first, fourth and last counted from the east or the south. The chunk west of a seam walks it from south to
+  // north and the one east of it from north to south; the chunk north of a seam walks it from west to east and the one
+  // south of it from east to west. Both must have the side as it was simplified once, the fixed way.
+  const Grid lines =
+      makeGrid(9, 9, [](int i, int j) { return (i % 4 == 0 || j % 4 == 0) && (i + j) % 2 == 1 ? 10 : 0; });
+  const SimplifiedSurface s = simplify(lines, 9, 9, 9.9, 4);
+  checkGuarantees(s, lines, 9, 9, 9.9);
+  const ChunkSideVertices found = verticesAlongChunkSides(s, 9, 9, latticeOf(9, 9, 4));
+  REQUIRE(found.problem == "");
+  // Chunks (0, 0), (1, 0), (0, 1) and (1, 1), in that order. Column 4: the east sides of the western chunks and the
+  // west sides of the eastern ones.
+  CHECK(found.along[0][1] == "(4, 0) (4, 1) (4, 4)");
+  CHECK(found.along[1][3] == "(4, 0) (4, 1) (4, 4)");
+  CHECK(found.along[2][1] == "(4, 4) (4, 5) (4, 8)");
+  CHECK(found.along[3][3] == "(4, 4) (4, 5) (4, 8)");
+  // Row 4: the south sides of the northern chunks and the north sides of the southern ones.
+  CHECK(found.along[0][0] == "(0, 4) (1, 4) (4, 4)");
+  CHECK(found.along[2][2] == "(0, 4) (1, 4) (4, 4)");
+  CHECK(found.along[1][0] == "(4, 4) (5, 4) (8, 4)");
+  CHECK(found.along[3][2] == "(4, 4) (5, 4) (8, 4)");
+  CHECK(chunkSideProblem(s, lines, 9, 9, 9.9, 4) == "");
+}
+
+TEST_CASE("a step along a seam and a spike on the corner of four chunks are kept, and the seams stay closed",
+          "[simplify]") {
+  // A flat 20 x 20 grid in chunks of 8 cells, at tolerance 2, with a step of 10 along column 8, the seam between the
+  // first two chunks, from row 0 down to row 8, where it ends in a spike on the corner the first four chunks share:
+  // samples (8, 0) to (8, 8) are 10 and the rest 0. A chunk's corners are always vertices, so the spike and the step's
+  // ends, (8, 0) and (8, 8), are. Each side that runs off the step keeps the sample at its foot, as its profile has
+  // it: the chord from 10 down to 0 over the side's 8 cells passes 8.75 over the first 0, more than over any other and
+  // more than 2, and beyond that the side is flat. That is (8, 9) on the seam below the spike, (7, 8) and (9, 8) on
+  // the seams either side of it, and (7, 0) and (9, 0) on the north edge. The step rises as a wall in both chunks
+  // beside it, and every chunk at the corner rises to the spike; every triangle must still face up, and the solid
+  // close (checkGuarantees).
+  const Grid g = makeGrid(20, 20, [](int i, int j) { return i == 8 && j <= 8 ? 10 : 0; });
+  const SimplifiedSurface s = simplify(g, 20, 20, 2, 8);
+  for (const auto& [i, j] : std::vector<std::pair<int, int>>{{8, 8}, {8, 0}, {8, 9}, {7, 8}, {9, 8}, {7, 0}, {9, 0}}) {
+    INFO("sample " << describe({i, j}));
+    CHECK(isVertexAt(s, 20, 20, i, j));
+  }
+  checkGuarantees(s, g, 20, 20, 2);
+  CHECK(chunkSideProblem(s, g, 20, 20, 2, 8) == "");
+}
+
+TEST_CASE("the vertices come chunk by chunk from the north-west, each chunk's outline before its interior",
+          "[simplify]") {
+  // On a plane in chunks of 8 cells each chunk is its four corners, and the first chunk's come first.
+  const Grid plane = makeGrid(20, 20, [](int i, int j) { return 2 * i + 3 * j; });
+  const SimplifiedSurface flat = simplify(plane, 20, 20, 0.5, 8);
+  REQUIRE(flat.surface.vertices.size() >= 4);
+  std::vector<std::string> firstFour;
+  for (std::size_t v = 0; v < 4; ++v) firstFour.push_back(whereIs(flat, v, 20, 20));
+  std::sort(firstFour.begin(), firstFour.end());
+  CHECK(firstFour == std::vector<std::string>{"(0, 0)", "(0, 8)", "(8, 0)", "(8, 8)"});
+
+  // On the fractal grid in chunks of 16 cells, 4 x 3 of them, a vertex comes with the first chunk that holds its
+  // sample, sides included, the chunks taken row by row from the north and along each row from the west; and of a
+  // chunk's vertices, those on its outline come first. Every chunk brings one at least, its south-east corner.
+  const Grid fractal = fractalGrid();
+  const SimplifiedSurface s = simplify(fractal, 64, 48, 2, 16);
+  const std::vector<Chunk> chunks = latticeOf(64, 48, 16);
+  std::vector<bool> brought(chunks.size(), false);
+  std::string problem;
+  std::size_t current = 0;    // the chunk whose vertices are coming
+  bool inside = false;        // whether its interior's have begun
+  std::size_t interiors = 0;  // vertices inside their chunks, so that the order is put to the test
+  for (std::size_t v = 0; v < s.surface.vertices.size() && problem.empty(); ++v) {
+    const std::optional<Sample> at = sampleOf(s.surface.vertices[v], 64, 48);
+    REQUIRE(at);
+    const auto first = static_cast<std::size_t>(
+        std::find_if(chunks.begin(), chunks.end(), [&](const Chunk& c) { return holds(c, *at); }) - chunks.begin());
+    REQUIRE(first < chunks.size());
+    const Chunk& c = chunks[first];
+    const bool onOutline = at->i == c.west || at->i == c.east || at->j == c.north || at->j == c.south;
+    if (first < current) {
+      problem = "vertex " + std::to_string(v) + " on " + describe(*at) + ", of " + chunkName(c) + ", comes after " +
+                chunkName(chunks[current]) + "'s";
+    } else if (first == current && inside && onOutline) {
+      problem = "vertex " + std::to_string(v) + " on " + describe(*at) + ", on the outline of " + chunkName(c) +
+                ", comes after its interior's";
+    }
+    if (first > current) {
+      current = first;
+      inside = false;
+    }
+    if (!onOutline) {
+      inside = true;
+      ++interiors;
+    }
+    brought[first] = true;
+  }
+  CHECK(problem == "");
+  CHECK(std::count(brought.begin(), brought.end(), false) == 0);
+  CHECK(interiors > 0);
+}
+
+TEST_CASE("a 300 x 300 grid keeps every guarantee as one chunk and in chunks of 64 cells", "[simplify]") {
+  // The fractal formula over 300 x 300 samples, nearly five of its longest waves across: a sanity run on a grid of some
+  // size, as one chunk and as 5 x 5 chunks, the last ones 43 cells.
+  const Grid fractal = fractalGrid(300, 300);
+  for (const int chunkCells : {kChunkCells, 64}) {
+    INFO("chunks of " << chunkCells << " cells");
+    const SimplifiedSurface s = simplify(fractal, 300, 300, 2, chunkCells);
+    checkGuarantees(s, fractal, 300, 300, 2);
+    CHECK(chunkSideProblem(s, fractal, 300, 300, 2, chunkCells) == "");
+  }
+}
+
+TEST_CASE("a grid wider than the largest chunk is simplified chunk by chunk", "[simplify]") {
+  // 16386 x 2 samples are 16385 cells across, one more than the largest chunk the predicates are exact for. Flat, each
+  // chunk is its four corners and two triangles: in chunks of 16384 cells that is two chunks, the second one cell
+  // wide; in the standard chunks of 2048, eight of 2048 cells and a ninth of one.
+  const Grid flat(2 * 16386, 0.0f);
+  const SimplifiedSurface widest = simplify(flat, 16386, 2, 0.5, kMostChunkCells);
+  CHECK(widest.surface.vertices.size() == 6);
+  CHECK(widest.surface.triangles.size() == 4);
+  checkGuarantees(widest, flat, 16386, 2, 0.5);
+  const SimplifiedSurface standard = simplify(flat, 16386, 2, 0.5);
+  CHECK(standard.surface.vertices.size() == 20);
+  CHECK(standard.surface.triangles.size() == 18);
+  checkGuarantees(standard, flat, 16386, 2, 0.5);
+}
+
 TEST_CASE("simplifyGrid refuses a grid, a tolerance, a chunk size or a frame it cannot work with", "[simplify]") {
   constexpr double nan = std::numeric_limits<double>::quiet_NaN();
   constexpr double inf = std::numeric_limits<double>::infinity();
@@ -710,6 +1063,14 @@ TEST_CASE("simplifyGrid refuses a grid, a tolerance, a chunk size or a frame it 
                          Message("the grid must be at least 2 x 2 vertices, not 1 x 7"));
   REQUIRE_THROWS_MATCHES(simplifyGrid(Grid(9, 0.0f), 9, 1, 1, 10, 10, 1, 1, 0), std::invalid_argument,
                          Message("the grid must be at least 2 x 2 vertices, not 9 x 1"));
+  // Every sample may be kept, and vertex numbers are 32 bits with room left for the solid's four bottom corners: a grid
+  // of more samples is refused as surfaceMesh refuses it, before its heights are looked at. One row fewer fits, and
+  // fails on its heights instead.
+  REQUIRE_THROWS_MATCHES(simplifyGrid(Grid{}, 65536, 65536, 1, 10, 10, 1, 1, 0), std::invalid_argument,
+                         Message("a grid of 65536 x 65536 vertices is too large: 32-bit vertex numbers leave room for "
+                                 "4294967292 besides the four bottom corners"));
+  REQUIRE_THROWS_MATCHES(simplifyGrid(Grid{}, 65536, 65535, 1, 10, 10, 1, 1, 0), std::invalid_argument,
+                         Message("a grid of 65536 x 65535 vertices needs 4294901760 heights, not 0"));
   REQUIRE_THROWS_MATCHES(simplifyGrid(Grid(62, 0.0f), 9, 7, 1, 10, 10, 1, 1, 0), std::invalid_argument,
                          Message("a grid of 9 x 7 vertices needs 63 heights, not 62"));
 
@@ -743,9 +1104,4 @@ TEST_CASE("simplifyGrid refuses a grid, a tolerance, a chunk size or a frame it 
   CHECK_THROWS_AS(simplifyGrid(g, 9, 7, 1, 10, 10, -2, 1, 0), std::invalid_argument);
   REQUIRE_THROWS_MATCHES(simplifyGrid(g, 9, 7, 1, 10, 10, 1, 1, nan), std::invalid_argument,
                          Message("the level must be finite, not nan"));
-
-  // Until the grid is cut into a lattice of chunks it is one chunk, and a chunk can be at most 16384 cells a side for
-  // the predicates to be exact: 16386 columns are 16385 cells.
-  REQUIRE_THROWS_MATCHES(simplifyGrid(Grid(2 * 16386, 0.0f), 16386, 2, 1, 10, 10, 1, 1, 0), std::invalid_argument,
-                         Message("a grid of 16386 x 2 vertices is more than one chunk of 16384 cells a side"));
 }

@@ -4,12 +4,16 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,6 +26,9 @@ static_assert(kMostChunkCells <= kMostPredicateCoordinate,
               "a chunk's own coordinates run from 0 to its side, which the predicates must be exact for");
 
 namespace {
+
+// Vertex numbers are 32 bits, and the solid adds its four bottom corners to the surface's vertices.
+constexpr std::uint64_t kMostVertices = std::uint64_t{std::numeric_limits<std::uint32_t>::max()} + 1 - 4;
 
 std::string formatNumber(double value, int digits) {
   char text[40];
@@ -59,11 +66,24 @@ class SurfaceBuilder {
     return static_cast<std::uint32_t>(mesh.vertices.size() - 1);
   }
 
+  // The number of the vertex of sample (column, row) on a chunk's outline. Each chunk that has the sample asks for it,
+  // the two beside a side or the up to four around a corner: the first to ask appends the vertex and the others are
+  // given its number, so that it is in the output once. Only outline samples are held, so the map is no larger than
+  // the samples the chunks' sides keep.
+  std::uint32_t addShared(int column, int row) {
+    const std::uint64_t sample = static_cast<std::uint64_t>(row) * static_cast<std::uint64_t>(grid_.cols) +
+                                 static_cast<std::uint64_t>(column);
+    const auto [found, isNew] = shared_.try_emplace(sample);
+    if (isNew) found->second = add(column, row);
+    return found->second;
+  }
+
   Mesh mesh;
 
  private:
   GridView grid_;
   double widthM_, heightM_, zScale_, scale_, levelM_;
+  std::unordered_map<std::uint64_t, std::uint32_t> shared_;  // by row cols + column, the outline samples' vertices
 };
 
 // The rectangle of samples a chunk covers, its sides included: columns firstColumn to lastColumn and rows firstRow to
@@ -77,7 +97,7 @@ struct ChunkRect {
 // a chunk's outline walks it, and two chunks that share a side keep the same samples on it. The north and south sides
 // are grid columns, the west and east sides grid rows, each from corner to corner.
 struct ChunkSides {
-  std::vector<int> north, south, west, east;
+  std::span<const int> north, south, west, east;
 };
 
 // The columns kept along row `row` from firstColumn to lastColumn, the row simplified from west to east.
@@ -99,6 +119,41 @@ std::vector<int> keptAlongColumn(GridView grid, int column, int firstRow, int la
   for (int& k : kept) k += firstRow;
   return kept;
 }
+
+// The samples each chunk's side keeps, simplified once for the one or two chunks that have the side. A side two chunks
+// share is the same segment of a grid line for both, known by its axis, its line and its range, so both are handed the
+// same samples, which become the same vertices along their common edge. Only the sides' samples are held, and what the
+// cache hands out stays where it is while the cache lives.
+class SideCache {
+ public:
+  SideCache(GridView grid, double toleranceM) : grid_(grid), toleranceM_(toleranceM) {}
+
+  // The columns kept along row `row` from firstColumn to lastColumn, the row simplified from west to east.
+  std::span<const int> alongRow(int row, int firstColumn, int lastColumn) {
+    const auto [side, isNew] = kept_.try_emplace(Side{true, row, firstColumn, lastColumn});
+    if (isNew) side->second = keptAlongRow(grid_, row, firstColumn, lastColumn, toleranceM_);
+    return side->second;
+  }
+
+  // The rows kept along column `column` from firstRow to lastRow, the column simplified from north to south.
+  std::span<const int> alongColumn(int column, int firstRow, int lastRow) {
+    const auto [side, isNew] = kept_.try_emplace(Side{false, column, firstRow, lastRow});
+    if (isNew) side->second = keptAlongColumn(grid_, column, firstRow, lastRow, toleranceM_);
+    return side->second;
+  }
+
+ private:
+  // A side: along a row or a column, which one, and from where to where along it.
+  struct Side {
+    bool alongRow;
+    int line, first, last;
+    auto operator<=>(const Side&) const = default;
+  };
+
+  GridView grid_;
+  double toleranceM_;
+  std::map<Side, std::vector<int>> kept_;  // a map of nodes, so that a side's samples stay where they are
+};
 
 // floor(n / d) for d > 0, which C++'s division, rounding towards zero, is not when n is negative.
 std::int64_t floorDiv(std::int64_t n, std::int64_t d) {
@@ -141,7 +196,8 @@ class ChunkTin {
   // Triangulates the chunk, appends its vertices and triangles to the output and returns its outline, as vertex numbers
   // of the output. The vertices come in the order they are inserted: the corners (south-west, south-east, north-east,
   // north-west, the first vertices of the outline's sides), then the samples the sides keep, side by side in the
-  // outline's order and along each side as the outline walks it, then the interior.
+  // outline's order and along each side as the outline walks it, then the interior. An outline vertex that a chunk
+  // before this one has put in the output already is not put there again.
   Boundary build(const ChunkSides& sides) {
     const std::array<std::uint32_t, 4> corner = {addVertex({0, height_}), addVertex({width_, height_}),
                                                  addVertex({width_, 0}), addVertex({0, 0})};
@@ -246,10 +302,15 @@ class ChunkTin {
     return walks;
   }
 
+  // Adds the vertex of sample p. A sample on the chunk's outline is on a side the chunk beside it has too, with the
+  // same samples kept, or on a corner up to four chunks share, so its vertex goes into the output once, with whichever
+  // chunk reaches it first. A sample inside is the chunk's own.
   std::uint32_t addVertex(GridPoint p) {
     const int column = rect_.firstColumn + p.x;
     const int row = rect_.firstRow + p.y;
-    vertices_.push_back({p, static_cast<double>(grid_.at(column, row)), out_.add(column, row)});
+    const bool onOutline = p.x == 0 || p.x == width_ || p.y == 0 || p.y == height_;
+    const std::uint32_t number = onOutline ? out_.addShared(column, row) : out_.add(column, row);
+    vertices_.push_back({p, static_cast<double>(grid_.at(column, row)), number});
     return static_cast<std::uint32_t>(vertices_.size() - 1);
   }
 
@@ -499,10 +560,19 @@ class ChunkTin {
                                                                                   // outline edge that starts there
 };
 
-// Simplifies one chunk of the grid, the rectangle rect, whose sides keep the samples sides lists: appends its vertices
-// and its triangles to out and returns its outline as vertex numbers of out's mesh.
+// Simplifies one chunk of the grid, the rectangle rect, whose sides keep the samples sides lists: appends its
+// triangles, and those of its vertices out does not have yet, to out, and returns its outline as vertex numbers of
+// out's mesh.
 Boundary simplifyChunk(GridView grid, ChunkRect rect, const ChunkSides& sides, double toleranceM, SurfaceBuilder& out) {
   return ChunkTin(grid, rect, toleranceM, out).build(sides);
+}
+
+// Appends a piece of the window's outline, the side of one chunk on the window's edge, to the side of the window it
+// lies on. A piece after the first starts at the corner where the side so far ends, which the two chunks share and
+// which is listed once.
+void appendPiece(std::vector<std::uint32_t>& side, const std::vector<std::uint32_t>& piece) {
+  assert(!piece.empty() && (side.empty() || side.back() == piece.front()) && "neighbouring chunks share a corner");
+  side.insert(side.end(), piece.begin() + (side.empty() ? 0 : 1), piece.end());
 }
 
 }  // namespace
@@ -513,6 +583,13 @@ SimplifiedSurface simplifyGrid(const std::vector<float>& heights, int cols, int 
     throw std::invalid_argument("the grid must be at least 2 x 2 vertices, not " + gridSize(cols, rows));
   }
   const std::uint64_t count = static_cast<std::uint64_t>(cols) * static_cast<std::uint64_t>(rows);
+  // Every sample may be kept, and vertex numbers are 32 bits with room left for the solid's four bottom corners:
+  // judged before heights is looked at, as surfaceMesh judges it, and with its message.
+  if (count > kMostVertices) {
+    throw std::invalid_argument("a grid of " + gridSize(cols, rows) +
+                                " vertices is too large: 32-bit vertex numbers leave room for " +
+                                std::to_string(kMostVertices) + " besides the four bottom corners");
+  }
   if (heights.size() != count) {
     throw std::invalid_argument("a grid of " + gridSize(cols, rows) + " vertices needs " + std::to_string(count) +
                                 " heights, not " + std::to_string(heights.size()));
@@ -535,12 +612,6 @@ SimplifiedSurface simplifyGrid(const std::vector<float>& heights, int cols, int 
                                 formatNumber(zScale, 15) + " and " + formatNumber(scale, 15));
   }
   if (!std::isfinite(levelM)) throw std::invalid_argument("the level must be finite, not " + formatNumber(levelM, 15));
-  // The lattice is one chunk for now, the whole grid, and the predicates are exact only on a chunk of up to
-  // kMostChunkCells cells a side. That also keeps the vertices few enough for 32-bit vertex numbers.
-  if (cols - 1 > kMostChunkCells || rows - 1 > kMostChunkCells) {
-    throw std::invalid_argument("a grid of " + gridSize(cols, rows) + " vertices is more than one chunk of " +
-                                std::to_string(kMostChunkCells) + " cells a side");
-  }
   const GridView grid{heights.data(), cols, rows};
   for (int row = 0; row < rows; ++row) {
     for (int column = 0; column < cols; ++column) {
@@ -551,16 +622,43 @@ SimplifiedSurface simplifyGrid(const std::vector<float>& heights, int cols, int 
     }
   }
 
+  // The lattice (spec 4.5): chunks of chunkCells cells a side from the north-west corner, those in the last column and
+  // the last row of chunks cut short, taken row by row from the north and along each row from the west. A chunk's
+  // sides come from the cache and its outline's vertices from out's shared numbers, so the chunks either side of a
+  // seam meet on the same vertices, each in the output once. Counted so that no int overflows, whatever the grid.
   SurfaceBuilder out(grid, widthM, heightM, zScale, scale, levelM);
-  const ChunkRect whole{0, 0, cols - 1, rows - 1};
-  ChunkSides sides;
-  sides.north = keptAlongRow(grid, 0, 0, cols - 1, toleranceM);
-  sides.south = keptAlongRow(grid, rows - 1, 0, cols - 1, toleranceM);
-  sides.west = keptAlongColumn(grid, 0, 0, rows - 1, toleranceM);
-  sides.east = keptAlongColumn(grid, cols - 1, 0, rows - 1, toleranceM);
+  SideCache sides(grid, toleranceM);
+  const int across = (cols - 2) / chunkCells + 1;
+  const int down = (rows - 2) / chunkCells + 1;
+  std::array<std::vector<std::vector<std::uint32_t>>, 4> pieces;  // the window's sides, by chunk as they come
+  for (int b = 0; b < down; ++b) {
+    const int firstRow = b * chunkCells;
+    const int lastRow = firstRow + std::min(chunkCells, rows - 1 - firstRow);
+    for (int a = 0; a < across; ++a) {
+      const int firstColumn = a * chunkCells;
+      const int lastColumn = firstColumn + std::min(chunkCells, cols - 1 - firstColumn);
+      const ChunkSides chunkSides{sides.alongRow(firstRow, firstColumn, lastColumn),
+                                  sides.alongRow(lastRow, firstColumn, lastColumn),
+                                  sides.alongColumn(firstColumn, firstRow, lastRow),
+                                  sides.alongColumn(lastColumn, firstRow, lastRow)};
+      Boundary outline =
+          simplifyChunk(grid, ChunkRect{firstColumn, firstRow, lastColumn, lastRow}, chunkSides, toleranceM, out);
+      if (b == down - 1) pieces[0].push_back(std::move(outline.sides[0]));
+      if (a == across - 1) pieces[1].push_back(std::move(outline.sides[1]));
+      if (b == 0) pieces[2].push_back(std::move(outline.sides[2]));
+      if (a == 0) pieces[3].push_back(std::move(outline.sides[3]));
+    }
+  }
 
+  // The window's outline is the chunks' sides on its edges, joined at the corners they share. They come from the west
+  // along a row of chunks and from the north down a column, so the east side, which runs from south to north, and the
+  // north side, from east to west, take theirs in reverse.
   SimplifiedSurface result;
-  result.boundary = simplifyChunk(grid, whole, sides, toleranceM, out);
+  auto& [south, east, north, west] = result.boundary.sides;
+  for (auto piece = pieces[0].begin(); piece != pieces[0].end(); ++piece) appendPiece(south, *piece);
+  for (auto piece = pieces[1].rbegin(); piece != pieces[1].rend(); ++piece) appendPiece(east, *piece);
+  for (auto piece = pieces[2].rbegin(); piece != pieces[2].rend(); ++piece) appendPiece(north, *piece);
+  for (auto piece = pieces[3].begin(); piece != pieces[3].end(); ++piece) appendPiece(west, *piece);
   result.surface = std::move(out.mesh);
   result.gridVertices = count;
   result.gridTriangles = 2 * static_cast<std::uint64_t>(cols - 1) * static_cast<std::uint64_t>(rows - 1);
