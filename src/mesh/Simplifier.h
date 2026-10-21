@@ -32,7 +32,9 @@ struct SimplifiedSurface {
 // surface is at most toleranceM above or below it, in the heights' metres, whatever zScale and scale do to them
 // afterwards; the triangles make one sheet, with no overlap, no gap and no vertex left unused; and the same grid,
 // tolerance and chunkCells give the same surface on every run and platform. A plane of any slope comes out as two
-// triangles a chunk, so as its four corners and two triangles when the grid is one chunk.
+// triangles a chunk, so as its four corners and two triangles when the grid is one chunk. The guarantees hold on the
+// heights before the lift to levelM: a levelM above a sample's height lifts that vertex to it and can break them, which
+// dem2mesh never does, its base plane never lifting.
 //
 // How (spec 4.4): each side of a chunk is simplified first, on its own, by simplifyProfile, a row from west to east and
 // a column from north to south whichever way the outline walks it; the samples it keeps are the chunk's boundary

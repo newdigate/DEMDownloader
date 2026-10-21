@@ -119,7 +119,9 @@ takes a surface with an ordered boundary instead of assuming grid topology.
 
 The 25,000,000-vertex cap keeps its meaning, the size of what is written, so with
 `--tolerance` it no longer applies to the grid: the grid may be as large as the
-window, and the dry run prints the two float32 buffers' size as the run's memory.
+window, and the dry run prints the two float32 buffers' size as the plan's
+`memory:` line, which counts those two buffers only; the fill's work lists and a
+large TIN come on top.
 The 4,000,000-vertex warning likewise moves to the simplified output and is
 printed after simplification. A simplified mesh above 25,000,000 vertices is
 refused once it has been simplified, before the solid is built and with nothing
@@ -449,6 +451,10 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
   base plane from the whole window's data.
 - The dry run simplifies, so a whole-City dry run costs as much as the run minus
   the writing.
+- With `--tolerance`, the 25,000,000-vertex limit is applied to the simplified
+  mesh once it has been simplified, with its own message (section 4.2).
+- With `--tolerance`, `summit:` reports the TIN's highest vertex, not the grid's
+  (section 4.7).
 - Whole-area PLY and `.blend` in tile mode; Blender checks all blocks in one
   session.
 - Part A and Part B as two plans in that order.
