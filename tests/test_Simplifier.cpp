@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_exception.hpp>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <array>
@@ -85,6 +86,18 @@ Grid fractalGrid() {
   return makeGrid(64, 48, [](int i, int j) {
     return 50 * std::sin(2 * pi * i / 64) + 20 * std::sin(2 * pi * j / 48) + 5 * std::sin(2 * pi * (i + j) / 16);
   });
+}
+
+// The most this process has held in memory so far, in MB. getrusage counts it in bytes on macOS and in kilobytes on
+// Linux and the BSDs. It only ever rises.
+double peakResidentMB() {
+  rusage usage{};
+  getrusage(RUSAGE_SELF, &usage);
+#if defined(__APPLE__)
+  return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);
+#else
+  return static_cast<double>(usage.ru_maxrss) / 1024.0;
+#endif
 }
 
 // The test's frame: columns kCellX apart and rows kCellY apart in model units, no exaggeration and no scaling, and a
@@ -507,6 +520,28 @@ TEST_CASE("a sample its side's profile drops is never inserted, even where round
   CHECK(s.surface.vertices.size() == 4);
   CHECK(sideSamples(s, 0, 4, 3) == "(0, 2) (3, 2)");
   checkGuarantees(s, edge, 4, 3, 2.0 / 3.0);
+}
+
+TEST_CASE("a long side is built into the outline in memory for its faces alone", "[simplify]") {
+  // A 2 x 2049 ribbon of random heights at tolerance 0, one standard chunk long: both long sides keep every sample.
+  // Inserting the second side's samples one after another, each new one takes over its predecessor's fan of edges
+  // across to the first side, so the outline costs 1024 x 1024 flips, each rewriting two faces. Nothing of them needs
+  // keeping while the outline is built, every face being scanned once it is done; the first version kept a note of
+  // every face it wrote, and peaked 25 MB higher here (98 MB at 2 x 4097, 1.3 GB at 2 x 16385), for a surface of 4098
+  // vertices and 4096 triangles. Without the notes the run grows by about 1 MB. The peak resident set only rises, so
+  // the check sees this run's growth only beyond what the process held before: run on its own, as ctest runs every
+  // case, it sees all of it.
+  std::mt19937 rng(20261021);
+  const Grid noise = randomGrid(rng, 2, 2049, 0, 100);
+  const double before = peakResidentMB();
+  const SimplifiedSurface s = simplify(noise, 2, 2049, 0);
+  const double grewMB = peakResidentMB() - before;
+  CHECK(s.surface.vertices.size() == 4098);
+  CHECK(s.surface.triangles.size() == 4096);
+  CHECK(grewMB < 8);
+  const auto lowest = std::min_element(s.surface.vertices.begin(), s.surface.vertices.end(),
+                                       [](const Vec3& a, const Vec3& b) { return a.z < b.z; });
+  CHECK(checkSolid(solidFromSurface(s.surface, s.boundary, lowest->z - 1.0f)).ok());
 }
 
 TEST_CASE("grids of two columns or two rows give a box or a ribbon", "[simplify]") {

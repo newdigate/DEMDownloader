@@ -153,7 +153,10 @@ class ChunkTin {
 
     // The outline's edges along a side run from its last corner back to its first, the faces turning
     // counter-clockwise for orient2d: so the next sample along the side lies on the outline edge that starts at the
-    // side's last corner.
+    // side's last corner. No face is scanned until the outline is done, when every face is, so the faces each
+    // insertion writes are forgotten as soon as it is legalised: a side inserted after the one opposite it flips each
+    // new sample's fan across to that side, about a quarter of the product of the two sides' samples in all, and
+    // noting every face written would hold two numbers a flip.
     const std::array<std::vector<GridPoint>, 4> walks = outlineWalks(sides);
     Boundary outline;
     for (std::size_t s = 0; s < 4; ++s) {
@@ -167,11 +170,12 @@ class ChunkTin {
         const FaceId f = outlineFrom_[end];
         splitEdge(f, indexOf(faces_[static_cast<std::size_t>(f)], end), p);
         legalise();
+        touched_.clear();
         outline.sides[s].push_back(vertices_[p].number);
       }
       outline.sides[s].push_back(vertices_[end].number);
     }
-    touched_.clear();
+    touched_.clear();  // the four corners' first two faces
 
     for (FaceId f = 0; f < static_cast<FaceId>(faces_.size()); ++f) rescan(f);
     while (!heap_.empty()) {
