@@ -1,6 +1,6 @@
 # dem2mesh: tolerance-driven simplification, land-only footprints and print tiles
 
-Status: draft for the owner's approval, 2026-10-21. Written from the brainstorming
+Status: approved by the owner on 2026-10-21 after a builder check. Written from the brainstorming
 conversation of 2026-10-20 and 2026-10-21, which included two map screens of the
 City at 5 km blocks and the owner's choices on them.
 
