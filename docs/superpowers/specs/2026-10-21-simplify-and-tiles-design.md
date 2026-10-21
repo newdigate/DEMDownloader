@@ -4,6 +4,11 @@ Status: approved by the owner on 2026-10-21 after a builder check. Written from 
 conversation of 2026-10-20 and 2026-10-21, which included two map screens of the
 City at 5 km blocks and the owner's choices on them.
 
+Part A (section 4) was implemented on 2026-10-21 through
+`docs/superpowers/plans/2026-10-21-simplify.md`; Part B (section 5) is pending. The
+whole City at full resolution, simplified at 2.5 m with Blender left out, took 26 s
+in a Release build, against the five minutes that section 4.4 targets.
+
 Builds on `2026-10-19-dem-to-mesh-design.md` (the implemented `dem2mesh`), whose
 rules stand wherever this document is silent.
 
@@ -85,7 +90,7 @@ Anti-goals, which would make this a failure even if it ran:
   triangulation. Blender's memory estimate (0.67 KB per triangle) now applies to
   the whole-area surface, which is small after simplification.
 - The owner builds Debug by default; the whole-City run is the first job for which
-  a Release build matters, and `CLAUDE.md` will say so.
+  a Release build matters, and `CLAUDE.md` says so.
 - The tests stay offline and spawn only the built binaries and, where present,
   the real Blender in the background.
 
@@ -116,8 +121,19 @@ The 25,000,000-vertex cap keeps its meaning, the size of what is written, so wit
 `--tolerance` it no longer applies to the grid: the grid may be as large as the
 window, and the dry run prints the two float32 buffers' size as the run's memory.
 The 4,000,000-vertex warning likewise moves to the simplified output and is
-printed after simplification. (Without `--tolerance` both apply to the grid as
-today.)
+printed after simplification. A simplified mesh above 25,000,000 vertices is
+refused once it has been simplified, before the solid is built and with nothing
+written:
+
+    error: the simplified mesh is N vertices; the limit is 25000000: raise --tolerance, or use --grid or crop
+
+The grid itself is limited to 2,147,483,647 vertices, the most an int holds, which
+keeps both of its sides within an int, and is refused before any pixel is read
+above that:
+
+    error: the output grid is N vertices; with --tolerance the limit is 2147483647: use --grid or crop
+
+(Without `--tolerance` both apply to the grid as today.)
 
 ### 4.3 What the simplifier guarantees
 
@@ -134,9 +150,11 @@ triangulated surface over the grid's rectangle such that:
 - the result is deterministic: the same grid and tolerance give the same
   triangles on every run and platform.
 
-It does not promise the fewest triangles possible, but a plane of any slope must
-come out as its four corners and two triangles, and a grid of random noise with a
-tolerance above the noise's range must do the same.
+It does not promise the fewest triangles possible, but for a grid that fits one
+chunk (section 4.5) a plane of any slope must come out as its four corners and two
+triangles, and a grid of random noise with a tolerance above the noise's range must
+do the same. A larger grid gives two triangles per chunk, since the chunk seams keep
+their sides' vertices, which section 4.5 accepts.
 
 ### 4.4 Algorithm (the decision, with the parts left to the builder)
 
@@ -209,13 +227,24 @@ height), which need no grid. The Blender script changes only in that the STL che
 compares the file's declared count with the import, as it already does; nothing
 depends on the grid formula.
 
-The summary gains one line after `grid:`:
+The summary gains one line after `grid:`, in the format the plan pinned (plain
+integers, like every other count of the summary, and no "in the mesh"), here for
+the Table Mountain crop at `--grid 500 --scale 0.02 --tolerance 0.05`:
 
-    simplify: tolerance 0.05 units (2.5 m), 1,002,001 grid vertices to 61,230 in the mesh, 193,914 triangles to 122,460
+    simplify: tolerance 0.05 units (2.5 m), 255500 grid vertices to 21985, 508980 triangles to 43649
 
-The `solid:` line counts the simplified solid. The dry run simplifies too (it has
-always built and checked the solid), so its counts and sizes are exact; with
-`--verbose` the `time: simplify` line shows the cost.
+The tolerance is shown as given and in the metres of terrain it stands for, to the
+centimetre; the triangles are the surface's, the grid's then the TIN's. The dry
+run's plan puts one more line before it, for the memory of section 4.2 (the sum to
+the nearest megabyte, or from 1,000 MB up in gigabytes to one decimal):
+
+    memory: window 568452 samples and grid 255500 vertices, 4 bytes each: about 3 MB
+
+The `solid:` line counts the simplified solid, and with `--tolerance` the `summit:`
+line gives the highest vertex of the simplified mesh, which the tolerance can leave
+below the grid's summit. The dry run simplifies too (it has always built and checked
+the solid), so its counts and sizes are exact; with `--verbose` the `time: simplify`
+line shows the cost.
 
 ## 5. Part B: footprints and tiles
 
