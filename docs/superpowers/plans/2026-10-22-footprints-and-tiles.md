@@ -414,3 +414,92 @@ Spec 5.5, 7 (Part B), 8, 9; CLAUDE.md.
 - Type consistency: `BlockRect` is defined in Task 2 and consumed by Tasks 3, 4 and 7; `Piece`/`BlockFootprint` by Tasks 4 and 7; `PieceOutline`/`BlockResult`/`BlockSimplifier` (Task 4) by Tasks 5 and 7; `TileLayout`/`BlockSelection` (Task 3) by Task 7; `MeshOptions` fields (Task 6) by Task 7; `BlenderJob::stls` (Task 8) by Task 7's placeholder removal.
 - Review Focus 1 to 5 are pinned in Task 7 (with Tasks 4 and 5 for 2 and 3).
 - Proportion: signatures, test names and assertions, and three algorithm notes (the ear test, the outline walk, the wall winding) that the signatures do not determine; no function bodies.
+
+## Follow-ups deferred at the final review (2026-10-22)
+
+The minors that the task reviews left open, one line each, task by task, as the ledger holds them (line numbers are those the reviewer saw); none changes what `dem2mesh` writes. The whole-branch review's own additions are appended below by the controller.
+
+Task 1, `PolygonTriangulation`:
+
+- Add to the random family a square with many lattice points a side and a scaled sparse-vertex variant.
+- No committed test shows `firstProblem` rejecting a bad triangulation.
+- `PolygonTriangulation.h:42-44`, "for such a polygon the set can miss an ear", reads as "simple" where it means self-crossing.
+- The first ear fill costs about 2x on shapes where the old search found an ear at once (within the stated bound).
+- Outcomes on self-crossing input changed with the ear set (unspecified either way).
+
+Task 2, `Footprint`:
+
+- The random run tests re-derive the unit's own rule: add the shared-stretch check or soften the claim at `test_Footprint.cpp:34-36`.
+- The header should say that `Piece::loop` is in window coordinates, which can exceed the 16,384 predicate bound (`BlockSimplifier` converts to block-local first).
+- `blockFootprint` is about 117 lines.
+- Pin a one-cell block, a one-cell piece and an all-out block.
+
+Task 3, `Tiles`:
+
+- Parameters named `blockCells` shadow the function `blockCells` (`Tiles.cpp:49`, `:72`).
+- Two header sentences are imprecise: `Tiles.h:10-11`, "apart from one division", and `:30`, "under half a cell".
+- The local `quoted` duplicates `CliChecks.h`'s: hoist it into `src/demdl/`.
+- The test helper `tilingProblem` would hang on a zero block side: add a guard.
+- No named 2 x 2 grid case, and argument-fault precedence is tested only for the width before the height.
+
+Task 4, `BlockSimplifier`:
+
+- The header does not forbid mixing window and footprint blocks in one `BlockSimplifier`; a mixed seam would T-junction silently (`dem2mesh` never mixes).
+- The "window blocks equal `simplifyGrid`" test can no longer fail: commit a golden fingerprint of `simplifyGrid` on the fractal.
+- The side cache keeps the interior coast runs that no other block uses.
+- `BlockSimplifier` is not movable: default the moves (`dem2mesh` constructs it in place).
+- No test pins the four-edge re-test in `legaliseAll` (mutant M6 survives).
+- Two checks run on a moved-from vector.
+- `Simplifier.cpp` is 1063 lines and `test_Simplifier.cpp` 2261: the footprint tests could move to their own file.
+- `tracked` is not asserted to be at most 4.
+
+Task 5, `FootprintSolid`:
+
+- `FootprintSolid.h:77-78` says a crossing outline is refused; it is refused only when no ear is left, and the caller must pass a simple polygon.
+- Wrapped messages quote the negated-row frame.
+- `FootprintSolid.cpp` duplicates `SolidMesh.cpp`'s `formatNumber` and plane checks verbatim.
+- The base re-clips the outline the simplifier clipped for its seed: carry the seed's triples in `PieceOutline` if coastal blocks ever dominate (on the City, building, checking and writing the 146 solids took 3.9 s of the 57 s before Blender starts, so they do not).
+- No 3-vertex solid case.
+
+The corner-contact join (the Task 2 fix round):
+
+- A stale comment at `test_Simplifier.cpp:1009`: "touch at a vertex all turn up in the footprint".
+- The multi-round join path is unreachable through `footprintCells` and untested.
+- No test pins that `*joined` is appended to.
+- `Simplifier.cpp:81`, `:275`, `:654` and `:995` still describe touching pieces, now unreachable from `footprintCells`.
+
+Task 6, the flags:
+
+- The comment at `MeshCli.cpp:75-77` says `parseBlocks` puts the flag in front; main does.
+- The empty-text `--blocks` message differs in wording from `parseBlocks`'s form message.
+- The footprint usage-error test does not pin the echoed value, and the "alone and together" case asserts no values.
+
+Task 7, blocks in `dem2mesh`:
+
+- No suite case runs at a scale other than 1, so a lost `* options.scale` in the local frame, the `tiles:` units or `cellAreaUnits2` would pass: add one at `--scale 0.5`.
+- "Refused before anything is read" is asserted only through an empty stdout: add `--verbose` and keep `out.empty()`.
+- The one-block layout is a hand-built aggregate: use designated initialisers or a `wholeGridLayout` helper.
+- First-pass errors carry no block label.
+- The tiled dry run names the PLY twice (`would write:` and `output:`), and a `--footprint data` dry run without `--tile` is uncovered.
+- A test asserts on its own oracle (`test_Dem2MeshEndToEnd.cpp:1628`, where the library's `solidTriangles` is the expectation).
+- `0% land` can print for a tiny kept piece (the City's r02 c06, r12 c13 and r18 c10 do).
+- The grid refusal says "with --tolerance" for a Part B run without it.
+- `dem2mesh_main.cpp` is 1174 lines with pure mesh work (`blockSurface`, `localNumber`, `renumbered`) that belongs in `src/mesh/` with unit tests at a scale other than 1, and its summary and plan builders could move to their own file; `test_Dem2MeshEndToEnd.cpp` is 1830 lines.
+
+Task 8, Blender over every block:
+
+- `makeScene` repeats the first `stl check:` line, which is correct while a success prints exactly one: take the last, or comment the invariant.
+- No `dem2mesh`-level test of a failing tiled Blender run.
+- The script's usage errors and its list validation are untested in the suite.
+- `solid` in `BlenderRunner.cpp:256` should be `stlArgument`.
+- A one-entry list would print "1 files" (never produced).
+- A path with a newline in it cannot be listed (it fails loudly, unguarded).
+- `blenderMemory` sums every block's triangles where spec 5.4 says the whole-area surface; it is conservative (the City's dry run says about 1.2 GB), and the City run did not measure Blender's own peak.
+
+The Part A follow-ups that Part B touched (from the list of `2026-10-21-simplify.md`):
+
+- The side cache and the vertex map are still never evicted. Still open, and negligible at 1000-cell blocks: the City run, which keeps 662,226 vertices and 146 blocks' runs, peaked at 2.29 GB in all.
+- `ChunkTin` was split in Task 4 as far as Part B needed: `Tin` is the shared engine (faces, flips, scan, heap, emission), the number of tracked corners a parameter (4 for a chunk, 0 for a piece) and the outline's samples a bitmap; `ChunkTin` keeps the rectangle's seeding and the new `PieceTin` seeds from `triangulatePolygon`. Done; `Tin` itself still keeps topology, scan and heap together.
+- A chunk of 16,384 cells at a near-zero tolerance needs about 30 GB of working state. Still open, and Part B now allows such blocks: a block side may be 16,384 cells, and `--tile` or `--footprint data` without `--tolerance` simplifies at 0. Bound a block's memory before it starts.
+- `formatNumber` now exists in eight files, not five (Part B added `Footprint.cpp`, `FootprintSolid.cpp` and `Tiles.cpp`), and `FootprintSolid.cpp` repeats `SolidMesh.cpp`'s frame and plane checks. Still open.
+- The spec-citation convention is settled only in the header of `dem2mesh_main.cpp` ("Part B 5.x"); the library headers say "spec 5.x" for the same document.

@@ -5,9 +5,18 @@ conversation of 2026-10-20 and 2026-10-21, which included two map screens of the
 City at 5 km blocks and the owner's choices on them.
 
 Part A (section 4) was implemented on 2026-10-21 through
-`docs/superpowers/plans/2026-10-21-simplify.md`; Part B (section 5) is pending. The
-whole City at full resolution, simplified at 2.5 m with Blender left out, took 26 s
-in a Release build, against the five minutes that section 4.4 targets.
+`docs/superpowers/plans/2026-10-21-simplify.md`. The whole City at full resolution,
+simplified at 2.5 m with Blender left out, took 26 s in a Release build, against the
+five minutes that section 4.4 targets.
+
+Part B (section 5) was implemented on 2026-10-22 through
+`docs/superpowers/plans/2026-10-22-footprints-and-tiles.md`. The owner's puzzle
+command on the whole City took 100 s in a Release build, Blender's check of every
+block included, against the ten minutes that section 5.5 targets, and peaked at
+2.29 GB: it wrote 146 blocks, the largest of 4.0 MB, and Blender found no
+non-manifold edge and no inverted face in any of them (section 5.5). Sections 5.2 to
+5.4 below describe the program as built; section 9 lists what was ruled on the way,
+including the places where it differs from the text this document was approved with.
 
 Builds on `2026-10-19-dem-to-mesh-design.md` (the implemented `dem2mesh`), whose
 rules stand wherever this document is silent.
@@ -250,7 +259,7 @@ line shows the cost.
 
 ## 5. Part B: footprints and tiles
 
-Part B is its own plan and lands after Part A, which it builds on.
+Part B is its own plan and landed after Part A, which it builds on.
 
 ### 5.1 Command line
 
@@ -291,15 +300,26 @@ each output vertex, the status of the nearest source sample.
   footprint is closed morphologically with a 3 x 3 neighbourhood, so an estuary or
   vlei joined to the sea by a one-sample channel counts as enclosed and is filled
   rather than cut as a 10 m slit into the land. Wider channels are real water and
-  stay cut.
+  stay cut. Neighbours outside the output grid count as in for the erosion (and as
+  out for the dilation), so the closing only adds cells and a footprint that
+  reaches the window's edge keeps its edge cells; the consequence is that a strip
+  of no-data one cell deep along the window's edge, such as a column of no-data
+  samples on the edge itself, or a notch of any width one cell deep in it, becomes
+  footprint, with filled heights. A strip two cells deep stays cut.
 - A **piece** is a 4-connected set of footprint cells (cells sharing an edge).
   Data that forms a separate piece, Robben Island for instance, is its own part of
-  the footprint and is written in whichever block holds it. Two pieces may touch
-  at a single vertex; the simplifier gives them that one shared vertex and both
-  shells keep it (an STL has no shared vertices anyway, and the PLY keeps one).
-  Such contacts pass the edge check and Blender's; the summary counts them,
-  `corner contacts: N`, so the owner can look at them if a printing service
-  objects.
+  the footprint and is written in whichever block holds it. Pieces never touch at
+  a vertex: a vertex whose four cells are a diagonal pair in the footprint and a
+  pair out is a corner contact, and it is **joined**, the north-west-most of its
+  two empty cells being added to the footprint and filled like an enclosed hole,
+  with the heights the fill gave it. (Two shells that touched there would stand
+  walls on the same vertical line. An STL has no shared vertices, and a reader
+  that merges corners, as Blender's importer does, reads that line as one edge in
+  four faces, which every checker calls non-manifold and a printing service may
+  refuse; Blender's check reported it. A 5 m cell is 0.1 mm on the print.) The
+  summary counts the joins inside the blocks it writes, `corner contacts: N`; a
+  join on a block side lies in neither block and is counted by none. A chain of
+  pieces touching corner to corner becomes one piece, with a cell at each link.
 - A piece smaller than `--min-piece` square model units (1 mm², which is 50 x
   50 m or 100 cells at 1:50,000) is dropped and listed, so a few stray cells do not
   become slivers no printer can make. Pieces are measured after tiling, per block.
@@ -329,7 +349,10 @@ the DEM's no-data specifically, so that addition would not change the design.
   metres and model units is printed. A block side above 16,384 cells is refused
   (4.5). Blocks share their boundary vertices: a 1000-cell block has 1001
   vertices across, the last column being the next block's first. The east and
-  south edges may end in blocks cut short.
+  south edges may end in blocks cut short. A lattice of more than 10,000 blocks is
+  refused before anything is read, `the lattice is N blocks; the limit is 10000:
+  use a larger --tile`, since a `--tile` of a few cells would otherwise write
+  millions of files; so is a `--blocks` that reaches beyond the lattice.
 - Blocks are numbered from the north-west, row then column, from 1. Files are
   `STEM_rRR_cCC.stl` with as many digits as the counts need (`cape-town_r03_c05.stl`).
   Each block's STL is in its own local frame: x and y from the block's south-west
@@ -340,50 +363,87 @@ the DEM's no-data specifically, so that addition would not change the design.
   include is simplified from the same samples by the same rule in both, so their
   boundary vertices, and hence their walls, are identical; a run only one block
   includes is that block's shoreline. The test that pins this compares the two
-  blocks' vertex lists along every shared side of a synthetic island, byte for
-  byte.
+  blocks' vertices along every shared side of a synthetic island, after undoing
+  the local frames: positions within 1e-3 units and heights exactly. Read back from
+  the City's 146 STLs the same way, all 5,853 vertices along the sides that 243
+  pairs of neighbouring blocks share agree in x, y and z to the last bit
+  (section 5.5).
+- **Tolerance.** Part B's modes run on the block simplifier. `--tile` or
+  `--footprint data` without `--tolerance` therefore simplifies at a tolerance of
+  0, which keeps every sample that is off the plane of its neighbours, and prints
+  `simplify: tolerance 0 units (0 m), ...`; the memory, the warning and the
+  25,000,000 limit of section 4.2 then count the whole-area surface.
 - **One base plane.** The base plane and plinth are chosen once from the whole
-  window's data heights (the footprint's, not the fill's), with today's rule, and
-  every block uses it, so the blocks sit flush. `--base` overrides as today. On the
-  City the lowest data point is -37.9 m, so the plane is about 0.8 mm below sea
-  level plus the plinth; the coast's slab is therefore about the plinth thick.
+  window's data heights, with today's rule, and every block uses it, so the blocks
+  sit flush. (The fill only copies data heights, so the range after it is the
+  data's; a lone data sample outside the footprint, one that makes no cell, still
+  counts, and so it does in the `heights:` and `summit:` lines.) `--base` overrides
+  as today. On the City the lowest data point is -37.9 m, so the plane is about
+  0.8 mm below sea level plus the plinth; the coast's slab is therefore about the
+  plinth thick.
 - **Walls and base of a footprint block.** The surface's boundary loops (one per
   piece) are known. Each boundary edge becomes a wall quad, two triangles from the
   edge down to the base plane. The base is the footprint polygon at the base
   plane, triangulated over the same boundary vertices (ear clipping or a
   constrained triangulation, builder's choice) and wound to face down. No
   T-junctions arise because every boundary vertex has its base counterpart. The
-  rectangle's two-triangle base and monotone walls of Part A remain for
-  `--footprint window` without tiles; a tiled or data-footprint block uses the
-  polygon construction.
+  rectangle's two-triangle base and monotone walls of Part A remain for every
+  block of `--footprint window`, tiled or not; a `--footprint data` block uses the
+  polygon construction, a file without no-data included: its one piece is the whole
+  window, whose surface is the one `--footprint window` makes (the PLYs are byte
+  for byte equal up to 2048 cells a side, where the window path is one chunk too)
+  but whose walls and base are the polygon's.
 - **Not written:** blocks with no footprint, and blocks outside `--blocks`. Both
   are listed in the summary. A block that holds land is always written, however
   little, unless every piece in it falls under `--min-piece`.
 
 ### 5.4 Outputs, Blender and the summary
 
-- Per block: `STEM_rRR_cCC.stl`, written through the atomic writer as today.
+- Per block: `STEM_rRR_cCC.stl`, written through the atomic writer as today. Without
+  `--tile` a footprint is one block and writes `STEM.stl`.
 - For the whole area: `STEM.ply`, the union of the blocks' surfaces in the global
   frame (shared vertices merged, which is exact since they are identical samples),
   with planar UVs over the whole window; and `STEM.blend` built from it, so one
-  scene previews the assembled puzzle. `--no-blend` skips both. The size warning
-  and Blender's memory estimate apply to this whole-area surface.
+  scene previews the assembled puzzle. `--no-blend` skips the `.blend` and
+  Blender's check, as today; the PLY is always written. With `--blocks` the whole
+  area is the selected blocks'. The size warning counts this whole-area surface.
+  Blender's memory estimate is worked out from the triangles of all the blocks'
+  solids added together, which over-states the peak, since Blender imports one
+  block at a time.
+- **Two passes.** Every selected block that holds land is simplified first, in
+  lattice order, into the one surface of the whole area. That surface is then
+  counted, limited and warned about as section 4.2 says, so the 25,000,000
+  refusal and the 4,000,000 warning come before anything is written. Only then is
+  each block's solid built, checked and written, one at a time, and the PLY last.
+  A run with no block to write is an error, `no selected block has land to write:
+  ...` (`the footprint has nothing to write: ...` without `--tile`), raised
+  before anything is written.
 - Blender's STL check runs over every block file in one Blender session: the job
   passes a list file of STL paths, the script imports each into an empty scene in
-  turn, and prints one line, `stl check: 146 files, 12,345,678 triangles, 0
-  non-manifold edges, 0 inverted faces`, failing on the first bad file with its
-  name. `dem2mesh` repeats that line as its last.
-- Summary: `input:`, `crop:`, `window:`, `grid:`, `simplify:` (totals), `heights:`,
-  `summit:`, `base:`, then `tiles: 13 x 20 blocks of 1000 x 1000 samples (5,000 x
-  5,000 m, 100 x 100 mm); 146 with land, 114 without, 32 cut short at the east or
-  south edge`, then one line per written block, `block r03 c05: 72% land, 184,220
-  triangles, 9.2 MB, cape-town_r03_c05.stl`, then `skipped: no land in r01 c05,
-  r01 c06, ...` and `dropped pieces:` when any, then the `wrote:` lines for the
-  PLY and `.blend` and Blender's check. The dry run prints the same with `would
-  write` and no files.
-- With `--overwrite`, existing block files are replaced; an existing block file
-  that this run would not write (a block that no longer has land, after a change
-  of crop or tolerance) is left alone and named in a `stale:` line.
+  turn, and prints one line, `stl check: 146 files, 1492328 triangles, 0
+  non-manifold edges, 0 inverted faces` (the totals, as plain integers), failing
+  on the first bad file with `stl check: <path> failed` and then that file's own
+  lines. `dem2mesh` repeats that line as its last. A single STL, tiled or not, is
+  checked in the plain form.
+- Summary: `input:`, `crop:`, `window:`, `grid:`, `simplify:` (the whole-area
+  surface's totals), `heights:`, `summit:`, `base:`, then with `--tile` `tiles: 13 x
+  20 blocks of 1000 x 1000 cells (5000 x 5000 m, 100 x 100 units); 146 with land,
+  114 without, 32 cut short at the east or south edge`, then one line per written
+  block, `block r14 c13: 74% land, 80022 triangles, 4.0 MB, cape-town_r14_c13.stl`,
+  then `skipped: no land in r01 c01, r01 c05, ...` and `not selected: ...` when
+  any. Each block is in exactly one of written, skipped (selected, with no piece
+  kept) and not selected (outside `--blocks`, with land or without), and `tiles:`
+  counts the whole lattice, selected or not. Without `--tile`, `footprint: 84% of
+  the window, 1 piece` takes the place of those lines. Then `dropped pieces:`,
+  `corner contacts: N` and `stale:` when any, `solid:`, the `wrote:` lines for every
+  STL in lattice order and then the PLY, and the `.blend` and Blender's check. The
+  dry run prints the same with `would write` and no files.
+- Without `--overwrite`, any block file of the lattice that exists is refused
+  before anything is read, whether or not this run would write it, since which
+  blocks hold land is known only after reading. With `--overwrite`, existing block
+  files are replaced; the file of a selected block that no longer has land, after
+  a change of crop, tolerance or `--min-piece`, is left alone and named in a
+  `stale:` line. The files of blocks outside `--blocks` are not named.
 
 ### 5.5 Memory and time for the whole City
 
@@ -392,6 +452,20 @@ blocks one at a time; the whole-area surface for the PLY accumulates in memory
 (order of a few hundred MB at 2.5 m). Target on the owner's machine, Release build:
 under ten minutes end to end, Blender included; the plan measures and records it.
 A Debug build may take several times longer and `CLAUDE.md` says so.
+
+Measured on 2026-10-22, with the puzzle command of section 5.1 on the whole City in
+a Release build, Blender included, on a machine that was also running another job
+(its load average was 9): 99.6 s end to end and a maximum resident set of 2.29 GB.
+Reading took 10.9 s, the fill 11.0 s, the resample 5.5 s, the footprint 7.1 s,
+simplifying all the blocks 18.0 s, building, checking and writing the 146 solids
+3.9 s, the PLY 0.5 s and Blender 41.1 s. The whole-area surface has 662,226
+vertices and 1,257,162 triangles, from 254,314,752 and 508,564,290; the 146 STLs
+hold 1,492,328 triangles and 74.6 MB, the largest of them, r14 c13, 4.0 MB, and
+the PLY is 29.6 MB. The dry run, which does everything but write and start
+Blender, took 58 s in one run and 45 s in another, with the same memory. A second
+run with `--no-blend` took 48 s and wrote the same 146 STLs and PLY, byte for byte.
+In the Debug build the r3_c1 tile took 28 s against 4.8 s in Release, to the same
+bytes; the City was not timed in Debug.
 
 ## 6. What stays the same
 
@@ -416,23 +490,37 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
   the cell rule, the slit closing and `--min-piece` may move the count by a few,
   and the summary's skipped and dropped lines account for each), each under the
   service's limit, Blender's check passes on all, and two neighbouring blocks
-  opened together in Blender show no step.
+  opened together in Blender show no step. Run on 2026-10-22 (section 5.5): the
+  command wrote 146 files, as the map screens counted (114 squares without land,
+  32 cut short at the east or south edge), the largest of 4.0 MB; Blender's check
+  passed on all 146 (1,492,328 triangles, 0 non-manifold edges, 0 inverted faces);
+  and the 146 STLs read back agree exactly along every side that neighbours share.
+  Opening two neighbouring blocks together in Blender, which no run has done, is
+  left to the owner's eye, and so is the service's upload limit.
 
 ## 8. Where it lives
 
 - `src/mesh/Predicates.h/.cpp`: exact integer orientation and in-circle.
 - `src/mesh/ProfileSimplifier.h/.cpp`: the one-dimensional rule of 4.4.
-- `src/mesh/Simplifier.h/.cpp`: the greedy TIN over a rectangle or a footprint,
-  with fixed boundary runs; the library function the later terrain project reuses.
-- `src/mesh/Footprint.h/.cpp`: mask to cells, components, enclosed holes, outline
-  loops, `--min-piece`.
-- `src/mesh/Tiles.h/.cpp`: the block grid, shared-side runs, block naming.
-- `src/mesh/SolidMesh`: generalised to a surface with boundary loops; the polygon
-  base and wall quads for footprints.
-- `src/app/MeshCli.cpp`, `src/app/dem2mesh_main.cpp`: the flags, the per-block
-  loop, the summary; `src/mesh/blender_scene.py`: the multi-file check.
-- Two plans: `2026-10-21-simplify.md` (Part A) and, after it lands,
-  `2026-10-21-footprints-and-tiles.md` (Part B).
+- `src/mesh/Simplifier.h/.cpp`: `simplifyGrid` for Part A, and `BlockSimplifier`,
+  the greedy TIN block by block over window blocks or a footprint's pieces, into one
+  surface, with fixed boundary runs; the library function the later terrain project
+  reuses.
+- `src/mesh/PolygonTriangulation.h/.cpp`: exact ear clipping of a simple polygon on
+  grid points, which seeds each piece's TIN and cuts each footprint block's base.
+- `src/mesh/Footprint.h/.cpp`: mask to cells (the four-corner rule, the closing, the
+  enclosed fill and the corner joins) and, per block, the pieces with their outline
+  loops split into runs, `--min-piece` and the joins counted.
+- `src/mesh/Tiles.h/.cpp`: the block lattice, block naming and `--blocks`; the
+  shared-side runs are the footprint's, since they depend on its cells.
+- `src/mesh/SolidMesh`: generalised to a surface with four sides (Part A);
+  `src/mesh/FootprintSolid.h/.cpp`: the wall quads and ear-clipped base of a
+  footprint block's pieces.
+- `src/app/MeshCli.cpp`, `src/app/dem2mesh_main.cpp`: the flags, the two passes over
+  the blocks, the summary; `src/mesh/BlenderRunner.h/.cpp` and
+  `src/mesh/blender_scene.py`: the list of STLs and the multi-file check.
+- Two plans: `2026-10-21-simplify.md` (Part A) and `2026-10-22-footprints-and-tiles.md`
+  (Part B).
 
 ## 9. Decisions taken on the owner's behalf
 
@@ -443,8 +531,8 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
   distance for the sides.
 - Cells need all four corners for data; slits of one or two cells are closed;
   enclosed no-data is filled; edge-connected no-data is cut; pieces are
-  4-connected and may touch at a vertex; `--min-piece` 1 mm² (50 x 50 m at
-  1:50,000).
+  4-connected, and two that would touch at a vertex are joined (below);
+  `--min-piece` 1 mm² (50 x 50 m at 1:50,000).
 - Run-time targets of five minutes (Part A, whole City) and ten (Part B, the
   puzzle, Blender included) in a Release build, measured rather than enforced.
 - Blocks numbered from the north-west, `STEM_rRR_cCC.stl`, local frames, one
@@ -458,3 +546,44 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
 - Whole-area PLY and `.blend` in tile mode; Blender checks all blocks in one
   session.
 - Part A and Part B as two plans in that order.
+
+Decided while Part B was built (2026-10-22): the five deviations of its plan, then
+the rulings made on the way.
+
+- Counts print as plain integers and sizes in "units", like every other line of the
+  summary: `block r14 c13: 74% land, 80022 triangles, 4.0 MB, cape-town_r14_c13.stl`
+  and `tiles: ... (5000 x 5000 m, 100 x 100 units)`; the commas and "mm" of the
+  first draft of section 5.4 were illustrative (deviation 1).
+- Without `--tile`, `--footprint data` runs the window as one block, so a window
+  above 16,384 cells a side is refused, `the window is W x H cells; a footprint
+  without --tile is limited to 16384 a side: use --tile or --grid`; the puzzle uses
+  `--tile` (deviation 2).
+- The cells, their closing and the enclosed test are worked out once for the whole
+  window, not per block, so that two blocks see the same cells along the side they
+  share (deviation 3).
+- Without `--overwrite`, any existing block file of the lattice is refused before
+  anything is read, whether or not this run would write it; with it, `stale:` names
+  the files that selected blocks without land leave behind (deviation 4).
+- The ear clipping that cuts each base also seeds the piece's TIN: one exact
+  algorithm for both, and the outline's edges are hull edges that the legalisation
+  never flips (deviation 5).
+- Corner contacts are joined, not kept: the north-west-most of the two empty cells
+  at a diagonal contact is added to the footprint and filled like an enclosed hole
+  (section 5.2). Kept, two shells share a vertical edge that the STL round trip
+  makes non-manifold, as Blender's check showed; the approved text's claim that
+  such contacts "pass the edge check and Blender's" was wrong. A 5 m bridge cell is
+  0.1 mm on the print. `corner contacts: N` counts the joins inside written blocks.
+- The 3 x 3 closing treats neighbours outside the grid as in for the erosion, so a
+  strip of no-data one cell deep along the window's edge becomes footprint.
+- `--tile` or `--footprint data` without `--tolerance` simplifies at a tolerance of
+  0 and prints `simplify: tolerance 0 units (0 m), ...` (section 5.3).
+- A lattice of more than 10,000 blocks is refused before anything is read, and so is
+  a `--blocks` that reaches beyond the lattice. `--blocks` accepts leading zeros
+  (`03:05`), since the block names carry them.
+- Every selected block is simplified before any is written, so the 25,000,000
+  refusal and the 4,000,000 warning on the whole-area surface come before anything
+  is written; a run with no block to write is an error (section 5.4).
+- `--footprint data` on a file without no-data gives the window as one piece, with
+  the window's own surface.
+- `stale:` names only the files of selected blocks that now have no land; `not
+  selected:` lists every block outside `--blocks`, with land or without.
