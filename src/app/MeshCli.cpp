@@ -169,7 +169,8 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   CLI::Option* const toleranceOption =
       app.add_option("--tolerance", tolerance,
                      "simplify the mesh to a TIN whose vertical error at any grid sample is at most FLOAT model units "
-                     "(after --z-scale and --scale), above 0; absent, the full grid is written")
+                     "(after --z-scale and --scale), above 0; absent, the full grid is written, or with --tile or "
+                     "--footprint data simplified at 0")
           ->check(decimal);
   // The type names are the forms of the spec's table, and the descriptions of --tile and --min-piece refer to SIZE and
   // A by them.

@@ -60,15 +60,84 @@ struct GridView {
   float at(int column, int row) const { return rowStart(row)[column]; }
 };
 
+// Thrown by SurfaceBuilder when a block takes more vertices than the vertex limit leaves it; simplifyBlock takes the
+// block back out of the surface and refuses it.
+struct VertexLimitPassed {};
+
 // Where the blocks' vertices go: the surface in model units. Each vertex is placed by surfaceMesh's own expressions,
 // operation for operation, so that it lands on the very floats the full grid's vertex at that sample would.
+//
+// The vertex limit, mostVertices: a block is stopped, with VertexLimitPassed, as soon as the surface as it was before
+// the block, plus the vertices the block has taken, exceeds the limit plus the samples round the block's edge. What a
+// block takes is each vertex it adds and each vertex of an earlier block it shares, once each. Only the samples on the
+// block's sides can be an earlier block's (blocks meet only along their sides), so the count is never more than that
+// many above the surface's own size, and a block is stopped only once the surface itself is beyond the limit: never
+// one whose surface would end within it.
 class SurfaceBuilder {
  public:
-  SurfaceBuilder(GridView grid, double widthM, double heightM, double zScale, double scale, double levelM)
-      : grid_(grid), widthM_(widthM), heightM_(heightM), zScale_(zScale), scale_(scale), levelM_(levelM) {}
+  SurfaceBuilder(GridView grid, double widthM, double heightM, double zScale, double scale, double levelM,
+                 std::uint64_t mostVertices)
+      : grid_(grid),
+        widthM_(widthM),
+        heightM_(heightM),
+        zScale_(zScale),
+        scale_(scale),
+        levelM_(levelM),
+        mostVertices_(mostVertices) {}
+
+  // Starts a block of width x height cells: from here what it takes is counted against the limit, and dropBlock can
+  // take it back out.
+  void startBlock(int width, int height) {
+    blockStart_ = mesh.vertices.size();
+    trianglesBefore_ = mesh.triangles.size();
+    taken_ = 0;
+    const std::uint64_t edge = 2 * (static_cast<std::uint64_t>(width) + static_cast<std::uint64_t>(height));
+    const std::uint64_t most = std::numeric_limits<std::uint64_t>::max();
+    allowed_ = mostVertices_ > most - edge ? most : mostVertices_ + edge;
+  }
+
+  // Leaves the surface as it was when the block started: its vertices and triangles, and the numbers of the outline
+  // samples it added.
+  void dropBlock() {
+    mesh.vertices.resize(blockStart_);
+    mesh.triangles.resize(trianglesBefore_);
+    std::erase_if(shared_, [this](const auto& entry) { return entry.second >= blockStart_; });
+  }
 
   // Appends the vertex of sample (column, row) and returns its number.
   std::uint32_t add(int column, int row) {
+    take();
+    return append(column, row);
+  }
+
+  // The number of the vertex of sample (column, row) on a block's outline: a chunk's side, or a piece's outline. Each
+  // block or piece that has the sample asks for it, the two beside a side, the up to four around a corner, the two
+  // pieces that touch at a vertex: the first to ask appends the vertex and the others are given its number, so that it
+  // is in the output once. Only outline samples are held, so the map is no larger than the samples the sides and runs
+  // keep. A vertex of an earlier block is taken by this one too; one this block has added already, where two of its
+  // pieces touch, is not taken again.
+  std::uint32_t addShared(int column, int row) {
+    const std::uint64_t sample = static_cast<std::uint64_t>(row) * static_cast<std::uint64_t>(grid_.cols) +
+                                 static_cast<std::uint64_t>(column);
+    if (const auto found = shared_.find(sample); found != shared_.end()) {
+      if (found->second < blockStart_) take();
+      return found->second;
+    }
+    take();
+    const std::uint32_t number = append(column, row);
+    shared_.emplace(sample, number);
+    return number;
+  }
+
+  Mesh mesh;
+
+ private:
+  // Counts a vertex the block takes, and stops the block when the count passes what the limit allows it.
+  void take() {
+    if (static_cast<std::uint64_t>(blockStart_) + ++taken_ > allowed_) throw VertexLimitPassed{};
+  }
+
+  std::uint32_t append(int column, int row) {
     const double x = column * widthM_ / (grid_.cols - 1) * scale_;
     const double y = (grid_.rows - 1 - row) * heightM_ / (grid_.rows - 1) * scale_;
     const double z = std::max(static_cast<double>(grid_.at(column, row)), levelM_) * zScale_ * scale_;
@@ -76,25 +145,13 @@ class SurfaceBuilder {
     return static_cast<std::uint32_t>(mesh.vertices.size() - 1);
   }
 
-  // The number of the vertex of sample (column, row) on a block's outline: a chunk's side, or a piece's outline. Each
-  // block or piece that has the sample asks for it, the two beside a side, the up to four around a corner, the two
-  // pieces that touch at a vertex: the first to ask appends the vertex and the others are given its number, so that it
-  // is in the output once. Only outline samples are held, so the map is no larger than the samples the sides and runs
-  // keep.
-  std::uint32_t addShared(int column, int row) {
-    const std::uint64_t sample = static_cast<std::uint64_t>(row) * static_cast<std::uint64_t>(grid_.cols) +
-                                 static_cast<std::uint64_t>(column);
-    const auto [found, isNew] = shared_.try_emplace(sample);
-    if (isNew) found->second = add(column, row);
-    return found->second;
-  }
-
-  Mesh mesh;
-
- private:
   GridView grid_;
   double widthM_, heightM_, zScale_, scale_, levelM_;
   std::unordered_map<std::uint64_t, std::uint32_t> shared_;  // by row cols + column, the outline samples' vertices
+  std::uint64_t mostVertices_;
+  std::size_t blockStart_ = 0, trianglesBefore_ = 0;  // the surface's vertices and triangles when the block started
+  std::uint64_t taken_ = 0;                           // by the block so far
+  std::uint64_t allowed_ = std::numeric_limits<std::uint64_t>::max();  // the limit plus the block's edge
 };
 
 // The samples a chunk's sides keep, each side as its line was simplified: simplifyProfile settles a tie by the order
@@ -944,25 +1001,29 @@ void appendPiece(std::vector<std::uint32_t>& side, const std::vector<std::uint32
 // What a BlockSimplifier holds between blocks: the grid, the surface so far, and the stretches of grid lines the blocks
 // have simplified, with the vertex numbers of the samples they keep.
 struct BlockSimplifier::State {
-  State(GridView grid, double toleranceM, double widthM, double heightM, double zScale, double scale, double levelM)
+  State(GridView grid, double toleranceM, double widthM, double heightM, double zScale, double scale, double levelM,
+        std::uint64_t mostVertices)
       : grid(grid),
         toleranceM(toleranceM),
-        out(grid, widthM, heightM, zScale, scale, levelM),
+        mostVertices(mostVertices),
+        out(grid, widthM, heightM, zScale, scale, levelM, mostVertices),
         sides(grid, toleranceM) {}
 
   GridView grid;
   double toleranceM;
+  std::uint64_t mostVertices;
   SurfaceBuilder out;
   SideCache sides;
   bool taken = false;  // whether takeSurface has moved the surface out
 };
 
 BlockSimplifier::BlockSimplifier(const std::vector<float>& heights, int cols, int rows, double toleranceM,
-                                 double widthM, double heightM, double zScale, double scale, double levelM) {
+                                 double widthM, double heightM, double zScale, double scale, double levelM,
+                                 std::uint64_t mostVertices) {
   checkGridAndTolerance(heights, cols, rows, toleranceM);
   const GridView grid{heights.data(), cols, rows};
   checkFrameAndHeights(grid, widthM, heightM, zScale, scale, levelM);
-  state_ = std::make_unique<State>(grid, toleranceM, widthM, heightM, zScale, scale, levelM);
+  state_ = std::make_unique<State>(grid, toleranceM, widthM, heightM, zScale, scale, levelM, mostVertices);
 }
 
 BlockSimplifier::~BlockSimplifier() = default;
@@ -984,23 +1045,31 @@ BlockResult BlockSimplifier::simplifyBlock(BlockRect rect, const BlockFootprint*
 
   BlockResult result;
   result.firstTriangle = s.out.mesh.triangles.size();
-  if (footprint == nullptr) {
-    result.rectangle = ChunkTin(s.grid, rect, s.toleranceM, s.out).build(chunkSides(s.sides, rect));
-  } else if (isWholeBlock(*footprint, rect)) {
-    const ChunkSides sides = chunkSides(s.sides, rect);
-    const Boundary rectangle = ChunkTin(s.grid, rect, s.toleranceM, s.out).build(sides);
-    result.pieces.push_back(rectangleOutline(rectangle, sideWalks(sides, rect)));
-  } else if (!footprint->pieces.empty()) {
-    // Every outline sample of the block is marked before the first piece is triangulated, so that a vertex where two
-    // pieces touch is left out of the second's scans as well as the first's.
-    OutlineSamples outline(rect);
-    for (const Piece& piece : footprint->pieces) {
-      for (const GridPoint& p : piece.loop) outline.mark({p.x - rect.firstColumn, p.y - rect.firstRow});
+  s.out.startBlock(rect.lastColumn - rect.firstColumn, rect.lastRow - rect.firstRow);
+  try {
+    if (footprint == nullptr) {
+      result.rectangle = ChunkTin(s.grid, rect, s.toleranceM, s.out).build(chunkSides(s.sides, rect));
+    } else if (isWholeBlock(*footprint, rect)) {
+      const ChunkSides sides = chunkSides(s.sides, rect);
+      const Boundary rectangle = ChunkTin(s.grid, rect, s.toleranceM, s.out).build(sides);
+      result.pieces.push_back(rectangleOutline(rectangle, sideWalks(sides, rect)));
+    } else if (!footprint->pieces.empty()) {
+      // Every outline sample of the block is marked before the first piece is triangulated, so that a vertex where two
+      // pieces touch is left out of the second's scans as well as the first's.
+      OutlineSamples outline(rect);
+      for (const Piece& piece : footprint->pieces) {
+        for (const GridPoint& p : piece.loop) outline.mark({p.x - rect.firstColumn, p.y - rect.firstRow});
+      }
+      for (const Piece& piece : footprint->pieces) {
+        const std::vector<GridPoint> kept = keptOutline(piece, rect, s.sides);
+        result.pieces.push_back(PieceTin(s.grid, rect, s.toleranceM, s.out, outline).build(kept));
+      }
     }
-    for (const Piece& piece : footprint->pieces) {
-      const std::vector<GridPoint> kept = keptOutline(piece, rect, s.sides);
-      result.pieces.push_back(PieceTin(s.grid, rect, s.toleranceM, s.out, outline).build(kept));
-    }
+  } catch (const VertexLimitPassed&) {
+    s.out.dropBlock();
+    const std::string most = std::to_string(s.mostVertices);
+    throw std::runtime_error("the simplified mesh is more than " + most + " vertices; the limit is " + most +
+                             ": raise --tolerance, or use --grid or crop");
   }
   result.triangles = s.out.mesh.triangles.size() - result.firstTriangle;
   return result;
@@ -1014,13 +1083,14 @@ Mesh BlockSimplifier::takeSurface() {
 }
 
 SimplifiedSurface simplifyGrid(const std::vector<float>& heights, int cols, int rows, double toleranceM, double widthM,
-                               double heightM, double zScale, double scale, double levelM, int chunkCells) {
+                               double heightM, double zScale, double scale, double levelM, int chunkCells,
+                               std::uint64_t mostVertices) {
   checkGridAndTolerance(heights, cols, rows, toleranceM);
   if (chunkCells < 1 || chunkCells > kMostChunkCells) {
     throw std::invalid_argument("a chunk must be 1 to " + std::to_string(kMostChunkCells) + " cells a side, not " +
                                 std::to_string(chunkCells));
   }
-  BlockSimplifier simplifier(heights, cols, rows, toleranceM, widthM, heightM, zScale, scale, levelM);
+  BlockSimplifier simplifier(heights, cols, rows, toleranceM, widthM, heightM, zScale, scale, levelM, mostVertices);
 
   // The lattice (spec 4.5): chunks of chunkCells cells a side from the north-west corner, those in the last column and
   // the last row of chunks cut short, taken row by row from the north and along each row from the west, each a window

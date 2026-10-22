@@ -443,6 +443,33 @@ TEST_CASE("a grid of more than 25,000,000 vertices is refused and nothing is wri
   CHECK(std::filesystem::is_empty(w.outDir));
 }
 
+TEST_CASE("in Part B's modes without --tolerance a grid of more than 25,000,000 vertices is refused before reading",
+          "[mesh-e2e]") {
+  // --tile and --footprint data simplify at 0 without --tolerance, which keeps nearly every sample, so the cap on the
+  // grid is the cap on what would be built (the plan's ruling on the cap); the refusal names the flag that lifts it.
+  // Required, not checked: a grid let through would be read and simplified at 0, 30,000,000 vertices of it.
+  const Workspace w;
+  const std::string refusal = "error: the output grid is 30000000 vertices; without --tolerance the limit is "
+                              "25000000: give --tolerance, or use --grid or crop\n";
+  for (const std::vector<std::string>& mode :
+       {std::vector<std::string>{"--footprint", "data", "--tile", "10"}, {"--tile", "10"}, {"--footprint", "data"}}) {
+    std::vector<std::string> args = mode;
+    args.insert(args.end(), {"--grid", "6000x5000"});
+    const Finished run = w.run(args);
+    INFO("stdout:\n" << run.out << "stderr:\n" << run.err);
+    CHECK(run.exitCode() == 1);
+    REQUIRE(run.err == refusal);
+    CHECK(run.out.empty());
+    args.push_back("--dry-run");
+    const Finished dry = w.run(args);
+    INFO("dry run, stdout:\n" << dry.out << "stderr:\n" << dry.err);
+    CHECK(dry.exitCode() == 1);
+    REQUIRE(dry.err == refusal);
+    CHECK(dry.out == "dry run\n");
+  }
+  CHECK(std::filesystem::is_empty(w.outDir));
+}
+
 TEST_CASE("a tolerance writes a simplified solid within it", "[mesh-e2e]") {
   const Workspace w;
   const Finished result = w.run({"--tolerance", "0.5", "--grid", "32x24"});
@@ -566,6 +593,28 @@ TEST_CASE("with a tolerance a grid of more than 2,147,483,647 vertices is refuse
   CHECK(result.exitCode() == 1);
   CHECK(result.err == "error: the output grid is 2500000000 vertices; with --tolerance the limit is 2147483647: use "
                       "--grid or crop\n");
+  CHECK(std::filesystem::is_empty(w.outDir));
+}
+
+TEST_CASE("in Part B's modes --tolerance lifts the grid's limit to 2,147,483,647 vertices, as it does without them",
+          "[mesh-e2e]") {
+  const Workspace w;
+  const Finished result = w.run({"--tile", "10", "--tolerance", "0.5", "--grid", "50000x50000"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 1);
+  CHECK(result.err == "error: the output grid is 2500000000 vertices; with --tolerance the limit is 2147483647: use "
+                      "--grid or crop\n");
+  CHECK(result.out.empty());
+
+  // A grid above 25,000,000 vertices passes the grid's check with the flag and goes on to the lattice, which blocks of
+  // 10 m on cells of about a metre make too large, still before any pixel is read.
+  const Finished lifted =
+      w.run({"--footprint", "data", "--tile", "10", "--tolerance", "0.5", "--grid", "6000x5000", "--dry-run"});
+  INFO("a grid of 30,000,000 vertices with --tolerance, stdout:\n" << lifted.out << "stderr:\n" << lifted.err);
+  CHECK(lifted.exitCode() == 1);
+  CHECK_THAT(lifted.err, StartsWith("error: the lattice is "));
+  CHECK_THAT(lifted.err, EndsWith(" blocks; the limit is 10000: use a larger --tile\n"));
+  CHECK(lifted.out == "dry run\n");
   CHECK(std::filesystem::is_empty(w.outDir));
 }
 

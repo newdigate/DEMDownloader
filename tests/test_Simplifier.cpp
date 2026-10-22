@@ -645,9 +645,11 @@ bool inFootprint(const Flags& cells, int cols, int rows, int i, int j) {
   return false;
 }
 
-// A BlockSimplifier in the test's frame over the grid g of cols x rows heights, which must outlive it.
-BlockSimplifier blockSimplifier(const Grid& g, int cols, int rows, double tolerance) {
-  return {g, cols, rows, tolerance, kCellX * (cols - 1), kCellY * (rows - 1), 1, 1, kLevel};
+// A BlockSimplifier in the test's frame over the grid g of cols x rows heights, which must outlive it, with the vertex
+// limit mostVertices or none.
+BlockSimplifier blockSimplifier(const Grid& g, int cols, int rows, double tolerance,
+                                std::uint64_t mostVertices = std::numeric_limits<std::uint64_t>::max()) {
+  return {g, cols, rows, tolerance, kCellX * (cols - 1), kCellY * (rows - 1), 1, 1, kLevel, mostVertices};
 }
 
 // The lattice of blocks of blockCols x blockRows cells from the north-west corner of a grid of cols x rows samples, the
@@ -2258,4 +2260,130 @@ TEST_CASE("a BlockSimplifier refuses a grid, a tolerance or a frame as simplifyG
                          Message("the window must be wider and taller than 0 m and finite, not 0 x 18 m"));
   REQUIRE_THROWS_MATCHES(BlockSimplifier(g, 9, 7, 1, 10, 10, 1, 1, nan), std::invalid_argument,
                          Message("the level must be finite, not nan"));
+}
+
+// --- The vertex limit (the plan's ruling on the cap) ------------------------------------------------------------------
+
+namespace {
+
+// Whether two surfaces are the same, vertex for vertex and triangle for triangle, in their order.
+bool sameSurface(const Mesh& a, const Mesh& b) {
+  if (a.vertices.size() != b.vertices.size() || a.triangles.size() != b.triangles.size()) return false;
+  for (std::size_t v = 0; v < a.vertices.size(); ++v) {
+    const Vec3& p = a.vertices[v];
+    const Vec3& q = b.vertices[v];
+    if (p.x != q.x || p.y != q.y || p.z != q.z) return false;
+  }
+  for (std::size_t t = 0; t < a.triangles.size(); ++t) {
+    const Triangle& p = a.triangles[t];
+    const Triangle& q = b.triangles[t];
+    if (p.a != q.a || p.b != q.b || p.c != q.c) return false;
+  }
+  return true;
+}
+
+// The refusal of a surface that passes the vertex limit `limit`.
+std::string beyondTheLimit(std::uint64_t limit) {
+  return "the simplified mesh is more than " + std::to_string(limit) + " vertices; the limit is " +
+         std::to_string(limit) + ": raise --tolerance, or use --grid or crop";
+}
+
+}  // namespace
+
+TEST_CASE("a vertex limit stops a surface that passes it, window block or footprint, and leaves the surface as it was",
+          "[simplify]") {
+  // Random heights at a tolerance of 0: nearly every one of the 16 x 12 samples is a vertex, more than the limit of 40
+  // and the 52 samples round the grid's edge, which the stop allows a block besides, for those of them an earlier block
+  // may have put in already.
+  std::mt19937 rng(7);
+  const Grid rough = randomGrid(rng, 16, 12, 0, 100);
+  REQUIRE(simplify(rough, 16, 12, 0).surface.vertices.size() > 40 + 2 * (15 + 11));
+  REQUIRE_THROWS_MATCHES(simplifyGrid(rough, 16, 12, 0, kCellX * 15, kCellY * 11, 1, 1, kLevel, kChunkCells, 40),
+                         std::runtime_error, Message(beyondTheLimit(40)));
+  BlockSimplifier windows = blockSimplifier(rough, 16, 12, 0, 40);
+  REQUIRE_THROWS_MATCHES(windows.simplifyBlock({0, 0, 15, 11}, nullptr), std::runtime_error,
+                         Message(beyondTheLimit(40)));
+  CHECK(windows.surface().vertices.empty());
+  CHECK(windows.surface().triangles.empty());
+
+  // A footprint block's pieces are counted the same way: every cell but a notch of five in the west column, so that the
+  // one piece is not its whole block and is triangulated from its outline.
+  Flags notched(15 * 11, 1);
+  for (std::size_t y = 0; y < 5; ++y) notched[y * 15] = 0;
+  const BlockFootprint footprint = blockFootprint(notched, 16, 12, {0, 0, 15, 11}, kCellX * kCellY, 0.0);
+  REQUIRE(footprint.pieces.size() == 1);
+  REQUIRE(footprint.pieces[0].runStarts.size() == 6);
+  BlockSimplifier unlimited = blockSimplifier(rough, 16, 12, 0);
+  (void)unlimited.simplifyBlock({0, 0, 15, 11}, &footprint);
+  REQUIRE(unlimited.surface().vertices.size() > 40 + 2 * (15 + 11));
+  BlockSimplifier pieces = blockSimplifier(rough, 16, 12, 0, 40);
+  REQUIRE_THROWS_MATCHES(pieces.simplifyBlock({0, 0, 15, 11}, &footprint), std::runtime_error,
+                         Message(beyondTheLimit(40)));
+  CHECK(pieces.surface().vertices.empty());
+  CHECK(pieces.surface().triangles.empty());
+}
+
+TEST_CASE("a surface that does not pass the vertex limit is the one made without it, shared vertices counted once",
+          "[simplify]") {
+  // The fractal in chunks of 16 cells, with the limit at the very number of vertices its surface comes to.
+  const Grid fractal = fractalGrid();
+  const SimplifiedSurface free = simplify(fractal, 64, 48, 2, 16);
+  const std::uint64_t n = free.surface.vertices.size();
+  const SimplifiedSurface limited = simplifyGrid(fractal, 64, 48, 2, kCellX * 63, kCellY * 47, 1, 1, kLevel, 16, n);
+  CHECK(sameSurface(limited.surface, free.surface));
+  CHECK(limited.boundary.sides == free.boundary.sides);
+
+  // The island's footprint in blocks of 12 x 9 cells, likewise.
+  const Island island;
+  const SimplifiedFootprint blocks = island.simplified(0.5, 12, 9);
+  BlockSimplifier atLimit =
+      blockSimplifier(island.grid, kIslandCols, kIslandRows, 0.5, blocks.surface.vertices.size());
+  for (const SimplifiedBlock& b : blocks.blocks) (void)atLimit.simplifyBlock(b.rect, &b.footprint);
+  CHECK(sameSurface(atLimit.surface(), blocks.surface));
+
+  // Two blocks side by side over random heights at a tolerance of 0, every sample a vertex: 45 in all, of which the 5 on
+  // the column the two share are the first block's. Counted again with the second block's own 20, they would make 50,
+  // above a limit of 45; the stop allows a block the 16 samples round its edge besides, for those an earlier block may
+  // have put in already, so the surface of exactly 45 is made.
+  std::mt19937 rng(3);
+  const Grid rough = randomGrid(rng, 9, 5, 0, 100);
+  const std::vector<BlockRect> two = {{0, 0, 4, 4}, {4, 0, 8, 4}};
+  BlockSimplifier free2 = blockSimplifier(rough, 9, 5, 0);
+  for (const BlockRect& rect : two) (void)free2.simplifyBlock(rect, nullptr);
+  REQUIRE(free2.surface().vertices.size() == 45);
+  BlockSimplifier tight = blockSimplifier(rough, 9, 5, 0, 45);
+  for (const BlockRect& rect : two) CHECK_NOTHROW(tight.simplifyBlock(rect, nullptr));
+  CHECK(sameSurface(tight.surface(), free2.surface()));
+}
+
+TEST_CASE("after a block refused at the vertex limit the next block goes on from the surface as it was", "[simplify]") {
+  // Three blocks in a row over 16 x 4 cells at a tolerance of 0: a plane of 4 x 4 cells, random heights inside 8 x 4,
+  // and the plane again over 4 x 4. Each square of plane is its four corners; the random block keeps nearly all of its
+  // 45 samples, more than the limit of 8 and the 24 samples round its edge, and is refused. Taken back out, it leaves
+  // the surface and the numbers of the outline samples as they were, so that the second square of plane comes out as it
+  // does when the random block was never asked for.
+  std::mt19937 rng(5);
+  const Grid g = makeGrid(17, 5, [&rng](int i, int j) {
+    return i > 4 && i < 12 ? static_cast<double>(rng() % 100000) / 1000.0 : 3 + 0.5 * i + 0.25 * j;
+  });
+  const BlockRect plane{0, 0, 4, 4}, random{4, 0, 12, 4}, again{12, 0, 16, 4};
+
+  BlockSimplifier free = blockSimplifier(g, 17, 5, 0);
+  (void)free.simplifyBlock(plane, nullptr);
+  const Mesh afterPlane = free.surface();
+  REQUIRE(afterPlane.vertices.size() == 4);
+  (void)free.simplifyBlock(again, nullptr);
+  REQUIRE(free.surface().vertices.size() == 8);
+  BlockSimplifier tooMany = blockSimplifier(g, 17, 5, 0);
+  (void)tooMany.simplifyBlock(plane, nullptr);
+  (void)tooMany.simplifyBlock(random, nullptr);
+  REQUIRE(tooMany.surface().vertices.size() > 8 + 2 * (8 + 4));
+
+  BlockSimplifier limited = blockSimplifier(g, 17, 5, 0, 8);
+  (void)limited.simplifyBlock(plane, nullptr);
+  REQUIRE_THROWS_MATCHES(limited.simplifyBlock(random, nullptr), std::runtime_error, Message(beyondTheLimit(8)));
+  CHECK(sameSurface(limited.surface(), afterPlane));
+  const BlockResult result = limited.simplifyBlock(again, nullptr);
+  CHECK(result.firstTriangle == afterPlane.triangles.size());
+  CHECK(sameSurface(limited.surface(), free.surface()));
 }

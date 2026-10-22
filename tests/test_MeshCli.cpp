@@ -250,7 +250,8 @@ TEST_CASE("the help states the ranges and defaults", "[meshcli]") {
            "model units per metre in the STL and PLY, above 0 (default 1; 0.02 makes a 10 km window 200 mm wide)",
            "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)",
            "simplify the mesh to a TIN whose vertical error at any grid sample is at most FLOAT model units (after "
-           "--z-scale and --scale), above 0; absent, the full grid is written",
+           "--z-scale and --scale), above 0; absent, the full grid is written, or with --tile or --footprint data "
+           "simplified at 0",
            "where the solid exists: window, the whole window as today; data, only where the DEM has data, with a wall "
            "along the data's edge (default window)",
            "split the window into square blocks of SIZE model units, each written as STEM_rRR_cCC.stl, above 0; "

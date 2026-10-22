@@ -56,13 +56,17 @@ using namespace demdl::mesh;
 
 // Spec 3 and 4.2: a mesh of more vertices than this is refused, its STL being about 2.5 GB at the limit, and one of
 // more than kWarnVertices is warned about, with the sizes of its files. Both count the mesh that is written: the output
-// grid, or with --tolerance the simplified mesh, whose size is known only once the grid has been simplified.
+// grid, or with --tolerance, and in Part B's modes, the simplified mesh, whose size is known only once the grid has been
+// simplified; the simplifier is given the limit as well, so that it stops a mesh that has passed it while making it
+// (the plan's ruling on the cap). Without --tolerance the output grid is held to the limit in Part B's modes too, since
+// simplified at 0 it keeps nearly every sample.
 constexpr std::uint64_t kMostVertices = 25'000'000;
 constexpr std::uint64_t kWarnVertices = 4'000'000;
 
 // With --tolerance the output grid is simplified, not written, so it may be as large as the window (spec 4.2): it is
 // refused only above the most an int holds, which still leaves both its sides within an int. At that limit its heights
-// are 8.6 GB of float32.
+// are 8.6 GB of float32. Only the flag lifts the grid's limit to this: Part B's modes simplify without it too, at 0,
+// and keep kMostVertices on the grid (the plan's ruling on the cap).
 constexpr std::uint64_t kMostVerticesToSimplify = std::numeric_limits<int>::max();
 
 // Part B 5.3: a lattice of more blocks than this is refused before anything is read, since a --tile of a few cells
@@ -202,10 +206,12 @@ struct OutputGrid {
 // --grid, or one vertex per sample of the window. A height left out follows the window's aspect in metres, so that the
 // cells come out square: rows = max(2, round((cols - 1) heightM / widthM) + 1). Worked out in double, because --grid
 // takes any int and an extreme aspect can ask for more rows than an int holds; refused, before anything is read, above
-// kMostVertices, or when the grid is to be simplified (simplify) above kMostVerticesToSimplify, either of which leaves
-// both sides within an int.
+// kMostVertices, or when --tolerance was given (toleranceGiven) above kMostVerticesToSimplify, either of which leaves
+// both sides within an int. Part B's modes (inBlocks) simplify at 0 without the flag, which keeps nearly every sample,
+// so their grid has kMostVertices too, and the refusal names the flag that lifts it (the plan's ruling on the cap); the
+// message of today's path stays as it was (spec 6).
 OutputGrid outputGridFor(const std::optional<demdl::cli::GridSize>& grid, const PixelWindow& window,
-                         const WindowExtent& extent, bool simplify) {
+                         const WindowExtent& extent, bool toleranceGiven, bool inBlocks) {
   double cols = window.cols;
   double rows = window.rows;
   if (grid) {
@@ -213,12 +219,16 @@ OutputGrid outputGridFor(const std::optional<demdl::cli::GridSize>& grid, const 
     rows = grid->rows != 0 ? grid->rows : std::max(2.0, std::round((cols - 1) * extent.heightM / extent.widthM) + 1);
   }
   const double vertices = cols * rows;
-  const std::uint64_t limit = simplify ? kMostVerticesToSimplify : kMostVertices;
+  const std::uint64_t limit = toleranceGiven ? kMostVerticesToSimplify : kMostVertices;
   // Asked this way round so that a NaN is refused too.
   if (!(vertices <= static_cast<double>(limit))) {
-    throw std::runtime_error("the output grid is " + fixed(vertices, 0) + " vertices; " +
-                             (simplify ? "with --tolerance " : "") + "the limit is " + std::to_string(limit) +
-                             ": use --grid or crop");
+    const std::string size = "the output grid is " + fixed(vertices, 0) + " vertices; ";
+    const std::string most = "the limit is " + std::to_string(limit) + ": ";
+    if (toleranceGiven) throw std::runtime_error(size + "with --tolerance " + most + "use --grid or crop");
+    if (inBlocks) {
+      throw std::runtime_error(size + "without --tolerance " + most + "give --tolerance, or use --grid or crop");
+    }
+    throw std::runtime_error(size + most + "use --grid or crop");
   }
   return {static_cast<int>(cols), static_cast<int>(rows)};
 }
@@ -379,7 +389,9 @@ struct Surface {
 
 // Spec 4.2: with --tolerance the mesh written is known only once it is simplified, so only then is it refused above
 // kMostVertices, with nothing written yet, and warned about above kWarnVertices, as a grid is before anything is read.
-// In Part B's modes the mesh is the whole-area surface (the plan's ruling on the tolerance).
+// The simplifier, given kMostVertices, stops a mesh while making it once it has passed the limit, by up to the samples
+// round a block's edge, so this exact count is what refuses one that ends just above it. In Part B's modes the mesh is
+// the whole-area surface, with or without --tolerance (the plan's rulings on the tolerance and the cap).
 void limitSimplifiedMesh(const MeshOptions& options, const Facts& f) {
   if (f.surfaceVertices > kMostVertices) {
     throw std::runtime_error("the simplified mesh is " + std::to_string(f.surfaceVertices) +
@@ -391,12 +403,14 @@ void limitSimplifiedMesh(const MeshOptions& options, const Facts& f) {
 
 // Spec 4.2: the grid becomes the surface as it stands (stage "surface"), or with --tolerance is simplified to a TIN
 // within it (stage "simplify"), and goes as soon as the surface is made, so that nothing per sample outlives this. What
-// will be written is counted from what was made, and with --tolerance limited (limitSimplifiedMesh).
+// will be written is counted from what was made, and with --tolerance limited, by the simplifier while it works and
+// then exactly (limitSimplifiedMesh).
 Surface makeSurface(const MeshOptions& options, Facts& f, std::vector<float> grid, StageClock& clock) {
   Surface surface;
   if (options.tolerance) {
     SimplifiedSurface tin = simplifyGrid(grid, f.grid.cols, f.grid.rows, toleranceInMetres(options), f.extent.widthM,
-                                         f.extent.heightM, options.zScale, options.scale, f.base.levelM);
+                                         f.extent.heightM, options.zScale, options.scale, f.base.levelM, kChunkCells,
+                                         kMostVertices);
     // The grid's summit is a vertex only if the tolerance needs it there, so the mesh's summit is its highest vertex,
     // back in metres.
     const auto summit = std::max_element(tin.surface.vertices.begin(), tin.surface.vertices.end(),
@@ -886,7 +900,7 @@ Blocks simplifyBlocks(const MeshOptions& options, const Facts& f, const BlockPla
   const int rows = f.grid.rows;
   const double cellArea = cellAreaUnits2(options, f);
   BlockSimplifier simplifier(grid, cols, rows, toleranceInMetres(options), f.extent.widthM, f.extent.heightM,
-                             options.zScale, options.scale, f.base.levelM);
+                             options.zScale, options.scale, f.base.levelM, kMostVertices);
   Blocks blocks;
   const TileLayout& t = plan.layout;
   for (int r = 0; r < t.down; ++r) {
@@ -1093,7 +1107,9 @@ int run(int argc, char** argv) {
   }
   const BlockSelection selection = blockSelection(options);
   // Part B's modes run on the block simplifier, so without --tolerance they simplify at 0, which keeps every sample off
-  // its neighbours' plane; their memory, warning and limit are then the tolerance's (the plan's ruling).
+  // its neighbours' plane, and their memory: line and warning are the tolerance's (the plan's ruling); but their grid
+  // keeps the cap it has without the flag (the plan's ruling on the cap), so whether it was given is noted first.
+  const bool toleranceGiven = options.tolerance.has_value();
   if (meshesInBlocks(options) && !options.tolerance) options.tolerance = 0.0;
   checkInput(options.input);
   checkOutputDirectory(options.outputStem);
@@ -1110,14 +1126,15 @@ int run(int argc, char** argv) {
   f.geometry = inspectGeoTiff(options.input);
   f.window = pixelWindowFor(f.geometry, options.crop);
   f.extent = extentInMetres(f.geometry, f.window);
-  f.grid = outputGridFor(options.grid, f.window, f.extent, options.tolerance.has_value());
+  f.grid = outputGridFor(options.grid, f.window, f.extent, toleranceGiven, meshesInBlocks(options));
   std::optional<BlockPlan> plan;
   if (meshesInBlocks(options)) {
     plan = planBlocks(options, outputs, f, selection);
     if (!options.overwrite && plan->tiled) checkNoLatticeFileExists(*plan, outputs);
   }
   // Without --tolerance the grid is what will be written, so its files are known before anything is read and a large
-  // one is warned about first.
+  // one is warned about first. Part B's modes, which have a tolerance of 0 by now, warn after simplifying instead, on
+  // the whole-area surface and the blocks that will be written (limitSimplifiedMesh).
   if (!options.tolerance) {
     countOutputs(f, f.grid.vertices(), f.grid.surfaceTriangles(), solidTriangleCount(f.grid.cols, f.grid.rows));
     if (f.surfaceVertices > kWarnVertices) warnOfLargeFiles(options, "the output grid", f);

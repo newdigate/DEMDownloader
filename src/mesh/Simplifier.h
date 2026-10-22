@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -64,9 +65,21 @@ struct SimplifiedSurface {
 // A grid of more samples than 32-bit vertex numbers can count with the solid's four bottom corners is refused with
 // std::invalid_argument before heights is looked at, as surfaceMesh refuses it. So is an infinite height, as a NaN is:
 // no tolerance can bound it.
+//
+// The vertex limit, mostVertices (none by default), stops a surface while it is being made rather than once it is
+// made, so that a tolerance near 0 on a large grid cannot hold gigabytes of it first: a chunk is stopped as soon as the
+// surface before it, plus the vertices the chunk has taken, exceeds mostVertices plus the samples round the chunk's
+// edge, 2 (w + h) for a chunk of w x h cells. What a chunk takes is each vertex it adds and each vertex of an earlier
+// chunk that it shares, once each, and only the samples on its sides can be an earlier chunk's; so the count is never
+// more than that many above the surface's own size, and a surface is stopped only once it has passed the limit, never
+// one that would end within it. One can end above the limit by up to a chunk's edge without being stopped: a caller
+// that holds a surface to the limit exactly counts it afterwards, as dem2mesh does. A stopped surface throws
+// std::runtime_error, "the simplified mesh is more than N vertices; the limit is N: raise --tolerance, or use --grid or
+// crop", N being mostVertices.
 [[nodiscard]] SimplifiedSurface simplifyGrid(const std::vector<float>& heights, int cols, int rows,
                                              double toleranceM, double widthM, double heightM, double zScale,
-                                             double scale, double levelM, int chunkCells = kChunkCells);
+                                             double scale, double levelM, int chunkCells = kChunkCells,
+                                             std::uint64_t mostVertices = std::numeric_limits<std::uint64_t>::max());
 
 // A piece's outline as the surface's vertex numbers (the samples the runs kept) with their grid coordinates, for
 // the walls and the base.
@@ -132,6 +145,13 @@ struct BlockResult {
 // straight. Otherwise std::invalid_argument names the piece by its loop's first sample. A refused block leaves the
 // surface as it was. simplifyBlock after takeSurface throws std::logic_error.
 //
+// The vertex limit, mostVertices, is simplifyGrid's, block by block: a block is stopped as soon as the surface before
+// it, plus the vertices it has taken, its outlines' (an earlier block's among them, once each) and its inside's,
+// exceeds mostVertices plus the samples round the block's edge, and throws simplifyGrid's std::runtime_error. A
+// stopped block leaves the surface as it was too: its vertices, its triangles and its outline samples' numbers are
+// taken back out, so that the next block goes on as if it had never been asked for. A vertex where two of the block's
+// own pieces touch is taken once.
+//
 // Memory, beyond heights and the surface: for the block at hand, a bit for each of its samples when it has a
 // footprint, marking its outlines' samples, and the faces of the window block or of the piece being triangulated, as
 // for a chunk of simplifyGrid's; from block to block, the samples the sides and runs keep, with their vertex numbers.
@@ -140,7 +160,8 @@ struct BlockResult {
 class BlockSimplifier {
  public:
   BlockSimplifier(const std::vector<float>& heights, int cols, int rows, double toleranceM, double widthM,
-                  double heightM, double zScale, double scale, double levelM);
+                  double heightM, double zScale, double scale, double levelM,
+                  std::uint64_t mostVertices = std::numeric_limits<std::uint64_t>::max());
   ~BlockSimplifier();
   BlockSimplifier(const BlockSimplifier&) = delete;
   BlockSimplifier& operator=(const BlockSimplifier&) = delete;
