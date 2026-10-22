@@ -118,6 +118,7 @@ add_library(demmesh STATIC
   src/mesh/Resampler.cpp
   src/mesh/Predicates.cpp
   src/mesh/PolygonTriangulation.cpp
+  src/mesh/Footprint.cpp
   src/mesh/ProfileSimplifier.cpp
   src/mesh/Simplifier.cpp
   src/mesh/BasePlane.cpp
@@ -181,6 +182,7 @@ if(DL_ELEVATION_TESTS)
     tests/test_Resampler.cpp
     tests/test_Predicates.cpp
     tests/test_PolygonTriangulation.cpp
+    tests/test_Footprint.cpp
     tests/test_ProfileSimplifier.cpp
     tests/test_Simplifier.cpp
     tests/test_BasePlane.cpp
