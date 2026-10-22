@@ -124,6 +124,7 @@ add_library(demmesh STATIC
   src/mesh/Tiles.cpp
   src/mesh/BasePlane.cpp
   src/mesh/SolidMesh.cpp
+  src/mesh/FootprintSolid.cpp
   src/mesh/AtomicFileWriter.cpp
   src/mesh/StlWriter.cpp
   src/mesh/PlyWriter.cpp
@@ -189,6 +190,7 @@ if(DL_ELEVATION_TESTS)
     tests/test_Tiles.cpp
     tests/test_BasePlane.cpp
     tests/test_SolidMesh.cpp
+    tests/test_FootprintSolid.cpp
     tests/test_MeshWriters.cpp
     tests/test_MeshCli.cpp
     tests/test_BlenderRunner.cpp
