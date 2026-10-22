@@ -15,6 +15,7 @@
 - C++20, `-Wall -Wextra` clean, the conventions of `CLAUDE.md`; headers as `"mesh/<Name>.h"`; namespace `demdl::mesh`; no new external dependency (spec 3).
 - Exact integer predicates on block-local coordinates; a block side above 16,384 cells is refused (spec 4.5, 5.3).
 - The footprint rules of spec 5.2, verbatim: a cell is in the footprint when all four of its vertices have data; no-data 4-connected to the window's edge is cut, enclosed no-data is filled; before the enclosed test the footprint is closed morphologically with a 3 x 3 neighbourhood; a piece is a 4-connected set of cells; pieces may touch at a vertex, counted as `corner contacts: N`; a piece under `--min-piece` square model units (default 1) is dropped and listed; the mask is carried through resampling by the nearest source sample; the outline is never moved off the grid lines.
+  *Overtaken during execution: pieces that would touch at a vertex are joined, not kept (spec section 9, "Corner contacts are joined, not kept"), and `corner contacts: N` counts the joins inside the blocks written; the touching-pieces cases and comments of Tasks 2, 4, 5 and 7 below are the plan as first written.*
 - Shared edges match exactly (spec 5.3): a block side is simplified over runs split wherever the data status of the cells on either side of the line changes, each run with its ends fixed, by the one-dimensional rule in the fixed direction of Part A (rows west to east, columns north to south).
 - One base plane for all blocks, from the whole window's data heights with today's rule (spec 5.3).
 - Blocks are counted in output-grid cells from the window's north-west corner, `round(SIZE / (scale x cellX))` by `round(SIZE / (scale x cellY))`, numbered from the north-west, row then column, from 1; files `STEM_rRR_cCC.stl` with as many digits as the counts need; each block in its own local frame, x and y from the block's south-west corner, z unchanged (spec 5.3).
@@ -35,8 +36,9 @@
 
 1. A block whose only land is a speck under `--min-piece` must be skipped and listed as dropped, not written as a sliver: Task 7.
 2. Two pieces touching at one vertex in a block must give two closed shells, pass the checks, and print `corner contacts: 1`: Tasks 5 and 7.
+   *Overtaken: the contact is joined into one closed shell, which passes the checks and prints `corner contacts: 1` (spec section 9, "Corner contacts are joined, not kept").*
 3. A tile size that does not divide the grid must give cut-short blocks on the east and south that are closed and match their neighbours: Tasks 4 and 7.
-4. `--footprint data` on a file without any no-data must give the whole window as one piece, closed, with the same surface as `--footprint window`: Task 7.
+4. `--footprint data` on a file without any no-data must give the whole window as one piece, closed, with the same surface as `--footprint window` (when both get the same `--tolerance` and the window is up to 2048 cells a side, or both are tiled): Task 7.
 5. `--overwrite` after a change that empties a block must leave the old block file alone and name it in `stale:`: Task 7.
 
 ## File structure
@@ -417,7 +419,7 @@ Spec 5.5, 7 (Part B), 8, 9; CLAUDE.md.
 
 ## Follow-ups deferred at the final review (2026-10-22)
 
-The minors that the task reviews left open, one line each, task by task, as the ledger holds them (line numbers are those the reviewer saw); none changes what `dem2mesh` writes. The whole-branch review's own additions are appended below by the controller.
+The minors that the task reviews left open, one line each, task by task (line numbers are those the reviewer saw); none changes what `dem2mesh` writes. The whole-branch review's own additions are appended below by the controller.
 
 Task 1, `PolygonTriangulation`:
 
@@ -426,6 +428,7 @@ Task 1, `PolygonTriangulation`:
 - `PolygonTriangulation.h:42-44`, "for such a polygon the set can miss an ear", reads as "simple" where it means self-crossing.
 - The first ear fill costs about 2x on shapes where the old search found an ear at once (within the stated bound).
 - Outcomes on self-crossing input changed with the ear set (unspecified either way).
+- Ear clipping is quadratic in an outline's vertices (about 3 to 4 ns x n^2 optimised, 1.3 s at 19,320 vertices) and runs twice for a piece, for its seed and for its base: the City's largest outline is 1,700 vertices (r14 c13), about 10 ms, but one of tens of thousands would cost seconds; a spatial index on the vertices is the next step.
 
 Task 2, `Footprint`:
 
@@ -460,12 +463,14 @@ Task 5, `FootprintSolid`:
 - `FootprintSolid.cpp` duplicates `SolidMesh.cpp`'s `formatNumber` and plane checks verbatim.
 - The base re-clips the outline the simplifier clipped for its seed: carry the seed's triples in `PieceOutline` if coastal blocks ever dominate (on the City, building, checking and writing the 146 solids took 3.9 s of the 57 s before Blender starts, so they do not).
 - No 3-vertex solid case.
+- The 32-bit vertex refusal in `solidFromPieces` (the surface and the copies above what 32-bit numbers count) is untested; reaching it takes gigabytes.
 
 The corner-contact join (the Task 2 fix round):
 
 - A stale comment at `test_Simplifier.cpp:1009`: "touch at a vertex all turn up in the footprint".
 - The multi-round join path is unreachable through `footprintCells` and untested.
 - No test pins that `*joined` is appended to.
+- `cornerContacts` counts a join whose bridge cell belongs to a piece that `--min-piece` then drops (a block whose pieces are all dropped is skipped, and counts none): filter by the kept pieces' cells if `corner contacts: N` should mean only bridges that are printed.
 - `Simplifier.cpp:81`, `:275`, `:654` and `:995` still describe touching pieces, now unreachable from `footprintCells`.
 
 Task 6, the flags:
@@ -482,7 +487,7 @@ Task 7, blocks in `dem2mesh`:
 - First-pass errors carry no block label.
 - The tiled dry run names the PLY twice (`would write:` and `output:`), and a `--footprint data` dry run without `--tile` is uncovered.
 - A test asserts on its own oracle (`test_Dem2MeshEndToEnd.cpp:1628`, where the library's `solidTriangles` is the expectation).
-- `0% land` can print for a tiny kept piece (the City's r02 c06, r12 c13 and r18 c10 do).
+- `0% land` can print for a tiny kept piece (the City's r02 c06, r05 c02, r12 c13 and r18 c10 do).
 - The grid refusal says "with --tolerance" for a Part B run without it.
 - `dem2mesh_main.cpp` is 1174 lines with pure mesh work (`blockSurface`, `localNumber`, `renumbered`) that belongs in `src/mesh/` with unit tests at a scale other than 1, and its summary and plan builders could move to their own file; `test_Dem2MeshEndToEnd.cpp` is 1830 lines.
 
@@ -494,7 +499,7 @@ Task 8, Blender over every block:
 - `solid` in `BlenderRunner.cpp:256` should be `stlArgument`.
 - A one-entry list would print "1 files" (never produced).
 - A path with a newline in it cannot be listed (it fails loudly, unguarded).
-- `blenderMemory` sums every block's triangles where spec 5.4 says the whole-area surface; it is conservative (the City's dry run says about 1.2 GB), and the City run did not measure Blender's own peak.
+- `blenderMemory` sums the triangles of every written block's solid, which over-states the peak since each block is imported into a reset scene (the City's dry run says about 1.2 GB); the larger of the whole-area scene and the biggest block would be closer, and the City run did not measure Blender's own peak.
 
 The Part A follow-ups that Part B touched (from the list of `2026-10-21-simplify.md`):
 

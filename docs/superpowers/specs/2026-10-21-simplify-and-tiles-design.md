@@ -96,8 +96,10 @@ Anti-goals, which would make this a failure even if it ran:
   resampled grid once more; everything else is per block or proportional to the
   output. The dry run states the memory a run will need.
 - Blender 4.2+ as today; the scene script keeps working for a surface of any
-  triangulation. Blender's memory estimate (0.67 KB per triangle) now applies to
-  the whole-area surface, which is small after simplification.
+  triangulation. Blender's memory estimate (0.67 KB per triangle) is worked out
+  from the triangles of the solid or solids written, which are few after
+  simplification; with `--tile` it adds up every block's solid, which over-states
+  the peak, since each block is imported into a reset scene.
 - The owner builds Debug by default; the whole-City run is the first job for which
   a Release build matters, and `CLAUDE.md` says so.
 - The tests stay offline and spawn only the built binaries and, where present,
@@ -317,9 +319,11 @@ each output vertex, the status of the nearest source sample.
   that merges corners, as Blender's importer does, reads that line as one edge in
   four faces, which every checker calls non-manifold and a printing service may
   refuse; Blender's check reported it. A 5 m cell is 0.1 mm on the print.) The
-  summary counts the joins inside the blocks it writes, `corner contacts: N`; a
-  join on a block side lies in neither block and is counted by none. A chain of
-  pieces touching corner to corner becomes one piece, with a cell at each link.
+  summary counts the joins inside the blocks it writes, `corner contacts: N` (a
+  join whose piece `--min-piece` then drops is counted all the same); a join on a
+  block side has one cell of its diagonal in each block, so neither counts it. A
+  chain of pieces touching corner to corner becomes one piece, with a cell at each
+  link.
 - A piece smaller than `--min-piece` square model units (1 mm², which is 50 x
   50 m or 100 cells at 1:50,000) is dropped and listed, so a few stray cells do not
   become slivers no printer can make. Pieces are measured after tiling, per block.
@@ -367,12 +371,13 @@ the DEM's no-data specifically, so that addition would not change the design.
   the local frames: positions within 1e-3 units and heights exactly. Read back from
   the City's 146 STLs the same way, all 5,853 vertices along the sides that 243
   pairs of neighbouring blocks share agree in x, y and z to the last bit
-  (section 5.5).
+  (section 7).
 - **Tolerance.** Part B's modes run on the block simplifier. `--tile` or
   `--footprint data` without `--tolerance` therefore simplifies at a tolerance of
   0, which keeps every sample that is off the plane of its neighbours, and prints
-  `simplify: tolerance 0 units (0 m), ...`; the memory, the warning and the
-  25,000,000 limit of section 4.2 then count the whole-area surface.
+  `simplify: tolerance 0 units (0 m), ...`; the warning and the 25,000,000 limit
+  of section 4.2 then count the whole-area surface, and the dry run's `memory:`
+  line counts the window and the grid only, as there.
 - **One base plane.** The base plane and plinth are chosen once from the whole
   window's data heights, with today's rule, and every block uses it, so the blocks
   sit flush. (The fill only copies data heights, so the range after it is the
@@ -391,7 +396,8 @@ the DEM's no-data specifically, so that addition would not change the design.
   block of `--footprint window`, tiled or not; a `--footprint data` block uses the
   polygon construction, a file without no-data included: its one piece is the whole
   window, whose surface is the one `--footprint window` makes (the PLYs are byte
-  for byte equal up to 2048 cells a side, where the window path is one chunk too)
+  for byte equal when both get the same `--tolerance` and the window is up to 2048
+  cells a side, where the window path is one chunk too, or when both are tiled)
   but whose walls and base are the polygon's.
 - **Not written:** blocks with no footprint, and blocks outside `--blocks`. Both
   are listed in the summary. A block that holds land is always written, however
@@ -408,8 +414,8 @@ the DEM's no-data specifically, so that addition would not change the design.
   Blender's check, as today; the PLY is always written. With `--blocks` the whole
   area is the selected blocks'. The size warning counts this whole-area surface.
   Blender's memory estimate is worked out from the triangles of all the blocks'
-  solids added together, which over-states the peak, since Blender imports one
-  block at a time.
+  solids added together, which over-states the peak, since each block is imported
+  into a reset scene.
 - **Two passes.** Every selected block that holds land is simplified first, in
   lattice order, into the one surface of the whole area. That surface is then
   counted, limited and warned about as section 4.2 says, so the 25,000,000
@@ -437,7 +443,10 @@ the DEM's no-data specifically, so that addition would not change the design.
   the window, 1 piece` takes the place of those lines. Then `dropped pieces:`,
   `corner contacts: N` and `stale:` when any, `solid:`, the `wrote:` lines for every
   STL in lattice order and then the PLY, and the `.blend` and Blender's check. The
-  dry run prints the same with `would write` and no files.
+  dry run prints the same lines and writes nothing; with `--tile` its plan has
+  `would write:` in place of `wrote:` and `output:` lines for the PLY and the
+  `.blend` only, and without `--tile` the usual `output:` lines for the STL, the
+  PLY and the `.blend`.
 - Without `--overwrite`, any block file of the lattice that exists is refused
   before anything is read, whether or not this run would write it, since which
   blocks hold land is known only after reading. With `--overwrite`, existing block
@@ -494,7 +503,8 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
   command wrote 146 files, as the map screens counted (114 squares without land,
   32 cut short at the east or south edge), the largest of 4.0 MB; Blender's check
   passed on all 146 (1,492,328 triangles, 0 non-manifold edges, 0 inverted faces);
-  and the 146 STLs read back agree exactly along every side that neighbours share.
+  and the 146 STLs read back agree exactly along every side that neighbours share
+  (5,853 vertices on 243 pairs of neighbouring blocks).
   Opening two neighbouring blocks together in Blender, which no run has done, is
   left to the owner's eye, and so is the service's upload limit.
 
