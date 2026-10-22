@@ -487,16 +487,20 @@ std::string gridLine(const Facts& f) {
          metres(f.extent.widthM / (f.grid.cols - 1)) + " x " + metres(f.extent.heightM / (f.grid.rows - 1)) + " m";
 }
 
-// The plan's memory with --tolerance (spec 4.2), where the grid can be far larger than the mesh written: the window and
-// the grid, each held once as float32, and both at once while the one is resampled into the other; the simplified mesh
-// grows with what it keeps, not with the grid. To the nearest megabyte, or once that is 1,000 or more, in gigabytes to
-// one decimal.
-std::string memoryLine(const Facts& f) {
+// The plan's memory with --tolerance (spec 4.2), and in Part B's modes, where the grid can be far larger than the mesh
+// written: the window and the grid, each held once as float32, and both at once while the one is resampled into the
+// other; with --footprint data the window's data mask too, a byte a sample, which readTerrain holds beside them then
+// (the grid's own mask comes after the window has gone). The simplified mesh grows with what it keeps, not with the
+// grid, and the footprint's cells and working state come on top, as the fill's do. To the nearest megabyte, or once
+// that is 1,000 or more, in gigabytes to one decimal.
+std::string memoryLine(const MeshOptions& options, const Facts& f) {
   const std::uint64_t samples = static_cast<std::uint64_t>(f.window.cols) * static_cast<std::uint64_t>(f.window.rows);
-  const double megabytes = 4.0 * static_cast<double>(samples + f.grid.vertices()) / 1e6;
+  const bool mask = footprintOfData(options);
+  const double floats = 4.0 * static_cast<double>(samples + f.grid.vertices());
+  const double megabytes = (floats + (mask ? static_cast<double>(samples) : 0.0)) / 1e6;
   const std::string about = megabytes < 999.5 ? fixed(megabytes, 0) + " MB" : fixed(megabytes / 1000, 1) + " GB";
   return "memory: window " + std::to_string(samples) + " samples and grid " + std::to_string(f.grid.vertices()) +
-         " vertices, 4 bytes each: about " + about;
+         " vertices, 4 bytes each" + (mask ? ", and the data mask, a byte a sample" : "") + ": about " + about;
 }
 
 // Spec 4.7: the tolerance in model units as given and in the metres of terrain they stand for, then the grid's surface
@@ -718,7 +722,7 @@ void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& 
   line("extent: " + metres(f.extent.widthM) + " x " + metres(f.extent.heightM) + " m");
   line(gridLine(f));
   if (options.tolerance) {
-    line(memoryLine(f));
+    line(memoryLine(options, f));
     line(simplifyLine(options, f));
   }
   line(heightsLine(f));

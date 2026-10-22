@@ -1694,6 +1694,42 @@ TEST_CASE("stale: names every block file of the stem that the run leaves behind,
   }
 }
 
+TEST_CASE("with --footprint data the dry run's memory line counts the data mask too, a byte a sample", "[mesh-e2e]") {
+  // A window of 1000 x 1000 samples of 0.0001 degrees, a plane with no no-data, planned on a grid of 500 x 500: its
+  // 1,000,000 samples and the grid's 250,000 vertices, 4 bytes each, are 5,000,000 bytes, and with --footprint data the
+  // window's data mask, held beside them while the one is resampled into the other, is 1,000,000 bytes more. The
+  // tolerance, which the line does not depend on, lets the plane be two triangles a block.
+  const TempDir dir;
+  constexpr int kSide = 1000;
+  std::vector<double> heights;
+  for (int j = 0; j < kSide; ++j) {
+    for (int i = 0; i < kSide; ++i) heights.push_back(10.0 + 0.25 * i + 0.5 * j);
+  }
+  const Path input = writeGeographicFixture(dir.path, kSide, kSide, {-33.9, -34.0, 18.5, 18.4}, heights);
+  const auto plan = [&](const std::vector<std::string>& extra) {
+    std::vector<std::string> args{"-i", input.string(), "-o", (dir.path / "plane").string(), "--no-blend", "--dry-run",
+                                  "--grid", "500x500", "--tolerance", "1"};
+    args.insert(args.end(), extra.begin(), extra.end());
+    return runDem2Mesh(args, dir.path);
+  };
+  const std::string window = "\n  memory: window 1000000 samples and grid 250000 vertices, 4 bytes each";
+  for (const std::vector<std::string>& data :
+       {std::vector<std::string>{"--footprint", "data"}, {"--footprint", "data", "--tile", "5000"}}) {
+    const Finished result = plan(data);
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    REQUIRE(result.exitCode() == 0);
+    CHECK_THAT(result.out, ContainsSubstring(window + ", and the data mask, a byte a sample: about 6 MB\n"));
+  }
+  // Without the data's footprint there is no mask, and the line is the one --tolerance has always printed.
+  for (const std::vector<std::string>& other :
+       {std::vector<std::string>{}, {"--tile", "5000"}, {"--footprint", "window", "--tile", "5000"}}) {
+    const Finished result = plan(other);
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    REQUIRE(result.exitCode() == 0);
+    CHECK_THAT(result.out, ContainsSubstring(window + ": about 5 MB\n"));
+  }
+}
+
 TEST_CASE("the dry run plans tiles without writing", "[mesh-e2e]") {
   const Island island;
   const TileLayout layout = island.layout(12);
