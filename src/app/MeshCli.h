@@ -19,6 +19,9 @@ struct GridSize {
   int rows = 0;
 };
 
+// --min-piece's default, in square model units: 1 mm2 on a print in millimetres (the simplify-and-tiles design, 5.2).
+inline constexpr double kDefaultMinPiece = 1;
+
 // What dem2mesh's command line asks for (spec 3), with the defaults of the spec's table. The paths are the text the
 // user typed; nothing here has been looked at on disk.
 struct MeshOptions {
@@ -34,11 +37,13 @@ struct MeshOptions {
   std::optional<double> base;  // metres before exaggeration; nullopt for sea level
   double scale = 1;
   double plinth = 2;
-  std::optional<double> tolerance;  // model units after --z-scale and --scale; nullopt writes the full grid
+  std::optional<double> tolerance;  // model units after --z-scale and --scale; nullopt writes the full grid, or with
+                                    // --tile or --footprint data simplifies at 0
   Footprint footprint = Footprint::Window;
   std::optional<double> tile;         // block side in model units after --scale; nullopt writes one solid
   std::optional<std::string> blocks;  // the --blocks text as typed, ROWS:COLS; main reads it with parseBlocks
-  double minPiece = 1;                // square model units; a piece of footprint below it is dropped and listed
+  std::optional<double> minPiece;     // square model units, a piece of footprint below it dropped and listed;
+                                      // nullopt for kDefaultMinPiece
   bool noBlend = false;
   std::optional<std::filesystem::path> blender;
   bool overwrite = false;
@@ -63,8 +68,8 @@ struct MeshOptions {
 // the crop box (BoundingBox::validate: finite, in range, north above south, east above west); the grid (at least 2
 // vertices each way, a height of 0 aside); z-scale and scale (finite, then positive); base (finite); plinth (finite,
 // then zero or positive); tolerance, when given (finite, then positive); tile, when given (finite, then positive);
-// min-piece (finite, then zero or positive); and --blocks, which needs --tile (its text is not read here). Pure: it
-// never touches the file system.
+// min-piece, when given (finite, then zero or positive); --blocks, which needs --tile (its text is not read here); and
+// --min-piece, which needs --footprint data. Pure: it never touches the file system.
 [[nodiscard]] std::string validateMeshOptions(const MeshOptions& options);
 
 }  // namespace demdl::cli

@@ -2262,7 +2262,7 @@ TEST_CASE("a BlockSimplifier refuses a grid, a tolerance or a frame as simplifyG
                          Message("the level must be finite, not nan"));
 }
 
-// --- The vertex limit (the plan's ruling on the cap) ------------------------------------------------------------------
+// --- The vertex limit (the plan's ruling on the cap) -----------------------------------------------------------------
 
 namespace {
 
@@ -2341,10 +2341,10 @@ TEST_CASE("a surface that does not pass the vertex limit is the one made without
   for (const SimplifiedBlock& b : blocks.blocks) (void)atLimit.simplifyBlock(b.rect, &b.footprint);
   CHECK(sameSurface(atLimit.surface(), blocks.surface));
 
-  // Two blocks side by side over random heights at a tolerance of 0, every sample a vertex: 45 in all, of which the 5 on
-  // the column the two share are the first block's. Counted again with the second block's own 20, they would make 50,
-  // above a limit of 45; the stop allows a block the 16 samples round its edge besides, for those an earlier block may
-  // have put in already, so the surface of exactly 45 is made.
+  // Two blocks side by side over random heights at a tolerance of 0, every sample a vertex: 45 in all, of which the 5
+  // on the column the two share are the first block's. Counted again with the second block's own 20, they would make
+  // 50, above a limit of 45; the stop allows a block the 16 samples round its edge besides, for those an earlier block
+  // may have put in already, so the surface of exactly 45 is made.
   std::mt19937 rng(3);
   const Grid rough = randomGrid(rng, 9, 5, 0, 100);
   const std::vector<BlockRect> two = {{0, 0, 4, 4}, {4, 0, 8, 4}};

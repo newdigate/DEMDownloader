@@ -57,10 +57,10 @@ using namespace demdl::mesh;
 
 // Spec 3 and 4.2: a mesh of more vertices than this is refused, its STL being about 2.5 GB at the limit, and one of
 // more than kWarnVertices is warned about, with the sizes of its files. Both count the mesh that is written: the output
-// grid, or with --tolerance, and in Part B's modes, the simplified mesh, whose size is known only once the grid has been
-// simplified; the simplifier is given the limit as well, so that it stops a mesh that has passed it while making it
-// (the plan's ruling on the cap). Without --tolerance the output grid is held to the limit in Part B's modes too, since
-// simplified at 0 it keeps nearly every sample.
+// grid, or with --tolerance, and in Part B's modes, the simplified mesh, whose size is known only once the grid has
+// been simplified; the simplifier is given the limit as well, so that it stops a mesh that has passed it while making
+// it (the plan's ruling on the cap). Without --tolerance the output grid is held to the limit in Part B's modes too,
+// since simplified at 0 it keeps nearly every sample.
 constexpr std::uint64_t kMostVertices = 25'000'000;
 constexpr std::uint64_t kWarnVertices = 4'000'000;
 
@@ -571,6 +571,9 @@ std::string percentOf(std::uint64_t part, std::uint64_t whole) {
   return std::to_string(std::llround(100.0 * static_cast<double>(part) / static_cast<double>(whole)));
 }
 
+// --min-piece, or its default, in square model units (Part B 5.1).
+double minPieceUnits2(const MeshOptions& options) { return options.minPiece.value_or(demdl::cli::kDefaultMinPiece); }
+
 // One cell of the output grid in square model units, which --min-piece is given in (Part B 5.2).
 double cellAreaUnits2(const MeshOptions& options, const Facts& f) {
   return f.extent.widthM / (f.grid.cols - 1) * options.scale * (f.extent.heightM / (f.grid.rows - 1) * options.scale);
@@ -951,7 +954,7 @@ Blocks simplifyBlocks(const MeshOptions& options, const Facts& f, const BlockPla
       const BlockRect rect = blockRect(t, r, c);
       std::optional<BlockFootprint> cut;
       if (plan.footprint) {
-        cut = blockFootprint(footprint.cells, cols, rows, rect, cellArea, options.minPiece, footprint.joined);
+        cut = blockFootprint(footprint.cells, cols, rows, rect, cellArea, minPieceUnits2(options), footprint.joined);
       }
       const bool land = !cut || !cut->pieces.empty();
       if (land) ++blocks.withLand;
@@ -990,7 +993,7 @@ std::string nothingToWrite(const MeshOptions& options, const BlockPlan& plan, co
   const std::size_t dropped = blocks.dropped.size();
   if (dropped == 0) return what + "no cell has data at all four of its corners";
   return what + std::to_string(dropped) + (dropped == 1 ? " piece was" : " pieces were") +
-         " dropped under --min-piece " + number(options.minPiece);
+         " dropped under --min-piece " + number(minPieceUnits2(options));
 }
 
 // What the blocks will write (Part B 5.4): the whole-area surface, which is the PLY, and each block's solid, an STL of

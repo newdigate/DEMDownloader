@@ -113,6 +113,7 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   std::string footprint;
   double tile = 0;
   std::string blocks;
+  double minPiece = 0;
   std::string blender;
   app.add_option("-i,--input", input, "GeoTIFF elevation model to read")
       ->type_name("PATH")
@@ -193,10 +194,12 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
           ->type_name("ROWS:COLS")
           ->check(notFlagLike)
           ->check(blocksText);
-  app.add_option("--min-piece", options.minPiece,
-                 "drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1)")
-      ->type_name("A")
-      ->check(decimal);
+  CLI::Option* const minPieceOption =
+      app.add_option("--min-piece", minPiece,
+                     "drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1); "
+                     "needs --footprint data")
+          ->type_name("A")
+          ->check(decimal);
   app.add_flag("--no-blend", options.noBlend, "write the STL and PLY only; do not run Blender");
   CLI::Option* const blenderOption =
       app.add_option("--blender", blender,
@@ -229,6 +232,7 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   }
   if (tileOption->count() > 0) options.tile = tile;
   if (blocksOption->count() > 0) options.blocks = blocks;
+  if (minPieceOption->count() > 0) options.minPiece = minPiece;
   if (blenderOption->count() > 0) options.blender = std::filesystem::path(blender);
   return {false, 0};
 }
@@ -259,9 +263,16 @@ std::string validateMeshOptions(const MeshOptions& options) {
     if (!std::isfinite(*options.tile)) return "tile must be finite";
     if (!(*options.tile > 0)) return "tile must be positive";
   }
-  if (!std::isfinite(options.minPiece)) return "min-piece must be finite";
-  if (options.minPiece < 0) return "min-piece must be zero or positive";
+  if (options.minPiece) {
+    if (!std::isfinite(*options.minPiece)) return "min-piece must be finite";
+    if (*options.minPiece < 0) return "min-piece must be zero or positive";
+  }
   if (options.blocks && !options.tile) return "--blocks requires --tile";
+  // --min-piece drops pieces of the data's footprint, so with the window's, where it would do nothing, it is refused
+  // whatever its value; with --footprint data and no --min-piece the default applies.
+  if (options.minPiece && options.footprint != MeshOptions::Footprint::Data) {
+    return "--min-piece requires --footprint data";
+  }
   return {};
 }
 

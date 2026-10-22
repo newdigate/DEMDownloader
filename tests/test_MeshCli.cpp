@@ -157,7 +157,8 @@ TEST_CASE("the example command line fills every MeshOptions field", "[meshcli]")
   CHECK_THAT(*p.options.tile, WithinAbs(100.0, 1e-12));
   REQUIRE(p.options.blocks.has_value());
   CHECK(*p.options.blocks == "3-5:2-4");
-  CHECK_THAT(p.options.minPiece, WithinAbs(2.5, 1e-12));
+  REQUIRE(p.options.minPiece.has_value());
+  CHECK_THAT(*p.options.minPiece, WithinAbs(2.5, 1e-12));
   CHECK(p.options.noBlend);
   REQUIRE(p.options.blender.has_value());
   CHECK(*p.options.blender == "/x/blender");
@@ -182,7 +183,7 @@ TEST_CASE("the two required flags alone leave everything else at its default", "
   CHECK(p.options.footprint == MeshOptions::Footprint::Window);
   CHECK_FALSE(p.options.tile.has_value());
   CHECK_FALSE(p.options.blocks.has_value());
-  CHECK(p.options.minPiece == 1.0);
+  CHECK_FALSE(p.options.minPiece.has_value());
   CHECK_FALSE(p.options.noBlend);
   CHECK_FALSE(p.options.blender.has_value());
   CHECK_FALSE(p.options.overwrite);
@@ -258,7 +259,8 @@ TEST_CASE("the help states the ranges and defaults", "[meshcli]") {
            "absent, one solid is written",
            "write only these blocks, each part a number or a range from 1, such as 3-5:2-4 or 7:12; the others are "
            "listed",
-           "drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1)"}) {
+           "drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1); needs "
+           "--footprint data"}) {
     CAPTURE(description);
     CHECK_THAT(help, ContainsSubstring(description));
   }
@@ -531,11 +533,17 @@ TEST_CASE("a --tolerance with a comma or without a value is a usage error naming
 }
 
 TEST_CASE("the --footprint flag takes window or data", "[meshcli]") {
-  // The example asks for data, so that a flag that was ignored would show in the window case.
+  // The example asks for data, so that a flag that was ignored would show in the window case. Its --min-piece, which
+  // needs --footprint data, is left out.
   const auto [text, expected] = GENERATE(table<const char*, MeshOptions::Footprint>(
       {{"window", MeshOptions::Footprint::Window}, {"data", MeshOptions::Footprint::Data}}));
   CAPTURE(text);
-  const Parsed p = parse(exampleWith("--footprint", text));
+  std::vector<const char*> argv = exampleWithout("--min-piece");
+  const auto footprint = std::find_if(argv.begin(), argv.end(),
+                                      [](const char* arg) { return std::string_view(arg) == "--footprint"; });
+  REQUIRE(footprint != argv.end());
+  *std::next(footprint) = text;
+  const Parsed p = parse(argv);
   REQUIRE_FALSE(p.outcome.exitNow);
   CHECK(p.options.footprint == expected);
   CHECK(validateMeshOptions(p.options).empty());
@@ -594,7 +602,8 @@ TEST_CASE("the --min-piece flag takes zero or a positive decimal", "[meshcli]") 
   CAPTURE(text);
   const Parsed p = parse(exampleWith("--min-piece", text));
   REQUIRE_FALSE(p.outcome.exitNow);
-  CHECK_THAT(p.options.minPiece, WithinAbs(expected, 1e-15));
+  REQUIRE(p.options.minPiece.has_value());
+  CHECK_THAT(*p.options.minPiece, WithinAbs(expected, 1e-15));
   CHECK(validateMeshOptions(p.options).empty());
 }
 
@@ -603,7 +612,8 @@ TEST_CASE("a negative --min-piece parses and validate refuses it", "[meshcli]") 
   CAPTURE(text);
   const Parsed p = parse(exampleWith("--min-piece", text.c_str()));
   REQUIRE_FALSE(p.outcome.exitNow);
-  CHECK(p.options.minPiece < 0);
+  REQUIRE(p.options.minPiece.has_value());
+  CHECK(*p.options.minPiece < 0);
   CHECK(validateMeshOptions(p.options) == "min-piece must be zero or positive");
 }
 
@@ -643,6 +653,33 @@ TEST_CASE("a --blocks without --tile parses and validate refuses it", "[meshcli]
   REQUIRE_FALSE(tileOnly.outcome.exitNow);
   CHECK_FALSE(tileOnly.options.blocks.has_value());
   CHECK(validateMeshOptions(tileOnly.options).empty());
+}
+
+TEST_CASE("a --min-piece without --footprint data parses and validate refuses it", "[meshcli]") {
+  // It drops pieces of the data's footprint; with the window's there are none, and it would do nothing.
+  const Parsed alone = parse(requiredWith({"--min-piece", "5"}));
+  REQUIRE_FALSE(alone.outcome.exitNow);
+  REQUIRE(alone.options.minPiece.has_value());
+  CHECK(validateMeshOptions(alone.options) == "--min-piece requires --footprint data");
+
+  // With --footprint window given or left out, among all the other flags of the example.
+  const Parsed window = parse(exampleWith("--footprint", "window"));
+  REQUIRE_FALSE(window.outcome.exitNow);
+  CHECK(validateMeshOptions(window.options) == "--min-piece requires --footprint data");
+  const Parsed unsaid = parse(exampleWithout("--footprint"));
+  REQUIRE_FALSE(unsaid.outcome.exitNow);
+  CHECK(validateMeshOptions(unsaid.options) == "--min-piece requires --footprint data");
+
+  // The flag given is what is refused, whatever its value, its default included.
+  const Parsed atDefault = parse(requiredWith({"--min-piece", "1"}));
+  REQUIRE_FALSE(atDefault.outcome.exitNow);
+  CHECK(validateMeshOptions(atDefault.options) == "--min-piece requires --footprint data");
+
+  // --footprint data alone is fine: the default applies.
+  const Parsed dataOnly = parse(requiredWith({"--footprint", "data"}));
+  REQUIRE_FALSE(dataOnly.outcome.exitNow);
+  CHECK_FALSE(dataOnly.options.minPiece.has_value());
+  CHECK(validateMeshOptions(dataOnly.options).empty());
 }
 
 TEST_CASE("each footprint and tile flag without a value, or before another flag, is a usage error naming it",
@@ -856,7 +893,8 @@ TEST_CASE("flags that are not given leave the caller's footprint, tile, blocks a
   CHECK(*p.options.tile == 7.0);
   REQUIRE(p.options.blocks.has_value());
   CHECK(*p.options.blocks == "1:1");
-  CHECK(p.options.minPiece == 3.0);
+  REQUIRE(p.options.minPiece.has_value());
+  CHECK(*p.options.minPiece == 3.0);
 }
 
 TEST_CASE("the default options are valid", "[meshcli]") {
@@ -1002,10 +1040,11 @@ TEST_CASE("validate wants a tile that is positive and finite, and lets it be abs
   }
 }
 
-TEST_CASE("validate wants a min-piece that is zero or positive and finite", "[meshcli]") {
+TEST_CASE("validate wants a min-piece that is zero or positive and finite, and lets it be absent", "[meshcli]") {
   MeshOptions options = validOptions();
-  CHECK(options.minPiece == 1.0);
+  CHECK_FALSE(options.minPiece.has_value());
   CHECK(validateMeshOptions(options).empty());
+  options.footprint = MeshOptions::Footprint::Data;
   // 0 drops no piece, and -0 is 0.
   for (const double ok : {0.0, -0.0, 1e-9, 1.0, 2.5, 1e6}) {
     CAPTURE(ok);
@@ -1023,6 +1062,17 @@ TEST_CASE("validate wants a min-piece that is zero or positive and finite", "[me
     options.minPiece = bad;
     CHECK(validateMeshOptions(options) == "min-piece must be finite");
   }
+}
+
+TEST_CASE("validate wants --footprint data with a --min-piece, and nothing without one", "[meshcli]") {
+  MeshOptions options = validOptions();
+  CHECK(validateMeshOptions(options).empty());
+  options.minPiece = 1;
+  CHECK(validateMeshOptions(options) == "--min-piece requires --footprint data");
+  options.footprint = MeshOptions::Footprint::Data;
+  CHECK(validateMeshOptions(options).empty());
+  options.minPiece.reset();
+  CHECK(validateMeshOptions(options).empty());
 }
 
 TEST_CASE("validate wants a tile with --blocks, and does not read the blocks", "[meshcli]") {
@@ -1074,5 +1124,7 @@ TEST_CASE("validate returns the first problem in the documented order", "[meshcl
   options.minPiece = 0;
   CHECK(validateMeshOptions(options) == "--blocks requires --tile");
   options.tile = 100;
+  CHECK(validateMeshOptions(options) == "--min-piece requires --footprint data");
+  options.footprint = MeshOptions::Footprint::Data;
   CHECK(validateMeshOptions(options).empty());
 }
