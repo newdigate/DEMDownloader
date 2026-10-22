@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "IslandFixture.h"
 #include "mesh/Footprint.h"
 #include "mesh/Predicates.h"
 
@@ -36,60 +37,6 @@ using demdl::mesh::resampleMaskNearest;
 // reading of the code under test.
 
 namespace {
-
-// ---------------------------------------------------------------------------------------------------------------------
-// The island, kept apart from the rest of the file so that it can be lifted into a fixture header as it stands.
-
-constexpr int kIslandCols = 24;
-constexpr int kIslandRows = 18;
-
-// The island's samples, kIslandCols x kIslandRows, row by row from the north-west: '#' data, '.' no-data. Columns are
-// counted from 0 at the west and rows from 0 at the north.
-// - The island: 9 x 9 samples, columns 4 to 12 and rows 2 to 10, with a tab of 2 x 5 samples, columns 13 and 14 and
-//   rows 4 to 8, that carries it east across column 12, so that a block side down column 12 or 13 cuts it, and one
-//   along row 9 does too.
-// - Inside it a lake of 2 x 2 no-data samples, columns 7 and 8 and rows 5 and 6, joined to the sea by a channel of
-//   no-data one sample wide along row 5, columns 4 to 6.
-// - An islet of 3 x 3 samples, columns 4 to 6 and rows 13 to 15.
-// - A single data sample alone, at column 18 and row 13.
-// - Two blobs of 3 x 3 samples, columns 17 to 19 and rows 2 to 4, and columns 19 to 21 and rows 4 to 6, which share the
-//   sample at column 19 and row 4: as cells, two blobs of 2 x 2 that touch at that one vertex.
-// Every feature is at least two no-data samples from the grid's edge and from every other feature. A gap of two
-// samples is three cells, and the closing joins nothing across a gap of three.
-std::vector<std::string> islandMaskRows() {
-  return {
-      "........................",  //  0
-      "........................",  //  1
-      "....#########....###....",  //  2
-      "....#########....###....",  //  3
-      "....###########..#####..",  //  4
-      ".........######....###..",  //  5
-      "....###..######....###..",  //  6
-      "....###########.........",  //  7
-      "....###########.........",  //  8
-      "....#########...........",  //  9
-      "....#########...........",  // 10
-      "........................",  // 11
-      "........................",  // 12
-      "....###...........#.....",  // 13
-      "....###.................",  // 14
-      "....###.................",  // 15
-      "........................",  // 16
-      "........................",  // 17
-  };
-}
-
-// The island's samples as a mask: 1 for data, 0 for no-data, row by row from the north-west.
-std::vector<std::uint8_t> islandMask() {
-  std::vector<std::uint8_t> mask;
-  for (const std::string& row : islandMaskRows()) {
-    for (const char c : row) mask.push_back(c == '#' ? 1 : 0);
-  }
-  return mask;
-}
-
-// End of the island.
-// ---------------------------------------------------------------------------------------------------------------------
 
 constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
 constexpr float kInfinity = std::numeric_limits<float>::infinity();
