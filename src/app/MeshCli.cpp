@@ -72,6 +72,14 @@ std::string checkBlenderName(const std::string& text) {
   return "must name the Blender executable, not " + quoted(text);
 }
 
+// An empty --blocks names no block. It is refused here, as an empty --blender is, so that it is a usage error whatever
+// main goes on to do. Whether the text is ROWS:COLS is for main to say, with parseBlocks (mesh/Tiles.h), which puts
+// the flag in front of its messages; that is why the text is kept as typed.
+std::string checkBlocksText(const std::string& text) {
+  if (!text.empty()) return {};
+  return "must be ROWS:COLS, such as 3-5:2-4 or 7:12, not " + quoted(text);
+}
+
 }  // namespace
 
 ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& options, std::ostream& out,
@@ -89,15 +97,22 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   const CLI::Validator gridText([](const std::string& text) { return readGrid(text).problem; }, "");
   const CLI::Validator fileStem(checkFileStem, "");
   const CLI::Validator blenderName(checkBlenderName, "");
+  const CLI::Validator blocksText(checkBlocksText, "");
+  // --footprint takes window or data and nothing else; any other text is a usage error that names both. The
+  // validator's own description is dropped: the option's type name, window|data, says as much in the help.
+  const CLI::Validator footprintValue = CLI::IsMember({"window", "data"}).description("");
 
-  // Parsed into locals so that the paths, the optional values and the grid are assigned only when the whole command
-  // line has parsed. Every flag sits in the order of the spec's table.
+  // Parsed into locals so that the paths, the optional values, the footprint and the grid are assigned only when the
+  // whole command line has parsed. Every flag sits in the order of the spec's table.
   std::string input;
   std::string outputStem;
   BoundingBox crop;
   std::string gridArg;
   double base = 0;
   double tolerance = 0;
+  std::string footprint;
+  double tile = 0;
+  std::string blocks;
   std::string blender;
   app.add_option("-i,--input", input, "GeoTIFF elevation model to read")
       ->type_name("PATH")
@@ -156,6 +171,31 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
                      "simplify the mesh to a TIN whose vertical error at any grid sample is at most FLOAT model units "
                      "(after --z-scale and --scale), above 0; absent, the full grid is written")
           ->check(decimal);
+  // The type names are the forms of the spec's table, and the descriptions of --tile and --min-piece refer to SIZE and
+  // A by them.
+  CLI::Option* const footprintOption =
+      app.add_option("--footprint", footprint,
+                     "where the solid exists: window, the whole window as today; data, only where the DEM has data, "
+                     "with a wall along the data's edge (default window)")
+          ->type_name("window|data")
+          ->check(footprintValue);
+  CLI::Option* const tileOption =
+      app.add_option("--tile", tile,
+                     "split the window into square blocks of SIZE model units, each written as STEM_rRR_cCC.stl, "
+                     "above 0; absent, one solid is written")
+          ->type_name("SIZE")
+          ->check(decimal);
+  CLI::Option* const blocksOption =
+      app.add_option("--blocks", blocks,
+                     "write only these blocks, each part a number or a range from 1, such as 3-5:2-4 or 7:12; "
+                     "the others are listed")
+          ->type_name("ROWS:COLS")
+          ->check(notFlagLike)
+          ->check(blocksText);
+  app.add_option("--min-piece", options.minPiece,
+                 "drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1)")
+      ->type_name("A")
+      ->check(decimal);
   app.add_flag("--no-blend", options.noBlend, "write the STL and PLY only; do not run Blender");
   CLI::Option* const blenderOption =
       app.add_option("--blender", blender,
@@ -182,6 +222,12 @@ ParseOutcome parseMeshArgs(int argc, const char* const* argv, MeshOptions& optio
   if (gridOption->count() > 0) options.grid = readGrid(gridArg).size;
   if (baseOption->count() > 0) options.base = base;
   if (toleranceOption->count() > 0) options.tolerance = tolerance;
+  // The check let through window and data only.
+  if (footprintOption->count() > 0) {
+    options.footprint = footprint == "data" ? MeshOptions::Footprint::Data : MeshOptions::Footprint::Window;
+  }
+  if (tileOption->count() > 0) options.tile = tile;
+  if (blocksOption->count() > 0) options.blocks = blocks;
   if (blenderOption->count() > 0) options.blender = std::filesystem::path(blender);
   return {false, 0};
 }
@@ -208,6 +254,13 @@ std::string validateMeshOptions(const MeshOptions& options) {
     if (!std::isfinite(*options.tolerance)) return "tolerance must be finite";
     if (!(*options.tolerance > 0)) return "tolerance must be positive";
   }
+  if (options.tile) {
+    if (!std::isfinite(*options.tile)) return "tile must be finite";
+    if (!(*options.tile > 0)) return "tile must be positive";
+  }
+  if (!std::isfinite(options.minPiece)) return "min-piece must be finite";
+  if (options.minPiece < 0) return "min-piece must be zero or positive";
+  if (options.blocks && !options.tile) return "--blocks requires --tile";
   return {};
 }
 

@@ -65,6 +65,10 @@ const std::vector<const char*> kExample = {
     "--scale", "0.02",
     "--plinth", "3",
     "--tolerance", "0.05",
+    "--footprint", "data",
+    "--tile", "100",
+    "--blocks", "3-5:2-4",
+    "--min-piece", "2.5",
     "--no-blend",
     "--blender", "/x/blender",
     "--overwrite",
@@ -148,6 +152,12 @@ TEST_CASE("the example command line fills every MeshOptions field", "[meshcli]")
   CHECK_THAT(p.options.plinth, WithinAbs(3.0, 1e-12));
   REQUIRE(p.options.tolerance.has_value());
   CHECK_THAT(*p.options.tolerance, WithinAbs(0.05, 1e-12));
+  CHECK(p.options.footprint == MeshOptions::Footprint::Data);
+  REQUIRE(p.options.tile.has_value());
+  CHECK_THAT(*p.options.tile, WithinAbs(100.0, 1e-12));
+  REQUIRE(p.options.blocks.has_value());
+  CHECK(*p.options.blocks == "3-5:2-4");
+  CHECK_THAT(p.options.minPiece, WithinAbs(2.5, 1e-12));
   CHECK(p.options.noBlend);
   REQUIRE(p.options.blender.has_value());
   CHECK(*p.options.blender == "/x/blender");
@@ -169,6 +179,10 @@ TEST_CASE("the two required flags alone leave everything else at its default", "
   CHECK(p.options.scale == 1.0);
   CHECK(p.options.plinth == 2.0);
   CHECK_FALSE(p.options.tolerance.has_value());
+  CHECK(p.options.footprint == MeshOptions::Footprint::Window);
+  CHECK_FALSE(p.options.tile.has_value());
+  CHECK_FALSE(p.options.blocks.has_value());
+  CHECK(p.options.minPiece == 1.0);
   CHECK_FALSE(p.options.noBlend);
   CHECK_FALSE(p.options.blender.has_value());
   CHECK_FALSE(p.options.overwrite);
@@ -217,8 +231,9 @@ TEST_CASE("the --help flag prints usage and exits successfully", "[meshcli]") {
 TEST_CASE("the help lists every flag", "[meshcli]") {
   const Parsed p = parse({"--help"});
   for (const char* flag : {"--input", "--output", "--north", "--south", "--east", "--west", "--grid", "--z-scale",
-                           "--base", "--scale", "--plinth", "--tolerance", "--no-blend", "--blender", "--overwrite",
-                           "--dry-run", "--verbose", "--version"}) {
+                           "--base", "--scale", "--plinth", "--tolerance", "--footprint", "--tile", "--blocks",
+                           "--min-piece", "--no-blend", "--blender", "--overwrite", "--dry-run", "--verbose",
+                           "--version"}) {
     CAPTURE(flag);
     CHECK_THAT(p.out, ContainsSubstring(flag));
   }
@@ -235,10 +250,32 @@ TEST_CASE("the help states the ranges and defaults", "[meshcli]") {
            "model units per metre in the STL and PLY, above 0 (default 1; 0.02 makes a 10 km window 200 mm wide)",
            "minimum thickness under the lowest point, model units after scaling, 0 or more (default 2)",
            "simplify the mesh to a TIN whose vertical error at any grid sample is at most FLOAT model units (after "
-           "--z-scale and --scale), above 0; absent, the full grid is written"}) {
+           "--z-scale and --scale), above 0; absent, the full grid is written",
+           "where the solid exists: window, the whole window as today; data, only where the DEM has data, with a wall "
+           "along the data's edge (default window)",
+           "split the window into square blocks of SIZE model units, each written as STEM_rRR_cCC.stl, above 0; "
+           "absent, one solid is written",
+           "write only these blocks, each part a number or a range from 1, such as 3-5:2-4 or 7:12; the others are "
+           "listed",
+           "drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1)"}) {
     CAPTURE(description);
     CHECK_THAT(help, ContainsSubstring(description));
   }
+}
+
+TEST_CASE("the help lists the footprint and tile flags after --tolerance, each with its placeholder", "[meshcli]") {
+  const std::string help = squashed(parse({"--help"}).out);
+  // The descriptions of --tile and --min-piece speak of SIZE and A, so the help has to show them. The flags follow
+  // --tolerance in the order of the spec's table and come before --no-blend.
+  std::size_t at = help.find("--tolerance FLOAT");
+  REQUIRE(at != std::string::npos);
+  for (const char* usage : {"--footprint window|data", "--tile SIZE", "--blocks ROWS:COLS", "--min-piece A"}) {
+    CAPTURE(usage);
+    const std::size_t found = help.find(usage, at);
+    REQUIRE(found != std::string::npos);
+    at = found + 1;
+  }
+  CHECK(help.find("--no-blend", at) != std::string::npos);
 }
 
 TEST_CASE("the help gives each crop edge its own range", "[meshcli]") {
@@ -492,6 +529,140 @@ TEST_CASE("a --tolerance with a comma or without a value is a usage error naming
   CHECK_THAT(beforeFlag.err, ContainsSubstring(", not '--dry-run'\n"));
 }
 
+TEST_CASE("the --footprint flag takes window or data", "[meshcli]") {
+  // The example asks for data, so that a flag that was ignored would show in the window case.
+  const auto [text, expected] = GENERATE(table<const char*, MeshOptions::Footprint>(
+      {{"window", MeshOptions::Footprint::Window}, {"data", MeshOptions::Footprint::Data}}));
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--footprint", text));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK(p.options.footprint == expected);
+  CHECK(validateMeshOptions(p.options).empty());
+}
+
+TEST_CASE("a --footprint other than window or data is a usage error naming both values", "[meshcli]") {
+  // The check is exact: a capital, a longer or a shorter word and a list are refused as "sea" is.
+  const std::string text = GENERATE(as<std::string>{}, "sea", "Window", "DATA", "win", "windows", "window,data", "");
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--footprint", text.c_str()));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, StartsWith("error: --footprint: "));
+  CHECK_THAT(p.err, ContainsSubstring(" not in {window,data}"));
+}
+
+TEST_CASE("the --footprint and --tile flags each work alone and together", "[meshcli]") {
+  // Spec 5.1: data works with or without tiles, and tiles work with the window as well.
+  const std::vector<const char*> more = GENERATE(values<std::vector<const char*>>({
+      {"--footprint", "data"},
+      {"--tile", "100"},
+      {"--footprint", "window", "--tile", "100"},
+      {"--footprint", "data", "--tile", "100"},
+  }));
+  CAPTURE(more);
+  std::vector<const char*> argv = kRequired;
+  argv.insert(argv.end(), more.begin(), more.end());
+  const Parsed p = parse(argv);
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK(validateMeshOptions(p.options).empty());
+}
+
+TEST_CASE("the --tile flag takes a positive decimal", "[meshcli]") {
+  const auto [text, expected] = GENERATE(table<const char*, double>(
+      {{"100", 100.0}, {"12.5", 12.5}, {".5", 0.5}, {"1e2", 100.0}, {"1e-9", 1e-9}, {"5000", 5000.0}}));
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--tile", text));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  REQUIRE(p.options.tile.has_value());
+  CHECK_THAT(*p.options.tile, WithinAbs(expected, 1e-15));
+  CHECK(validateMeshOptions(p.options).empty());
+}
+
+TEST_CASE("a --tile of 0 or less parses and validate refuses it", "[meshcli]") {
+  const std::string text = GENERATE(as<std::string>{}, "0", "0.0", "-0", "-1", "-100");
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--tile", text.c_str()));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  REQUIRE(p.options.tile.has_value());
+  CHECK(validateMeshOptions(p.options) == "tile must be positive");
+}
+
+TEST_CASE("the --min-piece flag takes zero or a positive decimal", "[meshcli]") {
+  const auto [text, expected] = GENERATE(table<const char*, double>(
+      {{"0", 0.0}, {"-0", 0.0}, {"1", 1.0}, {"2.5", 2.5}, {".5", 0.5}, {"1e3", 1000.0}, {"1e-9", 1e-9}}));
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--min-piece", text));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK_THAT(p.options.minPiece, WithinAbs(expected, 1e-15));
+  CHECK(validateMeshOptions(p.options).empty());
+}
+
+TEST_CASE("a negative --min-piece parses and validate refuses it", "[meshcli]") {
+  const std::string text = GENERATE(as<std::string>{}, "-1", "-0.5", "-1e-9");
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--min-piece", text.c_str()));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK(p.options.minPiece < 0);
+  CHECK(validateMeshOptions(p.options) == "min-piece must be zero or positive");
+}
+
+TEST_CASE("the --blocks flag keeps its text as typed", "[meshcli]") {
+  // parseBlocks (mesh/Tiles.h) reads the text in main, so that its messages can name the flag; here it is only kept.
+  const std::string text = GENERATE(as<std::string>{}, "3-5:2-4", "7:12", "03:05", "1:1", "not:blocks");
+  CAPTURE(text);
+  const Parsed p = parse(exampleWith("--blocks", text.c_str()));
+  REQUIRE_FALSE(p.outcome.exitNow);
+  REQUIRE(p.options.blocks.has_value());
+  CHECK(*p.options.blocks == text);
+  CHECK(validateMeshOptions(p.options).empty());
+}
+
+TEST_CASE("an empty --blocks is a usage error naming --blocks, as an empty --blender is", "[meshcli]") {
+  // It names no block, so it is refused with the parser's other usage errors, whatever main does with the text.
+  const Parsed p = parse(requiredWith({"--tile", "100", "--blocks", ""}));
+  CHECK(p.outcome.exitNow);
+  CHECK(p.outcome.exitCode == 1);
+  CHECK_THAT(p.err, StartsWith("error: --blocks: must be ROWS:COLS, such as 3-5:2-4 or 7:12, not ''\n"));
+}
+
+TEST_CASE("a --blocks without --tile parses and validate refuses it", "[meshcli]") {
+  const Parsed alone = parse(requiredWith({"--blocks", "3-5:2-4"}));
+  REQUIRE_FALSE(alone.outcome.exitNow);
+  REQUIRE(alone.options.blocks.has_value());
+  CHECK_FALSE(alone.options.tile.has_value());
+  CHECK(validateMeshOptions(alone.options) == "--blocks requires --tile");
+
+  // Among all the other flags of the example as well.
+  const Parsed example = parse(exampleWithout("--tile"));
+  REQUIRE_FALSE(example.outcome.exitNow);
+  CHECK(validateMeshOptions(example.options) == "--blocks requires --tile");
+
+  // --tile alone is fine: every block is written.
+  const Parsed tileOnly = parse(requiredWith({"--tile", "100"}));
+  REQUIRE_FALSE(tileOnly.outcome.exitNow);
+  CHECK_FALSE(tileOnly.options.blocks.has_value());
+  CHECK(validateMeshOptions(tileOnly.options).empty());
+}
+
+TEST_CASE("each footprint and tile flag without a value, or before another flag, is a usage error naming it",
+          "[meshcli]") {
+  const auto [flag, placeholder] = GENERATE(table<const char*, const char*>(
+      {{"--footprint", "window|data"}, {"--tile", "SIZE"}, {"--blocks", "ROWS:COLS"}, {"--min-piece", "A"}}));
+  CAPTURE(flag, placeholder);
+  // Nothing follows the flag to be read as its value.
+  const Parsed last = parse(requiredWith({flag}));
+  CHECK(last.outcome.exitNow);
+  CHECK(last.outcome.exitCode == 1);
+  CHECK_THAT(last.err, StartsWith(std::string("error: ") + flag + ": "));
+  CHECK_THAT(last.err, ContainsSubstring(std::string("1 required ") + placeholder + " missing"));
+
+  // The next flag is taken for the value and refused, so that a forgotten value does not swallow it silently.
+  const Parsed beforeFlag = parse(requiredWith({flag, "--dry-run"}));
+  CHECK(beforeFlag.outcome.exitNow);
+  CHECK(beforeFlag.outcome.exitCode == 1);
+  CHECK_THAT(beforeFlag.err, StartsWith(std::string("error: ") + flag + ": "));
+}
+
 TEST_CASE("the --base flag may be negative, zero or positive", "[meshcli]") {
   const auto [text, expected] = GENERATE(table<const char*, double>({{"-5", -5.0}, {"0", 0.0}, {"1500.5", 1500.5}}));
   CAPTURE(text);
@@ -558,7 +729,7 @@ TEST_CASE("help still wins over a bad crop value", "[meshcli]") {
 
 TEST_CASE("each numeric flag runs the decimal check", "[meshcli]") {
   const std::string flag = GENERATE(as<std::string>{}, "--north", "--south", "--east", "--west", "--z-scale", "--base",
-                                    "--scale", "--plinth", "--tolerance");
+                                    "--scale", "--plinth", "--tolerance", "--tile", "--min-piece");
   CAPTURE(flag);
   const Parsed p = parse(exampleWith(flag.c_str(), "1,5"));
   CHECK(p.outcome.exitNow);
@@ -576,6 +747,8 @@ TEST_CASE("a decimal beyond the range of a double parses as infinity and validat
        {"--base", "1e999", "base must be finite"},
        {"--plinth", "1e999", "plinth must be finite"},
        {"--tolerance", "1e999", "tolerance must be finite"},
+       {"--tile", "-1e999", "tile must be finite"},
+       {"--min-piece", "-1e999", "min-piece must be finite"},
        {"--north", "1e999", "bounding box values must be finite numbers"}}));
   CAPTURE(flag, value);
   const Parsed p = parse(exampleWith(flag, value));
@@ -591,6 +764,7 @@ TEST_CASE("a string option refuses a value that looks like a flag", "[meshcli]")
       {"-i", "in.tif", "-o", "--dry-run"},
       {"-i", "in.tif", "--output", "--overwrite"},
       {"-i", "in.tif", "-o", "out", "--blender", "--verbose"},
+      {"-i", "in.tif", "-o", "out", "--blocks", "--verbose"},
   }));
   const Parsed p = parse(argv);
   CHECK(p.outcome.exitNow);
@@ -651,6 +825,37 @@ TEST_CASE("a usage error leaves the paths as the caller had them", "[meshcli]") 
   CHECK(p.options.input == "keep.tif");
   CHECK(p.options.outputStem == "keep");
   CHECK_FALSE(p.options.blender.has_value());
+}
+
+TEST_CASE("a usage error leaves the footprint, the tile and the blocks as the caller had them", "[meshcli]") {
+  MeshOptions before;
+  before.tile = 7;
+  before.blocks = "1:1";
+  // The example asks for data, 100 and 3-5:2-4. --min-piece comes after the other three, on the command line and in
+  // the parser, so they have been read by the time its value is refused.
+  const Parsed p = parse(exampleWith("--min-piece", "2,5"), before);
+  REQUIRE(p.outcome.exitNow);
+  CHECK(p.options.footprint == MeshOptions::Footprint::Window);
+  REQUIRE(p.options.tile.has_value());
+  CHECK(*p.options.tile == 7.0);
+  REQUIRE(p.options.blocks.has_value());
+  CHECK(*p.options.blocks == "1:1");
+}
+
+TEST_CASE("flags that are not given leave the caller's footprint, tile, blocks and min-piece alone", "[meshcli]") {
+  MeshOptions before;
+  before.footprint = MeshOptions::Footprint::Data;
+  before.tile = 7;
+  before.blocks = "1:1";
+  before.minPiece = 3;
+  const Parsed p = parse(kRequired, before);
+  REQUIRE_FALSE(p.outcome.exitNow);
+  CHECK(p.options.footprint == MeshOptions::Footprint::Data);
+  REQUIRE(p.options.tile.has_value());
+  CHECK(*p.options.tile == 7.0);
+  REQUIRE(p.options.blocks.has_value());
+  CHECK(*p.options.blocks == "1:1");
+  CHECK(p.options.minPiece == 3.0);
 }
 
 TEST_CASE("the default options are valid", "[meshcli]") {
@@ -774,6 +979,64 @@ TEST_CASE("validate wants a tolerance that is positive and finite, and lets it b
   }
 }
 
+TEST_CASE("validate wants a tile that is positive and finite, and lets it be absent", "[meshcli]") {
+  MeshOptions options = validOptions();
+  CHECK_FALSE(options.tile.has_value());
+  CHECK(validateMeshOptions(options).empty());
+  for (const double ok : {1e-9, 0.5, 100.0, 1e6}) {
+    CAPTURE(ok);
+    options.tile = ok;
+    CHECK(validateMeshOptions(options).empty());
+  }
+  for (const double bad : {0.0, -0.0, -0.5, -1e6}) {
+    CAPTURE(bad);
+    options.tile = bad;
+    CHECK(validateMeshOptions(options) == "tile must be positive");
+  }
+  // NaN is not positive either, and is called what it is.
+  for (const double bad : {kNaN, kInf, -kInf}) {
+    CAPTURE(bad);
+    options.tile = bad;
+    CHECK(validateMeshOptions(options) == "tile must be finite");
+  }
+}
+
+TEST_CASE("validate wants a min-piece that is zero or positive and finite", "[meshcli]") {
+  MeshOptions options = validOptions();
+  CHECK(options.minPiece == 1.0);
+  CHECK(validateMeshOptions(options).empty());
+  // 0 drops no piece, and -0 is 0.
+  for (const double ok : {0.0, -0.0, 1e-9, 1.0, 2.5, 1e6}) {
+    CAPTURE(ok);
+    options.minPiece = ok;
+    CHECK(validateMeshOptions(options).empty());
+  }
+  for (const double bad : {-1e-9, -1.0, -1e6}) {
+    CAPTURE(bad);
+    options.minPiece = bad;
+    CHECK(validateMeshOptions(options) == "min-piece must be zero or positive");
+  }
+  // NaN is neither, and is called what it is.
+  for (const double bad : {kNaN, kInf, -kInf}) {
+    CAPTURE(bad);
+    options.minPiece = bad;
+    CHECK(validateMeshOptions(options) == "min-piece must be finite");
+  }
+}
+
+TEST_CASE("validate wants a tile with --blocks, and does not read the blocks", "[meshcli]") {
+  MeshOptions options = validOptions();
+  options.blocks = "3-5:2-4";
+  CHECK(validateMeshOptions(options) == "--blocks requires --tile");
+  options.tile = 100;
+  CHECK(validateMeshOptions(options).empty());
+  // The form of the text is for main to read with parseBlocks, so that its messages can name the flag.
+  options.blocks = "not blocks";
+  CHECK(validateMeshOptions(options).empty());
+  options.tile.reset();
+  CHECK(validateMeshOptions(options) == "--blocks requires --tile");
+}
+
 TEST_CASE("validate returns the first problem in the documented order", "[meshcli]") {
   MeshOptions options = validOptions();
   options.crop = BoundingBox{-34.0, -33.9, 18.5, 18.3};
@@ -783,6 +1046,9 @@ TEST_CASE("validate returns the first problem in the documented order", "[meshcl
   options.base = kNaN;
   options.plinth = -1;
   options.tolerance = 0;
+  options.tile = kNaN;
+  options.minPiece = kNaN;
+  options.blocks = "3-5:2-4";
   CHECK(validateMeshOptions(options) == "north must be greater than south");
   options.crop.reset();
   CHECK(validateMeshOptions(options) == "grid must be at least 2 x 2");
@@ -797,5 +1063,15 @@ TEST_CASE("validate returns the first problem in the documented order", "[meshcl
   options.plinth = 0;
   CHECK(validateMeshOptions(options) == "tolerance must be positive");
   options.tolerance = 0.05;
+  CHECK(validateMeshOptions(options) == "tile must be finite");
+  options.tile = 0;
+  CHECK(validateMeshOptions(options) == "tile must be positive");
+  options.tile.reset();
+  CHECK(validateMeshOptions(options) == "min-piece must be finite");
+  options.minPiece = -1;
+  CHECK(validateMeshOptions(options) == "min-piece must be zero or positive");
+  options.minPiece = 0;
+  CHECK(validateMeshOptions(options) == "--blocks requires --tile");
+  options.tile = 100;
   CHECK(validateMeshOptions(options).empty());
 }
