@@ -1813,6 +1813,70 @@ TEST_CASE("window tiles are full squares", "[mesh-e2e]") {
   }
 }
 
+TEST_CASE("at --scale 0.5 the blocks' frames, the tiles: line and a dropped piece's area are in model units",
+          "[mesh-e2e]") {
+  // Worked out by hand from the island's box (IslandFixture.h), not with the library: the samples are at the pixels'
+  // north-west corners, so the window's middle latitude is (-33.80 - 33.8085) / 2 = -33.80425, where metresPerDegree's
+  // series gives 92596.243 m to a degree of longitude and 110918.865 m to one of latitude. A cell is then 0.0006 x
+  // 92596.243 = 55.557746 m by 0.0005 x 110918.865 = 55.459433 m, and at --scale 0.5 27.778873 by 27.729716 units,
+  // 770.300 square units. A --tile of 333.35 units is round(333.35 / 27.778873) = round(12.0001) = 12 cells wide and
+  // round(12.0214) = 12 tall, 666.69 x 665.51 m and 333.35 x 332.76 units: over the island's 23 x 17 cells a lattice of
+  // 2 x 2, the east column of blocks 11 cells wide and the south row 5 cells tall.
+  constexpr double kUnitsX = 27.778873, kUnitsY = 27.729716;
+  const Island island;
+  const auto run = [&island](const std::vector<std::string>& extra) {
+    std::vector<std::string> args{"-i", island.input.string(), "-o", island.stem.string(), "--no-blend", "--scale",
+                                  "0.5", "--z-scale", "2", "--tile", "333.35", "--tolerance", "0.5"};
+    args.insert(args.end(), extra.begin(), extra.end());
+    return runDem2Mesh(args, island.dir.path);
+  };
+  struct Square {
+    const char* name;
+    int cols, rows;  // its cells
+  };
+  const std::vector<Square> squares = {{"r1_c1", 12, 12}, {"r1_c2", 11, 12}, {"r2_c1", 12, 5}, {"r2_c2", 11, 5}};
+  const std::string tiles = "\ntiles: 2 x 2 blocks of 12 x 12 cells (666.69 x 665.51 m, 333.35 x 332.76 units); ";
+  const auto boundsOfBlock = [&island](const Square& square) {
+    return boundsOf(readBinaryStl(island.stem.string() + "_" + square.name + ".stl"));
+  };
+
+  SECTION("window blocks are their squares from (0, 0), exactly") {
+    const Finished result = run({"--footprint", "window"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    REQUIRE(result.exitCode() == 0);
+    CHECK_THAT(result.out, ContainsSubstring(tiles + "4 with land, 0 without, 3 cut short at the east or south edge\n"));
+    for (const Square& square : squares) {
+      CAPTURE(square.name);
+      const Bounds b = boundsOfBlock(square);
+      CHECK_THAT(b.minX, WithinAbs(0.0, 1e-3));
+      CHECK_THAT(b.minY, WithinAbs(0.0, 1e-3));
+      CHECK_THAT(b.maxX, WithinAbs(square.cols * kUnitsX, 1e-3));
+      CHECK_THAT(b.maxY, WithinAbs(square.rows * kUnitsY, 1e-3));
+    }
+  }
+  SECTION("footprint blocks lie in their squares, and the islet dropped under --min-piece is in square units") {
+    // 4000 square units lie between the islet's 4 cells, 4 x 770.300 = 3081.2, and the 8 of the tab that column 12 cuts
+    // off the island into the block east of it, the smallest piece kept.
+    const Finished result = run({"--footprint", "data", "--min-piece", "4000"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    REQUIRE(result.exitCode() == 0);
+    CHECK_THAT(result.out, ContainsSubstring(tiles + "2 with land, 2 without, 3 cut short at the east or south edge\n"));
+    CHECK_THAT(result.out, ContainsSubstring("\nskipped: no land in r2 c1, r2 c2\ndropped pieces: r2 c1 4 cells "
+                                             "3081.2 units2\n"));
+    for (const Square& square : {squares[0], squares[1]}) {
+      CAPTURE(square.name);
+      const Bounds b = boundsOfBlock(square);
+      CHECK(b.minX >= -1e-3);
+      CHECK(b.minY >= -1e-3);
+      CHECK(b.maxX <= square.cols * kUnitsX + 1e-3);
+      CHECK(b.maxY <= square.rows * kUnitsY + 1e-3);
+    }
+    // The tab reaches the west side of its block, and the island the east side of its own.
+    CHECK_THAT(boundsOfBlock(squares[1]).minX, WithinAbs(0.0, 1e-3));
+    CHECK_THAT(boundsOfBlock(squares[0]).maxX, WithinAbs(12 * kUnitsX, 1e-3));
+  }
+}
+
 TEST_CASE("a lattice or a selection that cannot be written is refused before anything is read", "[mesh-e2e]") {
   const Island island;
   const auto checkRefused = [&island](const Finished& result, const std::string& problem) {
