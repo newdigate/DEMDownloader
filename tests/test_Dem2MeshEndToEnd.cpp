@@ -1631,6 +1631,69 @@ TEST_CASE("stale block files are left alone and named", "[mesh-e2e]") {
   }
 }
 
+TEST_CASE("stale: names every block file of the stem that the run leaves behind, whatever lattice made it",
+          "[mesh-e2e]") {
+  // The lattice of 12-cell blocks first: 2 x 2 blocks, three of them with land, whose files are r1_c1, r1_c2 and r2_c1.
+  const Island island;
+  const std::vector<ExpectedBlock> twelve = island.expected(island.layout(12), true);
+  const Finished once = island.run({"--footprint", "data", "--tile", island.tile(12)});
+  INFO("first run, stdout:\n" << once.out << "stderr:\n" << once.err);
+  REQUIRE(once.exitCode() == 0);
+  std::vector<std::string> blockFiles;
+  for (const ExpectedBlock& b : twelve) {
+    if (b.land) blockFiles.push_back(island.blockStl(b).filename().string());
+  }
+  REQUIRE(blockFiles == std::vector<std::string>{"island_r1_c1.stl", "island_r1_c2.stl", "island_r2_c1.stl"});
+  // A block's file of the stem from a lattice padded another way, and names that only look like a block's: without a
+  // number, of another stem, with another extension, and a directory.
+  writeFile(island.outDir / "island_r01_c01.stl", "an old block\n");
+  writeFile(island.outDir / "island_r1_c.stl", "not a block\n");
+  writeFile(island.outDir / "other_r1_c1.stl", "another stem's\n");
+  writeFile(island.outDir / "island_r1_c1.stl.bak", "a copy\n");
+  REQUIRE(std::filesystem::create_directory(island.outDir / "island_r9_c9.stl"));
+  const std::string islet = readFile(island.outDir / "island_r2_c1.stl");
+
+  SECTION("a run in another lattice names every one of them, in name order, and leaves them as they were") {
+    // Blocks of 2 cells: a lattice of 12 x 9, named r1_c01 to r9_c12, none of them a name of the first run's.
+    const TileLayout two = island.layout(2);
+    REQUIRE(two.across == 12);
+    REQUIRE(two.down == 9);
+    const std::string stale = "stale: island_r01_c01.stl, island_r1_c1.stl, island_r1_c2.stl, island_r2_c1.stl\n";
+    const std::vector<std::string> args{"--footprint", "data", "--tile", island.tile(2), "--overwrite"};
+    std::vector<std::string> dryArgs = args;
+    dryArgs.push_back("--dry-run");
+    const Finished dry = island.run(dryArgs);
+    INFO("dry run, stdout:\n" << dry.out << "stderr:\n" << dry.err);
+    REQUIRE(dry.exitCode() == 0);
+    CHECK_THAT(dry.out, ContainsSubstring("\n  " + stale + "  solid: "));
+    const Finished again = island.run(args);
+    INFO("second run, stdout:\n" << again.out << "stderr:\n" << again.err);
+    REQUIRE(again.exitCode() == 0);
+    CHECK_THAT(again.out, ContainsSubstring("\n" + stale + "solid: "));
+    CHECK(fileHolds(island.outDir / "island_r2_c1.stl", islet));
+    CHECK(fileHolds(island.outDir / "island_r01_c01.stl", "an old block\n"));
+  }
+  SECTION("blocks outside --blocks keep their files unnamed") {
+    // The first lattice again, its west column of blocks selected and the islet dropped under --min-piece: r2_c1,
+    // selected and now without land, is named, and so is the file of the other padding; r1_c2, not selected, is not.
+    const double minPiece = 6 * island.cellX * island.cellY;  // above the islet's 4 cells
+    const Finished again = island.run({"--footprint", "data", "--tile", island.tile(12), "--blocks", "1-2:1",
+                                       "--min-piece", decimals(minPiece, 3), "--overwrite"});
+    INFO("second run, stdout:\n" << again.out << "stderr:\n" << again.err);
+    REQUIRE(again.exitCode() == 0);
+    CHECK_THAT(again.out, ContainsSubstring("\nnot selected: r1 c2, r2 c2\n"));
+    CHECK_THAT(again.out, ContainsSubstring("\nstale: island_r01_c01.stl, island_r2_c1.stl\nsolid: "));
+    CHECK(fileHolds(island.outDir / "island_r2_c1.stl", islet));
+  }
+  SECTION("a footprint without --tile names them all, its own STL being no block's") {
+    const Finished again = island.run({"--footprint", "data", "--overwrite"});
+    INFO("second run, stdout:\n" << again.out << "stderr:\n" << again.err);
+    REQUIRE(again.exitCode() == 0);
+    CHECK_THAT(again.out, ContainsSubstring("\ncorner contacts: 1\nstale: island_r01_c01.stl, island_r1_c1.stl, "
+                                            "island_r1_c2.stl, island_r2_c1.stl\nsolid: "));
+  }
+}
+
 TEST_CASE("the dry run plans tiles without writing", "[mesh-e2e]") {
   const Island island;
   const TileLayout layout = island.layout(12);

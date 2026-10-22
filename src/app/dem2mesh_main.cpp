@@ -22,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -304,7 +305,7 @@ struct Blocks {
   std::vector<std::size_t> skipped;      // selected, with no piece kept
   std::vector<std::size_t> notSelected;  // outside --blocks
   std::vector<DroppedPiece> dropped;
-  std::vector<std::size_t> stale;  // skipped, with an STL of an earlier run at its name, left alone (--overwrite)
+  std::vector<std::string> stale;  // the stem's block files that this run leaves behind, by name (staleFiles)
   std::uint64_t withLand = 0, cutShort = 0;
 };
 
@@ -622,12 +623,10 @@ std::string droppedLine(const MeshOptions& options, const Facts& f, const BlockP
   return line;
 }
 
-// "stale: cape-town_r01_c05.stl, ...": the STLs of an earlier run that this one left alone, by name.
-std::string staleLine(const BlockPlan& plan, const Blocks& blocks) {
+// "stale: cape-town_r01_c05.stl, ...": the block files of the stem that this run left behind, by name (staleFiles).
+std::string staleLine(const Blocks& blocks) {
   std::string line = "stale: ";
-  for (std::size_t k = 0; k < blocks.stale.size(); ++k) {
-    line += (k > 0 ? ", " : "") + plan.stls[blocks.stale[k]].filename().string();
-  }
+  for (std::size_t k = 0; k < blocks.stale.size(); ++k) line += (k > 0 ? ", " : "") + blocks.stale[k];
   return line;
 }
 
@@ -650,7 +649,7 @@ std::vector<std::string> blockLines(const MeshOptions& options, const Facts& f, 
   std::uint64_t contacts = 0;
   for (const SimplifiedBlock& b : blocks.written) contacts += b.cornerContacts;
   if (contacts > 0) lines.push_back("corner contacts: " + std::to_string(contacts));
-  if (!blocks.stale.empty()) lines.push_back(staleLine(plan, blocks));
+  if (!blocks.stale.empty()) lines.push_back(staleLine(blocks));
   return lines;
 }
 
@@ -890,6 +889,48 @@ void checkNoLatticeFileExists(const BlockPlan& plan, const Outputs& outputs) {
   refuseExisting(outputs.blend);
 }
 
+// Whether name is a block's file of the stem in some lattice, STEM_r<digits>_c<digits>.stl, its numbers of any length
+// and padding: "cape-town_r03_c05.stl" and "cape-town_r3_c5.stl", not "cape-town_r3_c.stl".
+bool isBlockFileName(std::string_view name, std::string_view stem) {
+  const auto skip = [&name](std::string_view text) {
+    if (!name.starts_with(text)) return false;
+    name.remove_prefix(text.size());
+    return true;
+  };
+  const auto skipDigits = [&name] {
+    const std::size_t count = std::min(name.find_first_not_of("0123456789"), name.size());
+    name.remove_prefix(count);
+    return count > 0;
+  };
+  return skip(stem) && skip("_r") && skipDigits() && skip("_c") && skipDigits() && name == ".stl";
+}
+
+// Part B 5.4: the block files of the stem that this run leaves behind, by name and in name order, which for one
+// lattice's files is lattice order: every regular file in the output directory named as a block's of any lattice
+// (isBlockFileName) that this run neither writes (in a dry run, would write) nor leaves alone as the file of a block of
+// its lattice outside --blocks. So the files of another lattice, which a change of --tile, --grid, --scale or crop
+// makes, are named too, though the refusal without --overwrite looks only at this lattice's names. A directory that
+// cannot be listed names none, as a name that cannot be looked at counts as nothing (anythingAt).
+std::vector<std::string> staleFiles(const MeshOptions& options, const BlockPlan& plan, const Blocks& blocks) {
+  std::set<std::string> accounted;
+  for (const SimplifiedBlock& b : blocks.written) accounted.insert(plan.stls[b.index].filename().string());
+  for (const std::size_t block : blocks.notSelected) accounted.insert(plan.stls[block].filename().string());
+  fs::path dir = options.outputStem.parent_path();
+  if (dir.empty()) dir = ".";
+  const std::string stem = options.outputStem.filename().string();
+  std::vector<std::string> stale;
+  std::error_code listing;
+  for (fs::directory_iterator entry(dir, listing), end; !listing && entry != end; entry.increment(listing)) {
+    const std::string name = entry->path().filename().string();
+    std::error_code ignored;
+    if (isBlockFileName(name, stem) && !accounted.contains(name) && entry->is_regular_file(ignored)) {
+      stale.push_back(name);
+    }
+  }
+  std::sort(stale.begin(), stale.end());
+  return stale;
+}
+
 // Part B 5.3, the first pass: every block of the lattice in order, its footprint cut from the grid's cells with
 // --footprint data (pieces under --min-piece dropped), and each one that is selected and holds land simplified into the
 // one surface of the whole area, which makes blocks that share a side share its vertices. The grid and the cells are
@@ -1066,8 +1107,8 @@ void writeBlocks(const MeshOptions& options, const BlockPlan& plan, Facts& f, co
 // one surface of the whole area, which is counted, limited and warned about as a simplified mesh is (spec 4.2), before
 // anything is written; the grid and the cells go once it is made. Then each block's solid is built, checked and
 // written; then the PLY of the whole area, which goes before Blender starts, the summary and Blender, as for one solid.
-// With --overwrite the STLs that blocks now without land left from an earlier run are left alone and named. The dry
-// run builds and checks everything, as for one solid, and writes nothing.
+// The block files of the stem that this run does not write, from an earlier run of this lattice or another, are left
+// alone and named (staleFiles). The dry run builds and checks everything, as for one solid, and writes nothing.
 int meshBlocks(const MeshOptions& options, const Outputs& outputs, const BlockPlan& plan, Facts& f,
                std::vector<float> grid, FootprintGrid footprint, StageClock& clock) {
   Blocks blocks = simplifyBlocks(options, f, plan, grid, footprint);
@@ -1079,11 +1120,7 @@ int meshBlocks(const MeshOptions& options, const Outputs& outputs, const BlockPl
   limitSimplifiedMesh(options, f);
   writeBlocks(options, plan, f, blocks);
   clock.lap("blocks");
-  if (options.overwrite) {
-    for (const std::size_t block : blocks.skipped) {
-      if (anythingAt(plan.stls[block])) blocks.stale.push_back(block);
-    }
-  }
+  blocks.stale = staleFiles(options, plan, blocks);
   f.stls.clear();
   for (const SimplifiedBlock& b : blocks.written) f.stls.push_back(plan.stls[b.index]);
   f.blockLines = blockLines(options, f, plan, blocks);
