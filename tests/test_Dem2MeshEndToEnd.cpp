@@ -8,43 +8,68 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "FakeBlender.h"
 #include "GeoTiffFixtures.h"
+#include "IslandFixture.h"
 #include "SpawnedProcess.h"
 #include "TempDir.h"
 #include "demdl/BoundingBox.h"
 #include "demdl/DemRaster.h"
+#include "mesh/BasePlane.h"
 #include "mesh/BlenderRunner.h"
 #include "mesh/CropWindow.h"
+#include "mesh/Footprint.h"
+#include "mesh/FootprintSolid.h"
 #include "mesh/GeoTiffGrid.h"
 #include "mesh/NoDataFill.h"
 #include "mesh/PlyWriter.h"
 #include "mesh/Resampler.h"
+#include "mesh/Simplifier.h"
 #include "mesh/SolidMesh.h"
 #include "mesh/StlWriter.h"
+#include "mesh/Tiles.h"
 #include "mesh/TransverseMercator.h"
 
 using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::EndsWith;
 using Catch::Matchers::StartsWith;
 using Catch::Matchers::WithinAbs;
+using demdl::mesh::BasePlane;
+using demdl::mesh::BlockFootprint;
+using demdl::mesh::blockFootprint;
+using demdl::mesh::blockName;
+using demdl::mesh::BlockRect;
+using demdl::mesh::blockRect;
+using demdl::mesh::BlockResult;
+using demdl::mesh::BlockSimplifier;
 using demdl::mesh::checkSolid;
+using demdl::mesh::chooseBasePlane;
+using demdl::mesh::cutShort;
+using demdl::mesh::dataMaskOf;
+using demdl::mesh::downwardFacingTriangles;
 using demdl::mesh::extentInMetres;
 using demdl::mesh::FillReport;
 using demdl::mesh::fillNearest;
 using demdl::mesh::findBlender;
+using demdl::mesh::footprintCells;
 using demdl::mesh::GridGeometry;
+using demdl::mesh::GridPoint;
 using demdl::mesh::inspectGeoTiff;
 using demdl::mesh::Mesh;
+using demdl::mesh::MeshCheck;
+using demdl::mesh::Piece;
 using demdl::mesh::PixelWindow;
 using demdl::mesh::pixelWindowFor;
 using demdl::mesh::plyFileBytes;
@@ -53,6 +78,8 @@ using demdl::mesh::readWindow;
 using demdl::mesh::resampleQuadratic;
 using demdl::mesh::solidTriangleCount;
 using demdl::mesh::stlFileBytes;
+using demdl::mesh::TileLayout;
+using demdl::mesh::tileLayout;
 using demdl::mesh::WindowExtent;
 
 namespace {
@@ -879,4 +906,808 @@ TEST_CASE("with no Blender to be found, a run writes the STL and PLY and fails, 
   CHECK(again.err == "error: " + notFound + "\n");
   CHECK_THAT(again.out, EndsWith("\nwrote: " + w.ply().string() + "\nblender: not found\n"));
   CHECK_FALSE(std::filesystem::exists(w.blend()));
+}
+
+// Part B, the simplify-and-tiles design's sections 5.2 to 5.4 and 7: the island of IslandFixture.h, cut off where its
+// data ends (--footprint data) and split into blocks (--tile), each written as a closed solid of its own.
+
+namespace {
+
+// The island's heights as a file of dl_elevation's holds them, its no-data as DemRaster::kNoData.
+std::vector<double> islandFileHeights() {
+  std::vector<double> heights;
+  for (const float h : islandHeights()) heights.push_back(std::isnan(h) ? demdl::DemRaster::kNoData : double{h});
+  return heights;
+}
+
+// value to `count` decimals, as dem2mesh prints a size or an area.
+std::string decimals(double value, int count) {
+  char text[64];
+  std::snprintf(text, sizeof text, "%.*f", count, value);
+  return text;
+}
+
+// A block's name as the summary gives it: "r1 c2" for "r1_c2".
+std::string label(std::string name) {
+  name[name.find('_')] = ' ';
+  return name;
+}
+
+// The percentage the summary gives for part of whole: rounded to a whole number.
+std::string percent(std::uint64_t part, std::uint64_t whole) {
+  return std::to_string(std::llround(100.0 * static_cast<double>(part) / static_cast<double>(whole)));
+}
+
+// What a block of the island's lattice is to come to, worked out with the library as dem2mesh works it out.
+struct ExpectedBlock {
+  BlockRect rect{};
+  std::string name;  // "r1_c2"
+  bool cutShort = false;
+  bool land = false;  // a piece kept, which every block of --footprint window has
+  std::uint64_t cells = 0, landCells = 0, cornerContacts = 0;
+  std::size_t pieces = 0;
+  std::vector<std::uint64_t> dropped;  // the cells of each piece under --min-piece
+  std::uint64_t solidTriangles = 0;    // its solid's, when it has land
+};
+
+// A vertex of a block's top, back in the window's frame.
+struct TopVertex {
+  double x = 0, y = 0;
+  float z = 0;
+};
+
+// The island in a TempDir as a file of dl_elevation's, and an empty out/ for the outputs. The runs are at full
+// resolution and --scale 1, so a model unit is a metre and the grid's cells are the window's.
+struct Island {
+  TempDir dir;
+  Path input = writeGeographicFixture(dir.path, kIslandCols, kIslandRows, islandBox(), islandFileHeights());
+  Path outDir = dir.path / "out";
+  Path stem = outDir / "island";
+  WindowExtent extent = wholeFileExtent(input);
+  // The output grid's cells as dem2mesh works them out: the window's extent over the cells.
+  double cellX = extent.widthM / (kIslandCols - 1);
+  double cellY = extent.heightM / (kIslandRows - 1);
+
+  Island() { REQUIRE(std::filesystem::create_directory(outDir)); }
+
+  [[nodiscard]] Path stl() const { return stem.string() + ".stl"; }
+  [[nodiscard]] Path ply() const { return stem.string() + ".ply"; }
+  [[nodiscard]] Path blockStl(const ExpectedBlock& block) const { return stem.string() + "_" + block.name + ".stl"; }
+
+  // --tile for blocks `cells` of the grid's cells wide, and the lattice it makes.
+  [[nodiscard]] std::string tile(int cells) const { return decimals(cells * cellX, 6); }
+  [[nodiscard]] TileLayout layout(int cells) const {
+    return tileLayout(kIslandCols, kIslandRows, std::stod(tile(cells)), 1, cellX, cellY);
+  }
+  // The one block of the whole grid that a footprint without --tile is.
+  [[nodiscard]] TileLayout wholeGrid() const { return tileLayout(kIslandCols, kIslandRows, 1e9, 1, cellX, cellY); }
+
+  // Where sample (column, row) lies in the window's frame, the column and row fractional or not.
+  [[nodiscard]] double xOf(double column) const { return column * cellX; }
+  [[nodiscard]] double yOf(double row) const { return (kIslandRows - 1 - row) * cellY; }
+
+  // A block's top read back from its STL: the vertices above the base, which is the solid's lowest z, with the
+  // block's south-west corner added back to x and y, from which its own frame measures them (Part B 5.3).
+  [[nodiscard]] std::vector<TopVertex> topOf(const ExpectedBlock& block) const {
+    const Mesh solid = readBinaryStl(blockStl(block));
+    const double base = boundsOf(solid).minZ;
+    const double x0 = block.rect.firstColumn * extent.widthM / (kIslandCols - 1);
+    const double y0 = (kIslandRows - 1 - block.rect.lastRow) * extent.heightM / (kIslandRows - 1);
+    std::vector<TopVertex> top;
+    for (const auto& v : solid.vertices) {
+      if (v.z > base + 1e-3) top.push_back({v.x + x0, v.y + y0, v.z});
+    }
+    return top;
+  }
+
+  // dem2mesh on the island with the outputs at stem, without Blender, at --scale 1 and --tolerance 0.5, then extra.
+  [[nodiscard]] Finished run(const std::vector<std::string>& extra) const { return runAt("0.5", extra); }
+
+  // The same at the --tolerance given, or with none.
+  [[nodiscard]] Finished runAt(const std::optional<std::string>& tolerance,
+                               const std::vector<std::string>& extra) const {
+    std::vector<std::string> args{"-i", input.string(), "-o", stem.string(), "--no-blend", "--scale", "1"};
+    if (tolerance) args.insert(args.end(), {"--tolerance", *tolerance});
+    args.insert(args.end(), extra.begin(), extra.end());
+    return runDem2Mesh(args, dir.path);
+  }
+
+  // The grid dem2mesh meshes: the window read, filled from the nearest data and resampled to its own size.
+  [[nodiscard]] std::vector<float> grid() const {
+    const GridGeometry geometry = inspectGeoTiff(input);
+    const PixelWindow window = pixelWindowFor(geometry, std::nullopt);
+    std::vector<float> heights = readWindow(input, geometry, window);
+    (void)fillNearest(heights, window.cols, window.rows);
+    return resampleQuadratic(heights, window.cols, window.rows, window.cols, window.rows);
+  }
+
+  // The footprint's cells as dem2mesh works them out, and the corner contacts they join: the window's data as the
+  // mask, which at full resolution is the grid's.
+  [[nodiscard]] std::vector<std::uint8_t> cells(std::vector<GridPoint>* joined = nullptr) const {
+    const GridGeometry geometry = inspectGeoTiff(input);
+    const std::vector<float> heights = readWindow(input, geometry, pixelWindowFor(geometry, std::nullopt));
+    return footprintCells(dataMaskOf(heights), kIslandCols, kIslandRows, joined);
+  }
+
+  // Every block of the lattice, row by row from the north-west, as dem2mesh is to make it at --tolerance toleranceM
+  // (metres being units here): the footprint's pieces in the block (with --footprint data), and the solid of each block
+  // with land, simplified with the library in lattice order over the grid above, its base plane chosen as dem2mesh
+  // chooses it.
+  [[nodiscard]] std::vector<ExpectedBlock> expected(const TileLayout& layout, bool footprint, double minPiece = 1,
+                                                    double toleranceM = 0.5) const {
+    const GridGeometry geometry = inspectGeoTiff(input);
+    const PixelWindow window = pixelWindowFor(geometry, std::nullopt);
+    std::vector<float> filled = readWindow(input, geometry, window);
+    (void)fillNearest(filled, window.cols, window.rows);
+    const auto [lowest, highest] = std::minmax_element(filled.begin(), filled.end());
+    const BasePlane base = chooseBasePlane(*lowest, *highest, std::nullopt, 1, 1, 2);
+    const std::vector<float> heights = resampleQuadratic(filled, window.cols, window.rows, window.cols, window.rows);
+    std::vector<GridPoint> joined;
+    const std::vector<std::uint8_t> footprintCellsOfGrid = cells(&joined);
+    BlockSimplifier simplifier(heights, kIslandCols, kIslandRows, toleranceM, extent.widthM, extent.heightM, 1, 1,
+                               base.levelM);
+    std::vector<ExpectedBlock> blocks;
+    for (int r = 0; r < layout.down; ++r) {
+      for (int c = 0; c < layout.across; ++c) {
+        ExpectedBlock& b = blocks.emplace_back();
+        b.rect = blockRect(layout, r, c);
+        b.name = blockName(layout, r, c);
+        b.cutShort = cutShort(layout, r, c);
+        b.cells = static_cast<std::uint64_t>(b.rect.lastColumn - b.rect.firstColumn) *
+                  static_cast<std::uint64_t>(b.rect.lastRow - b.rect.firstRow);
+        if (!footprint) {
+          b.land = true;
+          b.landCells = b.cells;
+          const BlockResult result = simplifier.simplifyBlock(b.rect, nullptr);
+          b.solidTriangles = solidTriangleCount(*result.rectangle, result.triangles);
+          continue;
+        }
+        const BlockFootprint cut =
+            blockFootprint(footprintCellsOfGrid, kIslandCols, kIslandRows, b.rect, cellX * cellY, minPiece, joined);
+        for (const Piece& piece : cut.dropped) b.dropped.push_back(piece.cells);
+        b.land = !cut.pieces.empty();
+        b.landCells = cut.cells;
+        b.cornerContacts = cut.cornerContacts;
+        b.pieces = cut.pieces.size();
+        if (b.land) {
+          const BlockResult result = simplifier.simplifyBlock(b.rect, &cut);
+          b.solidTriangles = solidTriangleCount(result.pieces, result.triangles);
+        }
+      }
+    }
+    return blocks;
+  }
+};
+
+// The summary's line for a block written: "block r1 c2: 34% land, 282 triangles, 0.0 MB, island_r1_c2.stl".
+std::string blockLine(const Island& island, const ExpectedBlock& b) {
+  return "block " + label(b.name) + ": " + percent(b.landCells, b.cells) + "% land, " +
+         std::to_string(b.solidTriangles) + " triangles, " +
+         decimals(static_cast<double>(stlFileBytes(b.solidTriangles)) / 1e6, 1) + " MB, " +
+         island.blockStl(b).filename().string();
+}
+
+// The names of blocks, as the summary lists them: "r2 c1, r2 c2".
+std::string listOf(const std::vector<const ExpectedBlock*>& blocks) {
+  std::string list;
+  for (const ExpectedBlock* b : blocks) list += (list.empty() ? "" : ", ") + label(b->name);
+  return list;
+}
+
+// The vertices of a block's top on the grid line where it meets its neighbour, within the stretches of that line where
+// both blocks have land: `shared` lists the cells along the line, rows down a column or columns along a row, at which
+// the cells on both sides of the line are in the footprint. The line is column `line` when `vertical`, and row `line`
+// otherwise. Sorted along the line.
+std::vector<TopVertex> onSharedStretches(const Island& island, const std::vector<TopVertex>& top, bool vertical,
+                                         int line, const std::vector<int>& shared) {
+  std::vector<std::pair<double, TopVertex>> found;
+  for (const TopVertex& v : top) {
+    const double across = vertical ? v.x - island.xOf(line) : v.y - island.yOf(line);
+    if (std::abs(across) > 1e-3) continue;
+    // Where the vertex lies along the line, in cells: a row down a column, or a column along a row.
+    const double along = vertical ? (kIslandRows - 1) - v.y / island.cellY : v.x / island.cellX;
+    const bool inStretch = std::any_of(shared.begin(), shared.end(), [along](int cell) {
+      return along >= cell - 1e-6 && along <= cell + 1 + 1e-6;
+    });
+    if (inStretch) found.emplace_back(along, v);
+  }
+  std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<TopVertex> sorted;
+  for (const auto& [along, v] : found) sorted.push_back(v);
+  return sorted;
+}
+
+// Part B 5.3's shared edges: wherever two neighbouring blocks that are written both have land along the side between
+// them, their tops have the same vertices there, at positions within 1e-3 units of each other and at exactly the same
+// height, so that the printed blocks meet without a step. Returns how many vertices matched, so that a check that
+// found nothing to compare shows.
+std::size_t matchSharedSides(const Island& island, const TileLayout& layout, const std::vector<ExpectedBlock>& blocks) {
+  const std::vector<std::uint8_t> cells = island.cells();
+  const auto in = [&cells](int column, int row) {
+    return cells[static_cast<std::size_t>(row) * (kIslandCols - 1) + static_cast<std::size_t>(column)] != 0;
+  };
+  std::size_t matched = 0;
+  for (std::size_t a = 0; a < blocks.size(); ++a) {
+    const int r = static_cast<int>(a) / layout.across;
+    const int c = static_cast<int>(a) % layout.across;
+    // The neighbour to the east, then the one to the south.
+    for (const bool vertical : {true, false}) {
+      if (vertical ? c + 1 == layout.across : r + 1 == layout.down) continue;
+      const std::size_t b = vertical ? a + 1 : a + static_cast<std::size_t>(layout.across);
+      if (!blocks[a].land || !blocks[b].land) continue;
+      const BlockRect& rect = blocks[a].rect;
+      const int line = vertical ? rect.lastColumn : rect.lastRow;
+      std::vector<int> shared;  // the cells along the line with land on both sides of it
+      for (int k = vertical ? rect.firstRow : rect.firstColumn; k < (vertical ? rect.lastRow : rect.lastColumn); ++k) {
+        if (vertical ? in(line - 1, k) && in(line, k) : in(k, line - 1) && in(k, line)) shared.push_back(k);
+      }
+      const std::vector<TopVertex> west = onSharedStretches(island, island.topOf(blocks[a]), vertical, line, shared);
+      const std::vector<TopVertex> east = onSharedStretches(island, island.topOf(blocks[b]), vertical, line, shared);
+      CAPTURE(blocks[a].name, blocks[b].name, shared.size());
+      REQUIRE(west.size() == east.size());
+      for (std::size_t k = 0; k < west.size(); ++k) {
+        CAPTURE(k);
+        CHECK_THAT(west[k].x, WithinAbs(east[k].x, 1e-3));
+        CHECK_THAT(west[k].y, WithinAbs(east[k].y, 1e-3));
+        CHECK(west[k].z == east[k].z);
+      }
+      matched += west.size();
+    }
+  }
+  return matched;
+}
+
+// The grid samples that the written blocks' tops stand on, each once, every top vertex found within 1e-3 units of its
+// sample.
+std::set<std::pair<int, int>> samplesUnder(const Island& island, const std::vector<ExpectedBlock>& blocks) {
+  std::set<std::pair<int, int>> samples;
+  for (const ExpectedBlock& b : blocks) {
+    if (!b.land) continue;
+    for (const TopVertex& v : island.topOf(b)) {
+      const int column = static_cast<int>(std::lround(v.x / island.cellX));
+      const int row = static_cast<int>(std::lround((kIslandRows - 1) - v.y / island.cellY));
+      CHECK_THAT(v.x, WithinAbs(island.xOf(column), 1e-3));
+      CHECK_THAT(v.y, WithinAbs(island.yOf(row), 1e-3));
+      samples.emplace(column, row);
+    }
+  }
+  return samples;
+}
+
+// The island in blocks `cells` cells wide with --footprint data (Part B's section 7): only the blocks with land are
+// written, each a closed solid of the triangles its outlines make; neighbours match along their shared sides; the
+// summary counts and names the blocks; the PLY is the blocks' surfaces joined, each sample once.
+void checkIslandTiles(int cells) {
+  const Island island;
+  const TileLayout layout = island.layout(cells);
+  CAPTURE(cells, layout.blockCols, layout.blockRows, layout.across, layout.down);
+  const std::vector<ExpectedBlock> expected = island.expected(layout, true);
+  const Finished result = island.run({"--footprint", "data", "--tile", island.tile(cells)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+
+  // The files: a block's for each block with land, and the PLY; nothing for a block of sea alone.
+  std::vector<std::string> files{island.ply().filename().string()};
+  std::vector<const ExpectedBlock*> written, skipped;
+  std::uint64_t withLand = 0, cutShortBlocks = 0, contacts = 0;
+  for (const ExpectedBlock& b : expected) {
+    (b.land ? written : skipped).push_back(&b);
+    if (b.land) {
+      files.push_back(island.blockStl(b).filename().string());
+      ++withLand;
+      contacts += b.cornerContacts;
+    }
+    if (b.cutShort) ++cutShortBlocks;
+  }
+  std::sort(files.begin(), files.end());
+  CHECK(filesIn(island.outDir) == files);
+  REQUIRE_FALSE(written.empty());
+  REQUIRE_FALSE(skipped.empty());  // the island's lattices keep a block of sea and a lone sample, which makes no cell
+
+  // Each block a closed solid facing out, read back as a slicer would read it, its triangles those its outlines make.
+  for (const ExpectedBlock* b : written) {
+    CAPTURE(b->name);
+    const Mesh solid = readBinaryStl(island.blockStl(*b));
+    const MeshCheck check = checkSolid(solid);
+    CHECK(check.ok());
+    CHECK(check.nonManifoldEdges == 0);
+    CHECK(solid.triangles.size() == b->solidTriangles);
+    // The header names the block before the grid.
+    const std::string header = readFile(island.blockStl(*b)).substr(0, 80);
+    CHECK_THAT(header, StartsWith("dem2mesh "));
+    CHECK_THAT(header, ContainsSubstring(" block " + b->name + " grid 24x18 window 24x18+0+0 "));
+  }
+
+  // No step between neighbours, and something to compare: a run of the island's coast crosses a block side.
+  CHECK(matchSharedSides(island, layout, expected) > 0);
+
+  // The PLY is the union of the blocks' tops, each sample once: the vertices blocks share along a side are merged.
+  CHECK(std::stoul(plyHeaderAfter(island.ply(), "element vertex ")) == samplesUnder(island, expected).size());
+
+  // The summary: the lattice, a line for each block written, the blocks of sea, the contact that the join made.
+  const std::string tiles = lineAfter(result.out, "tiles: ");
+  CHECK_THAT(tiles, StartsWith(std::to_string(layout.across) + " x " + std::to_string(layout.down) + " blocks of " +
+                               std::to_string(layout.blockCols) + " x " + std::to_string(layout.blockRows) +
+                               " cells ("));
+  CHECK_THAT(tiles, EndsWith("); " + std::to_string(withLand) + " with land, " +
+                             std::to_string(expected.size() - withLand) + " without, " +
+                             std::to_string(cutShortBlocks) + " cut short at the east or south edge"));
+  // A full block's size in metres and in model units, the same at --scale 1: blockCols x cellX by blockRows x cellY.
+  char* end = nullptr;
+  const char* const size = tiles.c_str() + tiles.find('(') + 1;
+  CHECK_THAT(std::strtod(size, &end), WithinAbs(layout.blockCols * island.cellX, 0.01));
+  CHECK_THAT(std::strtod(end + 3, &end), WithinAbs(layout.blockRows * island.cellY, 0.01));
+  CHECK_THAT(std::string(end), StartsWith(" m, "));
+  std::string lines = "\ntiles: " + tiles + "\n";
+  for (const ExpectedBlock* b : written) lines += blockLine(island, *b) + "\n";
+  lines += "skipped: no land in " + listOf(skipped) + "\n";
+  if (contacts > 0) lines += "corner contacts: " + std::to_string(contacts) + "\n";
+  CHECK_THAT(result.out, ContainsSubstring(lines + "solid: "));
+  CHECK(result.out.find("dropped pieces: ") == std::string::npos);  // the lone sample makes no cell, so no piece
+  CHECK(result.out.find("not selected: ") == std::string::npos);
+  CHECK(result.out.find("stale: ") == std::string::npos);
+  CHECK(result.out.find("footprint: ") == std::string::npos);
+
+  // The files written, every block's STL in lattice order and then the PLY, with their sizes in the solid line.
+  std::string wrote;
+  std::uintmax_t stlBytes = 0;
+  for (const ExpectedBlock* b : written) {
+    wrote += "\nwrote: " + island.blockStl(*b).string();
+    stlBytes += std::filesystem::file_size(island.blockStl(*b));
+  }
+  CHECK_THAT(result.out, ContainsSubstring(wrote + "\nwrote: " + island.ply().string() + "\n"));
+  CHECK(occurrences(result.out, "wrote: ") == written.size() + 1);
+  std::uint64_t triangles = 0;
+  for (const ExpectedBlock* b : written) triangles += b->solidTriangles;
+  CHECK_THAT(result.out, ContainsSubstring("\nsolid: " + std::to_string(triangles) + " triangles, STL " +
+                                           std::to_string(stlBytes) + " bytes, PLY " +
+                                           std::to_string(std::filesystem::file_size(island.ply())) + " bytes\n"));
+  CHECK_THAT(result.out, EndsWith("\nblender: skipped (--no-blend)\n"));
+}
+
+}  // namespace
+
+TEST_CASE("a footprint without tiles ends at the coast", "[mesh-e2e]") {
+  const Island island;
+  const Finished result = island.run({"--footprint", "data"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  CHECK(filesIn(island.outDir) == std::vector<std::string>{"island.ply", "island.stl"});
+
+  const Mesh solid = readBinaryStl(island.stl());
+  const MeshCheck check = checkSolid(solid);
+  CHECK(check.ok());
+  CHECK(check.nonManifoldEdges == 0);
+  // One solid, whose header names no block.
+  CHECK_THAT(readFile(island.stl()).substr(0, 80), StartsWith("dem2mesh " DL_ELEVATION_VERSION " grid 24x18 "));
+  // The top surface faces up: the triangles with no corner on the base, since a footprint's walls are two triangles
+  // under each edge of its outline, each with a corner on the base, and the base has all three there.
+  const double base = boundsOf(solid).minZ;
+  Mesh top;
+  top.vertices = solid.vertices;
+  for (const auto& t : solid.triangles) {
+    const auto above = [&](std::uint32_t v) { return solid.vertices[v].z > base + 1e-3; };
+    if (above(t.a) && above(t.b) && above(t.c)) top.triangles.push_back(t);
+  }
+  CHECK_FALSE(top.triangles.empty());
+  CHECK(downwardFacingTriangles(top) == 0);
+
+  // No surface over the sea, nor over the lone sample, which makes no cell; the lake, enclosed, is filled and has one.
+  CHECK(std::isnan(topAt(solid, island.xOf(1), island.yOf(1))));
+  CHECK(std::isnan(topAt(solid, island.xOf(18), island.yOf(13))));
+  CHECK_FALSE(std::isnan(topAt(solid, island.xOf(7.5), island.yOf(5.5))));
+  // The knoll's summit, a sample inside the island, within the tolerance of the grid's height there.
+  const std::vector<float> grid = island.grid();
+  CHECK_THAT(topAt(solid, island.xOf(kIslandKnollColumn), island.yOf(kIslandKnollRow)),
+             WithinAbs(grid[static_cast<std::size_t>(kIslandKnollRow * kIslandCols + kIslandKnollColumn)], 0.5 + 0.01));
+
+  // One block of the whole grid: its pieces and land, the triangles they make, and the blobs' contact, joined.
+  const std::vector<ExpectedBlock> expected = island.expected(island.wholeGrid(), true);
+  REQUIRE(expected.size() == 1);
+  const ExpectedBlock& whole = expected.front();
+  CHECK(solid.triangles.size() == whole.solidTriangles);
+  CHECK(whole.cornerContacts == 1);
+  CHECK_THAT(result.out, ContainsSubstring("\nbase: " + lineAfter(result.out, "base: ") + "\nfootprint: " +
+                                           percent(whole.landCells, whole.cells) + "% of the window, " +
+                                           std::to_string(whole.pieces) + " pieces\ncorner contacts: 1\nsolid: "));
+  CHECK(result.out.find("dropped pieces: ") == std::string::npos);  // the lone sample makes no cell, so no piece
+  CHECK(result.out.find("tiles: ") == std::string::npos);
+  CHECK(result.out.find("block ") == std::string::npos);
+  CHECK_THAT(result.out, ContainsSubstring("\nwrote: " + island.stl().string() + "\nwrote: " + island.ply().string() +
+                                           "\nblender: skipped (--no-blend)\n"));
+  // The simplification, at the tolerance given.
+  CHECK_THAT(result.out, ContainsSubstring("\nsimplify: tolerance 0.5 units (0.5 m), 432 grid vertices to "));
+}
+
+TEST_CASE("blocks without --tolerance are simplified at a tolerance of 0", "[mesh-e2e]") {
+  // The plan's ruling: Part B's modes run on the block simplifier, which without --tolerance simplifies at 0, keeping
+  // every sample that is off its neighbours' plane.
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  const std::vector<ExpectedBlock> expected = island.expected(layout, true, 1, 0.0);
+  const Finished result = island.runAt(std::nullopt, {"--footprint", "data", "--tile", island.tile(12)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  CHECK_THAT(result.out, ContainsSubstring("\nsimplify: tolerance 0 units (0 m), 432 grid vertices to "));
+  for (const ExpectedBlock& b : expected) {
+    CAPTURE(b.name);
+    CHECK(std::filesystem::exists(island.blockStl(b)) == b.land);
+    if (!b.land) continue;
+    const Mesh solid = readBinaryStl(island.blockStl(b));
+    CHECK(checkSolid(solid).ok());
+    CHECK(solid.triangles.size() == b.solidTriangles);
+  }
+  // The same without --tile: the one block of a footprint.
+  const Finished whole = island.runAt(std::nullopt, {"--footprint", "data", "--overwrite"});
+  INFO("without --tile, stdout:\n" << whole.out << "stderr:\n" << whole.err);
+  REQUIRE(whole.exitCode() == 0);
+  CHECK_THAT(whole.out, ContainsSubstring("\nsimplify: tolerance 0 units (0 m), 432 grid vertices to "));
+  CHECK(readBinaryStl(island.stl()).triangles.size() ==
+        island.expected(island.wholeGrid(), true, 1, 0.0).front().solidTriangles);
+}
+
+TEST_CASE("tiles write one closed block per piece of land and match along shared edges", "[mesh-e2e]") {
+  checkIslandTiles(12);
+}
+
+TEST_CASE("a cut-short lattice still closes and matches", "[mesh-e2e]") {
+  // 13 cells a block over the grid's 23 x 17 cells: the east blocks are 10 cells wide and the south ones 4 tall.
+  checkIslandTiles(13);
+}
+
+TEST_CASE("a speck under --min-piece is dropped and the block skipped", "[mesh-e2e]") {
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  // Between the islet's 4 cells and the 8 of the smallest piece any block keeps besides it, the tab that column 12
+  // cuts off the island.
+  const double minPiece = 6 * island.cellX * island.cellY;
+  const std::vector<ExpectedBlock> expected = island.expected(layout, true, minPiece);
+  const ExpectedBlock* islet = nullptr;
+  std::vector<const ExpectedBlock*> skipped;
+  for (const ExpectedBlock& b : expected) {
+    if (!b.dropped.empty()) islet = &b;
+    if (!b.land) skipped.push_back(&b);
+  }
+  REQUIRE(islet != nullptr);
+  REQUIRE(islet->dropped == std::vector<std::uint64_t>{4});
+  REQUIRE_FALSE(islet->land);
+
+  const Finished result = island.run({"--footprint", "data", "--tile", island.tile(12), "--min-piece",
+                                      decimals(minPiece, 3)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  CHECK_FALSE(std::filesystem::exists(island.blockStl(*islet)));
+  // The islet, by its block, in cells and square model units to one decimal, and its block among the skipped ones.
+  CHECK_THAT(result.out, ContainsSubstring("\nskipped: no land in " + listOf(skipped) + "\ndropped pieces: " +
+                                           label(islet->name) + " 4 cells " +
+                                           decimals(4 * (island.cellX * island.cellY), 1) + " units2\n"));
+  CHECK_THAT(lineAfter(result.out, "tiles: "),
+             ContainsSubstring("; " + std::to_string(expected.size() - skipped.size()) + " with land, " +
+                               std::to_string(skipped.size()) + " without, "));
+}
+
+TEST_CASE("without tiles a speck under --min-piece is dropped and listed without a block", "[mesh-e2e]") {
+  const Island island;
+  const double minPiece = 6 * island.cellX * island.cellY;  // above the islet's 4 cells, as in the case above
+  const std::vector<ExpectedBlock> expected = island.expected(island.wholeGrid(), true, minPiece);
+  REQUIRE(expected.size() == 1);
+  REQUIRE(expected.front().dropped == std::vector<std::uint64_t>{4});
+  const Finished result = island.run({"--footprint", "data", "--min-piece", decimals(minPiece, 3)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  const ExpectedBlock& whole = expected.front();
+  CHECK_THAT(result.out, ContainsSubstring("\nfootprint: " + percent(whole.landCells, whole.cells) +
+                                           "% of the window, " + std::to_string(whole.pieces) +
+                                           " pieces\ndropped pieces: 4 cells " +
+                                           decimals(4 * (island.cellX * island.cellY), 1) + " units2\n"));
+  CHECK(readBinaryStl(island.stl()).triangles.size() == whole.solidTriangles);
+}
+
+TEST_CASE("a footprint with no piece to write is refused and nothing is written", "[mesh-e2e]") {
+  const Island island;
+  SECTION("every piece under --min-piece") {
+    const Finished result = island.run({"--footprint", "data", "--min-piece", "1000000000"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    CHECK(result.exitCode() == 1);
+    // The island, the islet and the blobs that the join makes one.
+    CHECK(result.err == "error: the footprint has nothing to write: 3 pieces were dropped under --min-piece "
+                        "1000000000\n");
+    CHECK(result.out.empty());
+  }
+  SECTION("a selection of blocks of sea alone") {
+    const TileLayout layout = island.layout(12);
+    const std::vector<ExpectedBlock> expected = island.expected(layout, true);
+    REQUIRE_FALSE(expected.back().land);  // the south-east block, with the lone sample, which makes no cell
+    REQUIRE(expected.back().dropped.empty());
+    const Finished result = island.run({"--footprint", "data", "--tile", island.tile(12), "--blocks",
+                                        std::to_string(layout.down) + ":" + std::to_string(layout.across)});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    CHECK(result.exitCode() == 1);
+    CHECK(result.err == "error: no selected block has land to write: no cell has data at all four of its corners\n");
+    CHECK(result.out.empty());
+  }
+  CHECK(std::filesystem::is_empty(island.outDir));
+}
+
+TEST_CASE("pieces touching at a corner are joined into one closed shell, and the contact is counted", "[mesh-e2e]") {
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  // The blobs touch at (19, 4), and footprintCells joins them there with the cell (19, 3), the north-west-most of the
+  // vertex's two empty cells (IslandFixture.h). The contact is inside one block, the one this finds.
+  std::vector<GridPoint> joined;
+  (void)island.cells(&joined);
+  REQUIRE(joined.size() == 1);
+  REQUIRE(joined.front().x == 19);
+  REQUIRE(joined.front().y == 4);
+  const std::vector<ExpectedBlock> expected = island.expected(layout, true);
+  const auto blobs = std::find_if(expected.begin(), expected.end(), [](const ExpectedBlock& b) {
+    return b.rect.firstColumn < 19 && 19 < b.rect.lastColumn && b.rect.firstRow < 4 && 4 < b.rect.lastRow;
+  });
+  REQUIRE(blobs != expected.end());
+  REQUIRE(blobs->cornerContacts == 1);
+
+  const Finished result = island.run({"--footprint", "data", "--tile", island.tile(12)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  // One file for the block, a closed solid, with no edge of more than two faces where the blobs met: two shells that
+  // touched there would stand two walls on the line under the vertex, which the STL's merged corners make one edge of
+  // four faces.
+  const Mesh solid = readBinaryStl(island.blockStl(*blobs));
+  const MeshCheck check = checkSolid(solid);
+  CHECK(check.ok());
+  CHECK(check.nonManifoldEdges == 0);
+  CHECK(solid.triangles.size() == blobs->solidTriangles);
+  // The cell that joins them is land, with a surface over its middle, at the block's own frame.
+  const double x0 = blobs->rect.firstColumn * island.cellX;
+  const double y0 = island.yOf(blobs->rect.lastRow);
+  CHECK_FALSE(std::isnan(topAt(solid, island.xOf(19.5) - x0, island.yOf(3.5) - y0)));
+  CHECK_THAT(result.out, ContainsSubstring("\ncorner contacts: 1\nsolid: "));
+}
+
+TEST_CASE("a file without no-data gives the whole window as one piece", "[mesh-e2e]") {
+  // The plane of the 8 x 6 fixture, 10 + 5 i + 3 j, with a height at every pixel.
+  const TempDir dir;
+  std::vector<double> heights;
+  for (int j = 0; j < kRows; ++j) {
+    for (int i = 0; i < kCols; ++i) heights.push_back(10.0 + 5.0 * i + 3.0 * j);
+  }
+  const Path input = writeGeographicFixture(dir.path, kCols, kRows, kBox, heights);
+  const auto run = [&](const std::string& name, const std::vector<std::string>& extra) {
+    std::vector<std::string> args{"-i", input.string(), "-o", (dir.path / name).string(), "--no-blend", "--tolerance",
+                                  "0.5"};
+    args.insert(args.end(), extra.begin(), extra.end());
+    return runDem2Mesh(args, dir.path);
+  };
+  const Finished window = run("window", {});
+  INFO("--footprint window, stdout:\n" << window.out << "stderr:\n" << window.err);
+  REQUIRE(window.exitCode() == 0);
+  const Finished data = run("data", {"--footprint", "data"});
+  INFO("--footprint data, stdout:\n" << data.out << "stderr:\n" << data.err);
+  REQUIRE(data.exitCode() == 0);
+
+  // The same surface as --footprint window's (Review Focus 4): the same simplification, and the PLY byte for byte.
+  CHECK(lineAfter(data.out, "simplify: ") == lineAfter(window.out, "simplify: "));
+  CHECK_THAT(data.out, ContainsSubstring("\nsimplify: tolerance 0.5 units (0.5 m), 48 grid vertices to 4, 70 triangles "
+                                         "to 2\n"));
+  CHECK(fileHolds(dir.path / "data.ply", readFile(dir.path / "window.ply")));
+  CHECK_THAT(data.out, ContainsSubstring("\nfootprint: 100% of the window, 1 piece\nsolid: "));
+  // Its solid closed: the two triangles, a wall of two triangles under each of the outline's four edges, and a base of
+  // two, as the window's box has.
+  const Mesh solid = readBinaryStl(dir.path / "data.stl");
+  const MeshCheck check = checkSolid(solid);
+  CHECK(check.ok());
+  CHECK(check.nonManifoldEdges == 0);
+  CHECK(solid.triangles.size() == 12);
+}
+
+TEST_CASE("a --blocks selection writes those blocks and lists the rest", "[mesh-e2e]") {
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  const std::vector<ExpectedBlock> expected = island.expected(layout, true);
+  REQUIRE(layout.down == 2);
+  REQUIRE(layout.across == 2);
+  const Finished result = island.run({"--footprint", "data", "--tile", island.tile(12), "--blocks", "1-1:1-2"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  // The first row of blocks, both with land, and the PLY of their surfaces alone.
+  REQUIRE(expected[0].land);
+  REQUIRE(expected[1].land);
+  CHECK(filesIn(island.outDir) == std::vector<std::string>{island.ply().filename().string(),
+                                                           island.blockStl(expected[0]).filename().string(),
+                                                           island.blockStl(expected[1]).filename().string()});
+  // The second row is outside the selection, the block with the islet and the block of sea alike, and nothing about
+  // them is skipped or dropped.
+  CHECK_THAT(result.out, ContainsSubstring("\n" + blockLine(island, expected[0]) + "\n" +
+                                           blockLine(island, expected[1]) + "\nnot selected: " +
+                                           listOf({&expected[2], &expected[3]}) + "\n"));
+  CHECK(result.out.find("skipped: ") == std::string::npos);
+  CHECK(occurrences(result.out, "\nblock ") == 2);
+  CHECK(occurrences(result.out, "wrote: ") == 3);
+  // The lattice is counted whole whatever --blocks picks.
+  const auto withLand = std::count_if(expected.begin(), expected.end(), [](const auto& b) { return b.land; });
+  CHECK_THAT(lineAfter(result.out, "tiles: "),
+             ContainsSubstring("; " + std::to_string(withLand) + " with land, " +
+                               std::to_string(static_cast<long>(expected.size()) - withLand) + " without, "));
+}
+
+TEST_CASE("stale block files are left alone and named", "[mesh-e2e]") {
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  const std::vector<ExpectedBlock> before = island.expected(layout, true);
+  const double minPiece = 6 * island.cellX * island.cellY;  // above the islet's 4 cells, as in the case above
+  const std::vector<ExpectedBlock> after = island.expected(layout, true, minPiece);
+  std::vector<const ExpectedBlock*> emptied;  // the blocks with land before and none after: the islet's
+  for (std::size_t k = 0; k < before.size(); ++k) {
+    if (before[k].land && !after[k].land) emptied.push_back(&before[k]);
+  }
+  REQUIRE(emptied.size() == 1);
+  const Path isletStl = island.blockStl(*emptied.front());
+
+  const std::vector<std::string> tiles{"--footprint", "data", "--tile", island.tile(12)};
+  const Finished first = island.run(tiles);
+  INFO("first run, stdout:\n" << first.out << "stderr:\n" << first.err);
+  REQUIRE(first.exitCode() == 0);
+  REQUIRE(std::filesystem::exists(isletStl));
+  const std::string islet = readFile(isletStl);
+  const std::vector<std::string> filesBefore = filesIn(island.outDir);
+
+  std::vector<std::string> again = tiles;
+  again.insert(again.end(), {"--min-piece", decimals(minPiece, 3)});
+  SECTION("without --overwrite, any block file of the lattice is refused before anything is read") {
+    const Finished refused = island.run(again);
+    INFO("stdout:\n" << refused.out << "stderr:\n" << refused.err);
+    CHECK(refused.exitCode() == 1);
+    // The first in lattice order, whether this run would write it or not.
+    CHECK(refused.err == "error: " + island.blockStl(before.front()).string() + " exists; use --overwrite\n");
+    CHECK(refused.out.empty());
+    CHECK(filesIn(island.outDir) == filesBefore);
+  }
+  SECTION("with --overwrite, the islet's old file is left as it was and named") {
+    again.push_back("--overwrite");
+    const Finished second = island.run(again);
+    INFO("stdout:\n" << second.out << "stderr:\n" << second.err);
+    REQUIRE(second.exitCode() == 0);
+    CHECK(fileHolds(isletStl, islet));
+    CHECK_THAT(second.out, ContainsSubstring("\nstale: " + isletStl.filename().string() + "\nsolid: "));
+    CHECK(filesIn(island.outDir) == filesBefore);
+    CHECK(occurrences(second.out, "wrote: ") == filesBefore.size() - 1);  // every file but the islet's
+  }
+}
+
+TEST_CASE("the dry run plans tiles without writing", "[mesh-e2e]") {
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  const std::vector<ExpectedBlock> expected = island.expected(layout, true);
+  const Finished result = island.run({"--footprint", "data", "--tile", island.tile(12), "--dry-run"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 0);
+  CHECK_THAT(result.out, StartsWith("dry run\n"));
+  CHECK_THAT(result.out, ContainsSubstring("\n  tiles: "));
+  // The plan's lines on the blocks are the summary's, then what a run would write, every STL and then the PLY.
+  std::string blocks, wouldWrite;
+  for (const ExpectedBlock& b : expected) {
+    if (!b.land) continue;
+    blocks += "\n  " + blockLine(island, b);
+    wouldWrite += "\n  would write: " + island.blockStl(b).string();
+  }
+  CHECK_THAT(result.out, ContainsSubstring(blocks + "\n  skipped: no land in "));
+  CHECK_THAT(result.out, ContainsSubstring(wouldWrite + "\n  would write: " + island.ply().string() + "\n  output: " +
+                                           island.ply().string() + " (will be created)\n"));
+  CHECK(result.out.find("output: " + island.stem.string() + "_") == std::string::npos);  // none for the blocks
+  CHECK(result.out.find("\nwrote: ") == std::string::npos);
+  CHECK_THAT(result.out, EndsWith("\n  blender: skipped (--no-blend)\n"));
+  CHECK(std::filesystem::is_empty(island.outDir));
+}
+
+TEST_CASE("window tiles are full squares", "[mesh-e2e]") {
+  const Island island;
+  const TileLayout layout = island.layout(12);
+  const std::vector<ExpectedBlock> expected = island.expected(layout, false);
+  REQUIRE(expected.size() == 4);
+  const Finished result = island.run({"--footprint", "window", "--tile", island.tile(12)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  std::vector<std::string> files{island.ply().filename().string()};
+  std::string lines;
+  for (const ExpectedBlock& b : expected) {
+    CAPTURE(b.name);
+    files.push_back(island.blockStl(b).filename().string());
+    // A square of the window's own surface, with the fill where the sea was: the rectangle's walls and base.
+    const Mesh solid = readBinaryStl(island.blockStl(b));
+    const MeshCheck check = checkSolid(solid);
+    CHECK(check.ok());
+    CHECK(check.nonManifoldEdges == 0);
+    CHECK(solid.triangles.size() == b.solidTriangles);
+    // In the block's own frame, from its south-west corner to its north-east one.
+    const auto bounds = boundsOf(solid);
+    CHECK_THAT(bounds.minX, WithinAbs(0.0, 1e-3));
+    CHECK_THAT(bounds.minY, WithinAbs(0.0, 1e-3));
+    CHECK_THAT(bounds.maxX, WithinAbs((b.rect.lastColumn - b.rect.firstColumn) * island.cellX, 1e-3));
+    CHECK_THAT(bounds.maxY, WithinAbs((b.rect.lastRow - b.rect.firstRow) * island.cellY, 1e-3));
+    lines += blockLine(island, b) + "\n";
+    CHECK_THAT(blockLine(island, b), ContainsSubstring(": 100% land, "));
+  }
+  std::sort(files.begin(), files.end());
+  CHECK(filesIn(island.outDir) == files);
+  CHECK_THAT(result.out, ContainsSubstring("\ntiles: " + lineAfter(result.out, "tiles: ") + "\n" + lines + "solid: "));
+  const auto cutShortBlocks = std::count_if(expected.begin(), expected.end(), [](const auto& b) { return b.cutShort; });
+  CHECK_THAT(lineAfter(result.out, "tiles: "),
+             EndsWith("; " + std::to_string(expected.size()) + " with land, 0 without, " +
+                      std::to_string(cutShortBlocks) + " cut short at the east or south edge"));
+  // Squares meet along their whole sides: every vertex on a side the first block shares is in its neighbour too.
+  for (const bool vertical : {true, false}) {
+    const ExpectedBlock& a = expected[0];
+    const ExpectedBlock& b = expected[vertical ? 1 : 2];
+    const int line = vertical ? a.rect.lastColumn : a.rect.lastRow;
+    std::vector<int> whole;
+    for (int k = vertical ? a.rect.firstRow : a.rect.firstColumn; k < (vertical ? a.rect.lastRow : a.rect.lastColumn);
+         ++k) {
+      whole.push_back(k);
+    }
+    const std::vector<TopVertex> first = onSharedStretches(island, island.topOf(a), vertical, line, whole);
+    const std::vector<TopVertex> second = onSharedStretches(island, island.topOf(b), vertical, line, whole);
+    CAPTURE(vertical);
+    REQUIRE(first.size() == second.size());
+    CHECK(first.size() >= 2);
+    for (std::size_t k = 0; k < first.size(); ++k) {
+      CHECK_THAT(first[k].x, WithinAbs(second[k].x, 1e-3));
+      CHECK_THAT(first[k].y, WithinAbs(second[k].y, 1e-3));
+      CHECK(first[k].z == second[k].z);
+    }
+  }
+}
+
+TEST_CASE("a lattice or a selection that cannot be written is refused before anything is read", "[mesh-e2e]") {
+  const Island island;
+  const auto checkRefused = [&island](const Finished& result, const std::string& problem) {
+    CHECK(result.exitCode() == 1);
+    CHECK(result.err == "error: " + problem + "\n");
+    CHECK(result.out.empty());
+    CHECK(std::filesystem::is_empty(island.outDir));
+  };
+  SECTION("--blocks that is not ROWS:COLS, read before anything else") {
+    const Finished result = island.run({"--tile", island.tile(12), "--blocks", "1-2"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "--blocks: must be ROWS:COLS, each part a whole number from 1 or a range such as 3-5, not "
+                         "'1-2'");
+  }
+  SECTION("--blocks beyond the lattice, which is named") {
+    const Finished result = island.run({"--tile", island.tile(12), "--blocks", "1-3:2"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "--blocks: '1-3:2' reaches beyond the lattice of 2 rows and 2 columns of blocks");
+  }
+  SECTION("a lattice of more than 10,000 blocks") {
+    // 199 x 199 cells of blocks of one cell each, a tile of 1 m being under half of either cell.
+    const Finished result = island.run({"--grid", "200x200", "--tile", "1"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "the lattice is 39601 blocks; the limit is 10000: use a larger --tile");
+  }
+  SECTION("a block side above 16,384 cells") {
+    const Finished result = island.run({"--grid", "16386x2", "--tile", "100000000"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "a block would be 16385 cells wide, but a block side may be at most 16384 cells: use a "
+                         "smaller --tile or a coarser --grid");
+  }
+  SECTION("a footprint without --tile above 16,384 cells a side") {
+    const Finished result = island.run({"--grid", "16386x2", "--footprint", "data"});
+    INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+    checkRefused(result, "the window is 16385 x 1 cells; a footprint without --tile is limited to 16384 a side: use "
+                         "--tile or --grid");
+  }
+}
+
+TEST_CASE("until Blender checks several blocks, a tiled run with Blender stops after writing them", "[mesh-e2e]") {
+  // The placeholder Task 8 replaces with one Blender session over every block's STL.
+  const Island island;
+  const TempDir bin;
+  const FakeBlender fake = writeFakeBlender(bin.path);
+  std::vector<std::string> args{"-i",          island.input.string(),   "-o",       island.stem.string(),
+                                "--blender",   fake.executable.string(), "--footprint", "data",
+                                "--tile",      island.tile(12),         "--tolerance", "0.5"};
+  const Finished result = runDem2Mesh(args, island.dir.path);
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  CHECK(result.exitCode() == 1);
+  CHECK(result.err == "error: Blender's check of several blocks comes in Task 8\n");
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + island.ply().string() + "\n"));
+  CHECK_FALSE(std::filesystem::exists(fake.arguments));  // never started
 }

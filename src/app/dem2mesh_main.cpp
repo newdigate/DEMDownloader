@@ -1,9 +1,12 @@
 // dem2mesh: an elevation GeoTIFF to a printable STL solid, the PLY surface, and the Blender scene built from it (spec 3
-// to 7), the surface simplified to within a tolerance when asked (spec 4.1 to 4.7). A section numbered 4.1 to 4.7 is
-// the simplify-and-tiles design's, the only one of the two designs with such sections; the other numbers are the
-// dem-to-mesh design's. main is the spec's pipeline as a sequence of named steps, each a call into the demmesh library,
-// so that the order can be read here and the work is tested there. The summary goes to stdout; every failure is one
-// line on stderr, "error: <message>", followed by Blender's output when Blender failed, and exit code 1.
+// to 7), the surface simplified to within a tolerance when asked (spec 4.1 to 4.7), and the solid cut off where the
+// data ends and split into blocks when asked (Part B 5.1 to 5.5). A section numbered 4.1 to 4.7 is the
+// simplify-and-tiles design's, the only one of the two designs with such sections, and one cited as "Part B 5.x" is
+// that design's too; the other numbers are the dem-to-mesh design's. A deviation or a ruling is the Part B plan's
+// (docs/superpowers/plans/2026-10-22-footprints-and-tiles.md). main is the spec's pipeline as a sequence of named
+// steps, each a call into the demmesh library, so that the order can be read here and the work is tested there. The
+// summary goes to stdout; every failure is one line on stderr, "error: <message>", followed by Blender's output when
+// Blender failed, and exit code 1.
 
 #include <unistd.h>
 
@@ -26,12 +29,15 @@
 #include <utility>
 #include <vector>
 
+#include "app/CliChecks.h"
 #include "app/ExitCodes.h"
 #include "app/MeshCli.h"
 #include "demdl/BoundingBox.h"
 #include "mesh/BasePlane.h"
 #include "mesh/BlenderRunner.h"
 #include "mesh/CropWindow.h"
+#include "mesh/Footprint.h"
+#include "mesh/FootprintSolid.h"
 #include "mesh/GeoTiffGrid.h"
 #include "mesh/NoDataFill.h"
 #include "mesh/PlyWriter.h"
@@ -39,6 +45,7 @@
 #include "mesh/Simplifier.h"
 #include "mesh/SolidMesh.h"
 #include "mesh/StlWriter.h"
+#include "mesh/Tiles.h"
 #include "mesh/TransverseMercator.h"
 
 namespace {
@@ -57,6 +64,10 @@ constexpr std::uint64_t kWarnVertices = 4'000'000;
 // refused only above the most an int holds, which still leaves both its sides within an int. At that limit its heights
 // are 8.6 GB of float32.
 constexpr std::uint64_t kMostVerticesToSimplify = std::numeric_limits<int>::max();
+
+// Part B 5.3: a lattice of more blocks than this is refused before anything is read, since a --tile of a few cells
+// would otherwise write millions of files. Counted in 64 bits.
+constexpr std::uint64_t kMostBlocks = 10'000;
 
 // value with `decimals` decimals, sized by a first call so that no value, however large, is cut short.
 std::string fixed(double value, int decimals) {
@@ -147,15 +158,22 @@ void checkOutputDirectory(const fs::path& stem) {
   }
 }
 
+// Whether anything is at path, a dangling link included. A name that cannot be looked at counts as nothing, and is left
+// to the writers to fail on.
+bool anythingAt(const fs::path& path) {
+  std::error_code ignored;
+  return fs::exists(fs::symlink_status(path, ignored));
+}
+
+// An output that is there already, refused when --overwrite was not given.
+void refuseExisting(const fs::path& path) {
+  if (anythingAt(path)) throw std::runtime_error(path.string() + " exists; use --overwrite");
+}
+
 // Without --overwrite, any of the three outputs already there is refused before anything is read: the .blend too,
 // though Blender writes it, since the run would replace it. Anything at the name counts, a dangling link included.
 void checkNoOutputExists(const Outputs& outputs) {
-  for (const fs::path* path : {&outputs.stl, &outputs.ply, &outputs.blend}) {
-    std::error_code ignored;  // a name that cannot be looked at is left to the writers to fail on
-    if (fs::exists(fs::symlink_status(*path, ignored))) {
-      throw std::runtime_error(path->string() + " exists; use --overwrite");
-    }
-  }
+  for (const fs::path* path : {&outputs.stl, &outputs.ply, &outputs.blend}) refuseExisting(*path);
 }
 
 // A Blender the user named, with --blender or BLENDER, that cannot be started is refused before anything is read, in a
@@ -219,7 +237,65 @@ struct Facts {
   double meshSummit = 0;           // the surface's highest height: the resampled grid's, or the simplified mesh's
   double surfaceLowZ = 0, surfaceHighZ = 0;  // the surface's lowest and highest z in model units, for Blender's camera
   BasePlane base;
-  MeshCheck check;
+  MeshCheck check;  // the solid's; in Part B's modes only edgesChecked, false when a block's edges went unchecked
+  std::vector<fs::path> stls;           // the STLs written, in lattice order: STEM.stl alone but with --tile
+  std::vector<std::string> blockLines;  // Part B 5.4's lines on the blocks, after base: (none without blocks)
+};
+
+// --footprint data: the solid stands only where the DEM has data (Part B 5.2).
+bool footprintOfData(const MeshOptions& options) { return options.footprint == MeshOptions::Footprint::Data; }
+
+// Part B's modes, which mesh the window block by block (Part B 5.3): --tile, and --footprint data, which without --tile
+// is one block of the whole grid (deviation 2). Without either, the run is today's, byte for byte (spec 6).
+bool meshesInBlocks(const MeshOptions& options) { return options.tile.has_value() || footprintOfData(options); }
+
+// The blocks of a run in Part B's modes, laid out from the grid before anything is read (Part B 5.3): the lattice, the
+// selection --blocks makes from it, and each block's name and STL, row by row from the north-west. With --tile a block
+// writes STEM_rRR_cCC.stl; the one block of --footprint data without --tile writes STEM.stl.
+struct BlockPlan {
+  bool tiled = false;      // --tile
+  bool footprint = false;  // --footprint data: a block holds the pieces of the data; otherwise it is a whole square
+  TileLayout layout{};
+  BlockSelection selection;
+  std::vector<std::string> names;  // "r03_c05"
+  std::vector<fs::path> stls;
+};
+
+// The footprint of --footprint data on the output grid (Part B 5.2): footprintCells' cells, a byte each, and the
+// corner contacts it joined, which each block counts within itself.
+struct FootprintGrid {
+  std::vector<std::uint8_t> cells;
+  std::vector<GridPoint> joined;
+};
+
+// A block to be written, as the simplifier left it: its place in the lattice, its part of the whole-area surface, and
+// what the summary says of it.
+struct SimplifiedBlock {
+  std::size_t index = 0;  // in the lattice, row by row from the north-west
+  BlockRect rect{};
+  BlockResult result;
+  std::uint64_t cells = 0;      // the block's
+  std::uint64_t landCells = 0;  // its kept pieces', or every cell of a square
+  std::uint64_t cornerContacts = 0;
+  std::uint64_t solidTriangles = 0;  // in the solid its outline makes
+};
+
+// A piece of footprint under --min-piece in a selected block, dropped and listed (Part B 5.2).
+struct DroppedPiece {
+  std::size_t block = 0;
+  std::uint64_t cells = 0;
+};
+
+// What the blocks come to (Part B 5.4): the whole-area surface, which is the PLY, the blocks to write in lattice order,
+// and the others as the summary lists them. withLand and cutShort count the whole lattice, selected or not.
+struct Blocks {
+  Mesh surface;
+  std::vector<SimplifiedBlock> written;
+  std::vector<std::size_t> skipped;      // selected, with no piece kept
+  std::vector<std::size_t> notSelected;  // outside --blocks
+  std::vector<DroppedPiece> dropped;
+  std::vector<std::size_t> stale;  // skipped, with an STL of an earlier run at its name, left alone (--overwrite)
+  std::uint64_t withLand = 0, cutShort = 0;
 };
 
 // Blender's peak resident memory, estimated from the solid's triangle count, as "<gigabytes> GB" to one decimal: about
@@ -242,11 +318,13 @@ void countOutputs(Facts& f, std::uint64_t vertices, std::uint64_t triangles, std
 
 // "4000000 vertices" and up: the sizes in megabytes, which is what a user weighs before waiting for them, and the
 // memory Blender will want, which can be more than the machine has, unless --no-blend leaves Blender out. mesh names
-// what has that many vertices: "the output grid", or with --tolerance "the simplified mesh".
+// what has that many vertices: "the output grid", or with --tolerance "the simplified mesh". With --tile the STLs are
+// the blocks', their sizes added up.
 void warnOfLargeFiles(const MeshOptions& options, std::string_view mesh, const Facts& f) {
   const std::string stl = fixed(static_cast<double>(f.stlBytes) / 1e6, 0) + " MB";
   const std::string ply = fixed(static_cast<double>(f.plyBytes) / 1e6, 0) + " MB";
-  std::cerr << "warning: " << mesh << " is " << f.surfaceVertices << " vertices: the STL will take " << stl;
+  std::cerr << "warning: " << mesh << " is " << f.surfaceVertices << " vertices: "
+            << (options.tile ? "the STLs" : "the STL") << " will take " << stl;
   if (options.noBlend) {
     std::cerr << " and the PLY " << ply << "\n";
   } else {
@@ -260,9 +338,17 @@ void warnOfLargeFiles(const MeshOptions& options, std::string_view mesh, const F
 // surface's clamp to the level is only a guard; the grid resampled to the output size, always, even at full
 // resolution, as the kernel's smoothing is part of the design. The window goes when this returns, so that it is never
 // held beside a mesh.
-std::vector<float> readTerrain(const MeshOptions& options, Facts& f, StageClock& clock) {
+//
+// With footprint, for --footprint data (Part B 5.2), the window's data is taken as the mask before the fill gives every
+// no-data sample a height, so that the fill copies data heights and the range is the data's (the plan's ruling on the
+// base plane); the mask is carried to the grid by the nearest sample, which at full resolution is the mask as it
+// stands; and the grid's cells with data at all four corners are the footprint (footprintCells). The window goes
+// before the cells are made and the mask once they are, each a byte a cell, 254 MB on the City's whole file.
+std::vector<float> readTerrain(const MeshOptions& options, Facts& f, FootprintGrid* footprint, StageClock& clock) {
   std::vector<float> heights = readWindow(options.input, f.geometry, f.window);
   clock.lap("read");
+  std::vector<std::uint8_t> mask;
+  if (footprint != nullptr) mask = dataMaskOf(heights);
   f.fill = fillNearest(heights, f.window.cols, f.window.rows);
   clock.lap("fill");
   const auto [lowest, highest] = std::minmax_element(heights.begin(), heights.end());
@@ -271,6 +357,14 @@ std::vector<float> readTerrain(const MeshOptions& options, Facts& f, StageClock&
   std::vector<float> grid = resampleQuadratic(heights, f.window.cols, f.window.rows, f.grid.cols, f.grid.rows);
   f.meshSummit = *std::max_element(grid.begin(), grid.end());  // the grid's, until it is simplified
   clock.lap("resample");
+  if (footprint != nullptr) {
+    release(heights);
+    if (f.grid.cols != f.window.cols || f.grid.rows != f.window.rows) {
+      mask = resampleMaskNearest(mask, f.window.cols, f.window.rows, f.grid.cols, f.grid.rows);
+    }
+    footprint->cells = footprintCells(mask, f.grid.cols, f.grid.rows, &footprint->joined);
+    clock.lap("footprint");
+  }
   return grid;
 }
 
@@ -283,10 +377,21 @@ struct Surface {
   Boundary boundary;
 };
 
+// Spec 4.2: with --tolerance the mesh written is known only once it is simplified, so only then is it refused above
+// kMostVertices, with nothing written yet, and warned about above kWarnVertices, as a grid is before anything is read.
+// In Part B's modes the mesh is the whole-area surface (the plan's ruling on the tolerance).
+void limitSimplifiedMesh(const MeshOptions& options, const Facts& f) {
+  if (f.surfaceVertices > kMostVertices) {
+    throw std::runtime_error("the simplified mesh is " + std::to_string(f.surfaceVertices) +
+                             " vertices; the limit is " + std::to_string(kMostVertices) +
+                             ": raise --tolerance, or use --grid or crop");
+  }
+  if (f.surfaceVertices > kWarnVertices) warnOfLargeFiles(options, "the simplified mesh", f);
+}
+
 // Spec 4.2: the grid becomes the surface as it stands (stage "surface"), or with --tolerance is simplified to a TIN
 // within it (stage "simplify"), and goes as soon as the surface is made, so that nothing per sample outlives this. What
-// will be written is counted from what was made. Only now is a simplified mesh's size known, so with --tolerance it is
-// refused here above kMostVertices and warned about above kWarnVertices, as a grid is before anything is read.
+// will be written is counted from what was made, and with --tolerance limited (limitSimplifiedMesh).
 Surface makeSurface(const MeshOptions& options, Facts& f, std::vector<float> grid, StageClock& clock) {
   Surface surface;
   if (options.tolerance) {
@@ -307,14 +412,7 @@ Surface makeSurface(const MeshOptions& options, Facts& f, std::vector<float> gri
   const std::uint64_t triangles = surface.mesh.triangles.size();
   countOutputs(f, surface.mesh.vertices.size(), triangles, solidTriangleCount(surface.boundary, triangles));
   clock.lap(options.tolerance ? "simplify" : "surface");
-  if (options.tolerance) {
-    if (f.surfaceVertices > kMostVertices) {
-      throw std::runtime_error("the simplified mesh is " + std::to_string(f.surfaceVertices) +
-                               " vertices; the limit is " + std::to_string(kMostVertices) +
-                               ": raise --tolerance, or use --grid or crop");
-    }
-    if (f.surfaceVertices > kWarnVertices) warnOfLargeFiles(options, "the simplified mesh", f);
-  }
+  if (options.tolerance) limitSimplifiedMesh(options, f);
   return surface;
 }
 
@@ -341,13 +439,14 @@ void checkSurface(const Mesh& surface) {
                            " surface triangles face down or have no area");
 }
 
-// The STL's 80-byte header names the tool and what was meshed (spec 5.5), the file name last since the header cuts
-// what does not fit, and so never begins "solid", which marks an ASCII STL to some readers.
-std::string stlHeader(const MeshOptions& options, const Facts& f) {
-  return "dem2mesh " DL_ELEVATION_VERSION " grid " + std::to_string(f.grid.cols) + "x" +
-         std::to_string(f.grid.rows) + " window " + std::to_string(f.window.cols) + "x" +
-         std::to_string(f.window.rows) + "+" + std::to_string(f.window.col0) + "+" + std::to_string(f.window.row0) +
-         " " + options.input.filename().string();
+// The STL's 80-byte header names the tool and what was meshed (spec 5.5), a tile's block by its name before the grid
+// (Part B 5.4), the file name last since the header cuts what does not fit, and so never begins "solid", which marks an
+// ASCII STL to some readers.
+std::string stlHeader(const MeshOptions& options, const Facts& f, const std::string& block = {}) {
+  return "dem2mesh " DL_ELEVATION_VERSION + (block.empty() ? std::string() : " block " + block) + " grid " +
+         std::to_string(f.grid.cols) + "x" + std::to_string(f.grid.rows) + " window " + std::to_string(f.window.cols) +
+         "x" + std::to_string(f.window.rows) + "+" + std::to_string(f.window.col0) + "+" +
+         std::to_string(f.window.row0) + " " + options.input.filename().string();
 }
 
 // The lines of the summary, which the dry run's plan shares.
@@ -436,6 +535,111 @@ std::string edgesNotCheckedLine() {
          " triangles; the count, the areas and the volume were";
 }
 
+// The lines on the blocks (Part B 5.4), after base:, with counts as plain integers and sizes in "units" (deviation 1).
+
+// "r03 c05": a block's name as the summary gives it.
+std::string blockLabel(const BlockPlan& plan, std::size_t block) {
+  std::string label = plan.names[block];
+  label[label.find('_')] = ' ';
+  return label;
+}
+
+// The blocks' labels, a comma between each two.
+std::string blockList(const BlockPlan& plan, const std::vector<std::size_t>& blocks) {
+  std::string list;
+  for (const std::size_t block : blocks) list += (list.empty() ? "" : ", ") + blockLabel(plan, block);
+  return list;
+}
+
+// part of whole as a percentage, rounded to a whole number: "72".
+std::string percentOf(std::uint64_t part, std::uint64_t whole) {
+  return std::to_string(std::llround(100.0 * static_cast<double>(part) / static_cast<double>(whole)));
+}
+
+// One cell of the output grid in square model units, which --min-piece is given in (Part B 5.2).
+double cellAreaUnits2(const MeshOptions& options, const Facts& f) {
+  return f.extent.widthM / (f.grid.cols - 1) * options.scale * (f.extent.heightM / (f.grid.rows - 1) * options.scale);
+}
+
+// "tiles: 13 x 20 blocks of 1000 x 1000 cells (5000 x 5000 m, 100 x 100 units); 146 with land, 114 without, 32 cut
+// short at the east or south edge": the lattice across and down; a full block in cells, in metres and in model units,
+// the units to the hundredth as metres are; and what the lattice's blocks hold, whether --blocks picks them or not.
+std::string tilesLine(const MeshOptions& options, const Facts& f, const BlockPlan& plan, const Blocks& blocks) {
+  const TileLayout& t = plan.layout;
+  const double widthM = t.blockCols * (f.extent.widthM / (f.grid.cols - 1));
+  const double heightM = t.blockRows * (f.extent.heightM / (f.grid.rows - 1));
+  const std::uint64_t all = static_cast<std::uint64_t>(t.across) * static_cast<std::uint64_t>(t.down);
+  return "tiles: " + std::to_string(t.across) + " x " + std::to_string(t.down) + " blocks of " +
+         std::to_string(t.blockCols) + " x " + std::to_string(t.blockRows) + " cells (" + metres(widthM) + " x " +
+         metres(heightM) + " m, " + metres(widthM * options.scale) + " x " + metres(heightM * options.scale) +
+         " units); " + std::to_string(blocks.withLand) + " with land, " + std::to_string(all - blocks.withLand) +
+         " without, " + std::to_string(blocks.cutShort) + " cut short at the east or south edge";
+}
+
+// "block r03 c05: 72% land, 184220 triangles, 9.2 MB, cape-town_r03_c05.stl": the share of the block's cells that its
+// kept pieces cover (all of a square's), its solid's triangles, and its file, by name, with its size to a tenth of a
+// megabyte.
+std::string blockLine(const BlockPlan& plan, const SimplifiedBlock& b) {
+  return "block " + blockLabel(plan, b.index) + ": " + percentOf(b.landCells, b.cells) + "% land, " +
+         std::to_string(b.solidTriangles) + " triangles, " +
+         fixed(static_cast<double>(stlFileBytes(b.solidTriangles)) / 1e6, 1) + " MB, " +
+         plan.stls[b.index].filename().string();
+}
+
+// "footprint: 72% of the window, 2 pieces": the one block of a footprint without --tile, which is the whole grid.
+std::string footprintLine(const SimplifiedBlock& b) {
+  const std::size_t pieces = b.result.pieces.size();
+  return "footprint: " + percentOf(b.landCells, b.cells) + "% of the window, " + std::to_string(pieces) +
+         (pieces == 1 ? " piece" : " pieces");
+}
+
+// "dropped pieces: r05 c02 2 cells 0.5 units2, ...": each piece under --min-piece, by its block when there are tiles,
+// in cells and in square model units to one decimal.
+std::string droppedLine(const MeshOptions& options, const Facts& f, const BlockPlan& plan, const Blocks& blocks) {
+  const double cellArea = cellAreaUnits2(options, f);
+  std::string line = "dropped pieces: ";
+  for (std::size_t k = 0; k < blocks.dropped.size(); ++k) {
+    const DroppedPiece& piece = blocks.dropped[k];
+    if (k > 0) line += ", ";
+    if (plan.tiled) line += blockLabel(plan, piece.block) + " ";
+    line += std::to_string(piece.cells) + (piece.cells == 1 ? " cell " : " cells ") +
+            fixed(static_cast<double>(piece.cells) * cellArea, 1) + " units2";
+  }
+  return line;
+}
+
+// "stale: cape-town_r01_c05.stl, ...": the STLs of an earlier run that this one left alone, by name.
+std::string staleLine(const BlockPlan& plan, const Blocks& blocks) {
+  std::string line = "stale: ";
+  for (std::size_t k = 0; k < blocks.stale.size(); ++k) {
+    line += (k > 0 ? ", " : "") + plan.stls[blocks.stale[k]].filename().string();
+  }
+  return line;
+}
+
+// All of the lines on the blocks, in the summary's order: with --tile the lattice, a line for each block written, then
+// the blocks skipped for want of land and those outside --blocks; without it, the footprint; then, when there are
+// any, the pieces dropped, the corner contacts joined inside the blocks written (the plan's ruling on contacts), and
+// the stale files.
+std::vector<std::string> blockLines(const MeshOptions& options, const Facts& f, const BlockPlan& plan,
+                                    const Blocks& blocks) {
+  std::vector<std::string> lines;
+  if (plan.tiled) {
+    lines.push_back(tilesLine(options, f, plan, blocks));
+    for (const SimplifiedBlock& b : blocks.written) lines.push_back(blockLine(plan, b));
+    if (!blocks.skipped.empty()) lines.push_back("skipped: no land in " + blockList(plan, blocks.skipped));
+    if (!blocks.notSelected.empty()) lines.push_back("not selected: " + blockList(plan, blocks.notSelected));
+  } else {
+    lines.push_back(footprintLine(blocks.written.front()));
+  }
+  if (!blocks.dropped.empty()) lines.push_back(droppedLine(options, f, plan, blocks));
+  std::uint64_t contacts = 0;
+  for (const SimplifiedBlock& b : blocks.written) contacts += b.cornerContacts;
+  if (contacts > 0) lines.push_back("corner contacts: " + std::to_string(contacts));
+  if (!blocks.stale.empty()) lines.push_back(staleLine(plan, blocks));
+  return lines;
+}
+
 // What to do about a missing Blender (spec 7.1), for its error and for the dry run's plan.
 constexpr std::string_view kBlenderAdvice = "pass --blender, set BLENDER, or install it at /Applications/Blender.app";
 
@@ -457,16 +661,18 @@ void printSummary(const MeshOptions& options, const Outputs& outputs, const Fact
   if (options.tolerance) std::cout << simplifyLine(options, f) << "\n";
   std::cout << heightsLine(f) << "\n"
             << summitLine(f) << "\n"
-            << baseLine(options, f) << "\n"
-            << solidLine(f) << "\n";
+            << baseLine(options, f) << "\n";
+  for (const std::string& line : f.blockLines) std::cout << line << "\n";
+  std::cout << solidLine(f) << "\n";
   if (!f.check.edgesChecked) std::cout << edgesNotCheckedLine() << "\n";
-  std::cout << "wrote: " << outputs.stl.string() << "\n"
-            << "wrote: " << outputs.ply.string() << "\n";
+  for (const fs::path& stl : f.stls) std::cout << "wrote: " << stl.string() << "\n";
+  std::cout << "wrote: " << outputs.ply.string() << "\n";
 }
 
 // The plan of spec 3.1, after the "dry run" line that run() printed first: the summary's lines with what the summary
 // leaves out (the projection, where the samples sit, the no-data value, the vertical datum, the window in metres) and
-// what would be written instead of "wrote:".
+// what would be written instead of "wrote:". With --tile the blocks' STLs, and the PLY after them, are what a run
+// "would write:", and only the PLY and the .blend are looked for on disk (Part B 5.4).
 void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& f) {
   const GridGeometry& g = f.geometry;
   const auto line = [](const std::string& text) { std::cout << "  " << text << "\n"; };
@@ -502,15 +708,21 @@ void printPlan(const MeshOptions& options, const Outputs& outputs, const Facts& 
   line(heightsLine(f));
   line(summitLine(f));
   line(baseLine(options, f));
+  for (const std::string& text : f.blockLines) line(text);
   line(solidLine(f));
   if (!f.check.edgesChecked) line(edgesNotCheckedLine());
   const std::optional<fs::path> blender = options.noBlend ? std::nullopt : findBlender(options.blender);
-  std::vector<const fs::path*> written{&outputs.stl, &outputs.ply};
+  std::vector<const fs::path*> written;
+  if (options.tile) {
+    for (const fs::path& stl : f.stls) line("would write: " + stl.string());
+    line("would write: " + outputs.ply.string());
+  } else {
+    written.push_back(&outputs.stl);
+  }
+  written.push_back(&outputs.ply);
   if (blender) written.push_back(&outputs.blend);
   for (const fs::path* path : written) {
-    std::error_code ignored;
-    const bool exists = fs::exists(fs::symlink_status(*path, ignored));
-    line("output: " + path->string() + (exists ? " (exists, will be overwritten)" : " (will be created)"));
+    line("output: " + path->string() + (anythingAt(*path) ? " (exists, will be overwritten)" : " (will be created)"));
   }
   line(plannedBlenderLine(options, f, blender));
 }
@@ -548,6 +760,8 @@ int blenderFailed(const std::string& message, const std::string& output) {
 // is looked for, so that the .blend found afterwards is this Blender's, and a run whose Blender fails or is not found
 // leaves no old scene beside the new STL and PLY.
 int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f, StageClock& clock) {
+  // Until the Blender job takes every block's STL, a tiled run stops here, its files written (the plan's Task 8).
+  if (options.tile) throw std::runtime_error("Blender's check of several blocks comes in Task 8");
   std::error_code removal;
   fs::remove(outputs.blend, removal);  // no error when there is none
   if (removal) throw std::runtime_error("cannot remove " + outputs.blend.string() + ": " + removal.message());
@@ -583,6 +797,294 @@ int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f
   return demdl::cli::kExitComplete;
 }
 
+// The summary, then Blender's scene, which --no-blend leaves out.
+int reportAndMakeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f, StageClock& clock) {
+  printSummary(options, outputs, f);
+  if (options.noBlend) {
+    std::cout << "blender: skipped (--no-blend)\n";
+    return demdl::cli::kExitComplete;
+  }
+  return makeScene(options, outputs, f, clock);
+}
+
+// Part B: the blocks.
+
+// --blocks, read before anything else is looked at, or every block when it was not given. parseBlocks' messages
+// complete "--blocks: ", as the parser's do for the flags it checks itself.
+BlockSelection blockSelection(const MeshOptions& options) {
+  if (!options.blocks) return {};
+  try {
+    return parseBlocks(*options.blocks);
+  } catch (const std::invalid_argument& e) {
+    throw std::runtime_error(std::string("--blocks: ") + e.what());
+  }
+}
+
+// "1 row", "2 rows".
+std::string counted(int count, const std::string& thing) {
+  return std::to_string(count) + " " + thing + (count == 1 ? "" : "s");
+}
+
+// Part B 5.3 and deviation 2: the lattice of --tile, each block as near SIZE square as the output grid's cells allow,
+// or without --tile the one block of the whole grid, which the exact predicates bound to kMostChunkCells a side; with
+// each block's name and file. Refused before anything is read when a block side would be longer than that
+// (tileLayout says which), when the lattice has more than kMostBlocks blocks, and when --blocks reaches beyond it,
+// which BlockSelection::selected would let pass.
+BlockPlan planBlocks(const MeshOptions& options, const Outputs& outputs, const Facts& f,
+                     const BlockSelection& selection) {
+  BlockPlan plan;
+  plan.tiled = options.tile.has_value();
+  plan.footprint = footprintOfData(options);
+  plan.selection = selection;
+  const int cols = f.grid.cols;
+  const int rows = f.grid.rows;
+  if (plan.tiled) {
+    plan.layout = tileLayout(cols, rows, *options.tile, options.scale, f.extent.widthM / (cols - 1),
+                             f.extent.heightM / (rows - 1));
+  } else if (cols - 1 > kMostChunkCells || rows - 1 > kMostChunkCells) {
+    throw std::runtime_error("the window is " + std::to_string(cols - 1) + " x " + std::to_string(rows - 1) +
+                             " cells; a footprint without --tile is limited to " + std::to_string(kMostChunkCells) +
+                             " a side: use --tile or --grid");
+  } else {
+    plan.layout = {cols, rows, cols - 1, rows - 1, 1, 1};
+  }
+  const TileLayout& t = plan.layout;
+  const std::uint64_t count = static_cast<std::uint64_t>(t.across) * static_cast<std::uint64_t>(t.down);
+  if (count > kMostBlocks) {
+    throw std::runtime_error("the lattice is " + std::to_string(count) + " blocks; the limit is " +
+                             std::to_string(kMostBlocks) + ": use a larger --tile");
+  }
+  if (!selection.all && (selection.lastRow > t.down || selection.lastCol > t.across)) {
+    throw std::runtime_error("--blocks: " + demdl::cli::quoted(*options.blocks) + " reaches beyond the lattice of " +
+                             counted(t.down, "row") + " and " + counted(t.across, "column") + " of blocks");
+  }
+  for (int r = 0; r < t.down; ++r) {
+    for (int c = 0; c < t.across; ++c) {
+      plan.names.push_back(blockName(t, r, c));
+      plan.stls.push_back(plan.tiled ? fs::path(options.outputStem.string() + "_" + plan.names.back() + ".stl")
+                                     : outputs.stl);
+    }
+  }
+  return plan;
+}
+
+// Deviation 4: without --overwrite, every file of the lattice that is there already is refused before anything is
+// read, whether or not this run would write it, since which blocks hold land is known only once the window is read:
+// each block's STL in lattice order, then the PLY and the .blend, as checkNoOutputExists takes them for one solid.
+void checkNoLatticeFileExists(const BlockPlan& plan, const Outputs& outputs) {
+  for (const fs::path& stl : plan.stls) refuseExisting(stl);
+  refuseExisting(outputs.ply);
+  refuseExisting(outputs.blend);
+}
+
+// Part B 5.3, the first pass: every block of the lattice in order, its footprint cut from the grid's cells with
+// --footprint data (pieces under --min-piece dropped), and each one that is selected and holds land simplified into the
+// one surface of the whole area, which makes blocks that share a side share its vertices. The grid and the cells are
+// only read; the lattice is counted whole, selected or not, for the tiles: line.
+Blocks simplifyBlocks(const MeshOptions& options, const Facts& f, const BlockPlan& plan, const std::vector<float>& grid,
+                      const FootprintGrid& footprint) {
+  const int cols = f.grid.cols;
+  const int rows = f.grid.rows;
+  const double cellArea = cellAreaUnits2(options, f);
+  BlockSimplifier simplifier(grid, cols, rows, toleranceInMetres(options), f.extent.widthM, f.extent.heightM,
+                             options.zScale, options.scale, f.base.levelM);
+  Blocks blocks;
+  const TileLayout& t = plan.layout;
+  for (int r = 0; r < t.down; ++r) {
+    for (int c = 0; c < t.across; ++c) {
+      const std::size_t index = static_cast<std::size_t>(r) * static_cast<std::size_t>(t.across) +
+                                static_cast<std::size_t>(c);
+      const BlockRect rect = blockRect(t, r, c);
+      std::optional<BlockFootprint> cut;
+      if (plan.footprint) {
+        cut = blockFootprint(footprint.cells, cols, rows, rect, cellArea, options.minPiece, footprint.joined);
+      }
+      const bool land = !cut || !cut->pieces.empty();
+      if (land) ++blocks.withLand;
+      if (cutShort(t, r, c)) ++blocks.cutShort;
+      if (!plan.selection.selected(r, c)) {
+        blocks.notSelected.push_back(index);
+        continue;
+      }
+      if (cut) {
+        for (const Piece& piece : cut->dropped) blocks.dropped.push_back({index, piece.cells});
+      }
+      if (!land) {
+        blocks.skipped.push_back(index);
+        continue;
+      }
+      SimplifiedBlock& b = blocks.written.emplace_back();
+      b.index = index;
+      b.rect = rect;
+      b.result = simplifier.simplifyBlock(rect, cut ? &*cut : nullptr);
+      b.cells = static_cast<std::uint64_t>(rect.lastColumn - rect.firstColumn) *
+                static_cast<std::uint64_t>(rect.lastRow - rect.firstRow);
+      b.landCells = cut ? cut->cells : b.cells;
+      b.cornerContacts = cut ? cut->cornerContacts : 0;
+      b.solidTriangles = b.result.rectangle ? solidTriangleCount(*b.result.rectangle, b.result.triangles)
+                                            : solidTriangleCount(b.result.pieces, b.result.triangles);
+    }
+  }
+  blocks.surface = simplifier.takeSurface();
+  return blocks;
+}
+
+// Why a run in Part B's modes has no block to write: no selected block keeps a piece of footprint.
+std::string nothingToWrite(const MeshOptions& options, const BlockPlan& plan, const Blocks& blocks) {
+  const std::string what =
+      plan.tiled ? "no selected block has land to write: " : "the footprint has nothing to write: ";
+  const std::size_t dropped = blocks.dropped.size();
+  if (dropped == 0) return what + "no cell has data at all four of its corners";
+  return what + std::to_string(dropped) + (dropped == 1 ? " piece was" : " pieces were") +
+         " dropped under --min-piece " + number(options.minPiece);
+}
+
+// What the blocks will write (Part B 5.4): the whole-area surface, which is the PLY, and each block's solid, an STL of
+// its own, their triangles and sizes added up; and the surface's summit, its highest vertex back in metres, and its
+// lowest and highest z for Blender's camera, as makeSurface and run() find them for one solid.
+void countBlocks(const MeshOptions& options, Facts& f, const Blocks& blocks) {
+  f.surfaceVertices = blocks.surface.vertices.size();
+  f.surfaceTriangles = blocks.surface.triangles.size();
+  f.triangles = 0;
+  f.stlBytes = 0;
+  for (const SimplifiedBlock& b : blocks.written) {
+    f.triangles += b.solidTriangles;
+    f.stlBytes += stlFileBytes(b.solidTriangles);
+  }
+  f.plyBytes = plyFileBytes(f.surfaceVertices, f.surfaceTriangles);
+  const auto [low, high] = std::minmax_element(blocks.surface.vertices.begin(), blocks.surface.vertices.end(),
+                                               [](const Vec3& a, const Vec3& b) { return a.z < b.z; });
+  f.surfaceLowZ = low->z;
+  f.surfaceHighZ = high->z;
+  f.meshSummit = static_cast<double>(high->z) / (options.zScale * options.scale);
+}
+
+// The number in a block's own mesh of the surface's vertex n: its place in numbers, which lists the block's vertices by
+// their numbers in the surface, ascending. A vertex the block does not have gets numbers.size(), which no vertex of the
+// block's mesh has, so that the solid builders refuse it.
+std::uint32_t localNumber(const std::vector<std::uint32_t>& numbers, std::uint32_t n) {
+  const auto at = std::lower_bound(numbers.begin(), numbers.end(), n);
+  return static_cast<std::uint32_t>((at != numbers.end() && *at == n ? at : numbers.end()) - numbers.begin());
+}
+
+// A block's part of the whole-area surface as a mesh of its own (Part B 5.3): its triangles, and the vertices they use,
+// numbered afresh in the order of their numbers in the surface, x and y measured from the block's south-west corner,
+// (x0, y0), in double and then rounded to float as the surface's are, and z as it is. numbers gets each of the block's
+// vertices' number in the surface, for localNumber.
+Mesh blockSurface(const Mesh& surface, const SimplifiedBlock& b, double x0, double y0,
+                  std::vector<std::uint32_t>& numbers) {
+  const auto first = surface.triangles.begin() + static_cast<std::ptrdiff_t>(b.result.firstTriangle);
+  const auto last = first + static_cast<std::ptrdiff_t>(b.result.triangles);
+  numbers.clear();
+  for (auto t = first; t != last; ++t) numbers.insert(numbers.end(), {t->a, t->b, t->c});
+  std::sort(numbers.begin(), numbers.end());
+  numbers.erase(std::unique(numbers.begin(), numbers.end()), numbers.end());
+  Mesh mesh;
+  mesh.vertices.reserve(numbers.size());
+  for (const std::uint32_t n : numbers) {
+    const Vec3& v = surface.vertices[n];
+    mesh.vertices.push_back({static_cast<float>(v.x - x0), static_cast<float>(v.y - y0), v.z});
+  }
+  mesh.triangles.reserve(b.result.triangles);
+  for (auto t = first; t != last; ++t) {
+    mesh.triangles.push_back({localNumber(numbers, t->a), localNumber(numbers, t->b), localNumber(numbers, t->c)});
+  }
+  return mesh;
+}
+
+// A window block's four sides, and a footprint block's outlines, in the numbers of the block's own mesh (the plan's
+// ruling on the outlines' numbers).
+Boundary renumbered(const Boundary& boundary, const std::vector<std::uint32_t>& numbers) {
+  Boundary local = boundary;
+  for (std::vector<std::uint32_t>& side : local.sides) {
+    for (std::uint32_t& v : side) v = localNumber(numbers, v);
+  }
+  return local;
+}
+
+std::vector<PieceOutline> renumbered(const std::vector<PieceOutline>& pieces,
+                                     const std::vector<std::uint32_t>& numbers) {
+  std::vector<PieceOutline> local = pieces;
+  for (PieceOutline& piece : local) {
+    for (std::uint32_t& v : piece.vertices) v = localNumber(numbers, v);
+  }
+  return local;
+}
+
+// One block as a solid of its own (Part B 5.3): its part of the whole-area surface in the block's frame, checked to
+// face up; the solid on it, a square's walls and base for a window block and each piece's for a footprint block,
+// checked to be closed, to face out and to have the triangles its outline makes (spec 6); then, unless this is a dry
+// run, its STL. numbers is room for blockSurface's.
+void writeBlock(const MeshOptions& options, const BlockPlan& plan, Facts& f, const Mesh& surface,
+                const SimplifiedBlock& b, std::vector<std::uint32_t>& numbers) {
+  // The block's south-west corner, worked out in double as the simplifier places its vertices (Simplifier.h).
+  const double x0 = b.rect.firstColumn * f.extent.widthM / (f.grid.cols - 1) * options.scale;
+  const double y0 = (f.grid.rows - 1 - b.rect.lastRow) * f.extent.heightM / (f.grid.rows - 1) * options.scale;
+  const Mesh top = blockSurface(surface, b, x0, y0, numbers);
+  checkSurface(top);
+  const auto planeZ = static_cast<float>(f.base.planeZ);
+  const Mesh solid = b.result.rectangle ? solidFromSurface(top, renumbered(*b.result.rectangle, numbers), planeZ)
+                                        : solidFromPieces(top, renumbered(b.result.pieces, numbers), planeZ);
+  const MeshCheck check = checkSolid(solid);
+  selfCheck(check, b.solidTriangles);
+  if (!check.edgesChecked) f.check.edgesChecked = false;
+  if (options.dryRun) return;
+  writeBinaryStl(solid, plan.stls[b.index], stlHeader(options, f, plan.tiled ? plan.names[b.index] : std::string()));
+}
+
+// Part B 5.3, the second pass: the blocks to be written, in lattice order and one at a time, so that only one block's
+// mesh and solid are held beside the whole-area surface. With --tile a failure names its block.
+void writeBlocks(const MeshOptions& options, const BlockPlan& plan, Facts& f, const Blocks& blocks) {
+  std::vector<std::uint32_t> numbers;
+  for (const SimplifiedBlock& b : blocks.written) {
+    if (!plan.tiled) {
+      writeBlock(options, plan, f, blocks.surface, b, numbers);
+      continue;
+    }
+    try {
+      writeBlock(options, plan, f, blocks.surface, b, numbers);
+    } catch (const std::exception& e) {
+      throw std::runtime_error("block " + blockLabel(plan, b.index) + ": " + e.what());
+    }
+  }
+}
+
+// Part B 5.3 to 5.5, once the grid and its footprint are made and the base plane chosen. The blocks are simplified into
+// one surface of the whole area, which is counted, limited and warned about as a simplified mesh is (spec 4.2), before
+// anything is written; the grid and the cells go once it is made. Then each block's solid is built, checked and
+// written; then the PLY of the whole area, which goes before Blender starts, the summary and Blender, as for one solid.
+// With --overwrite the STLs that blocks now without land left from an earlier run are left alone and named. The dry
+// run builds and checks everything, as for one solid, and writes nothing.
+int meshBlocks(const MeshOptions& options, const Outputs& outputs, const BlockPlan& plan, Facts& f,
+               std::vector<float> grid, FootprintGrid footprint, StageClock& clock) {
+  Blocks blocks = simplifyBlocks(options, f, plan, grid, footprint);
+  release(grid);
+  release(footprint.cells);
+  clock.lap("simplify");
+  if (blocks.written.empty()) throw std::runtime_error(nothingToWrite(options, plan, blocks));
+  countBlocks(options, f, blocks);
+  limitSimplifiedMesh(options, f);
+  writeBlocks(options, plan, f, blocks);
+  clock.lap("blocks");
+  if (options.overwrite) {
+    for (const std::size_t block : blocks.skipped) {
+      if (anythingAt(plan.stls[block])) blocks.stale.push_back(block);
+    }
+  }
+  f.stls.clear();
+  for (const SimplifiedBlock& b : blocks.written) f.stls.push_back(plan.stls[b.index]);
+  f.blockLines = blockLines(options, f, plan, blocks);
+  if (options.dryRun) {
+    printPlan(options, outputs, f);
+    return demdl::cli::kExitComplete;
+  }
+  writeBinaryPly(blocks.surface, outputs.ply, f.extent.widthM * options.scale, f.extent.heightM * options.scale);
+  release(blocks.surface.vertices);
+  release(blocks.surface.triangles);
+  clock.lap("write PLY");
+  return reportAndMakeScene(options, outputs, f, clock);
+}
+
 int run(int argc, char** argv) {
   MeshOptions options;
   const demdl::cli::ParseOutcome parsed = demdl::cli::parseMeshArgs(argc, argv, options, std::cout, std::cerr);
@@ -590,20 +1092,31 @@ int run(int argc, char** argv) {
   if (const std::string problem = demdl::cli::validateMeshOptions(options); !problem.empty()) {
     throw std::runtime_error(problem);
   }
+  const BlockSelection selection = blockSelection(options);
+  // Part B's modes run on the block simplifier, so without --tolerance they simplify at 0, which keeps every sample off
+  // its neighbours' plane; their memory, warning and limit are then the tolerance's (the plan's ruling).
+  if (meshesInBlocks(options) && !options.tolerance) options.tolerance = 0.0;
   checkInput(options.input);
   checkOutputDirectory(options.outputStem);
   const Outputs outputs = outputsFor(options.outputStem);
-  if (!options.overwrite) checkNoOutputExists(outputs);
+  // With --tile the files are the lattice's, which the grid decides (checkNoLatticeFileExists).
+  if (!options.overwrite && !options.tile) checkNoOutputExists(outputs);
   if (!options.noBlend) checkNamedBlender(options);
   // First, so that it stays the first line when --verbose prints the stages' times.
   if (options.dryRun) std::cout << "dry run\n";
 
   StageClock clock(options.verbose);
   Facts f;
+  f.stls = {outputs.stl};
   f.geometry = inspectGeoTiff(options.input);
   f.window = pixelWindowFor(f.geometry, options.crop);
   f.extent = extentInMetres(f.geometry, f.window);
   f.grid = outputGridFor(options.grid, f.window, f.extent, options.tolerance.has_value());
+  std::optional<BlockPlan> plan;
+  if (meshesInBlocks(options)) {
+    plan = planBlocks(options, outputs, f, selection);
+    if (!options.overwrite && plan->tiled) checkNoLatticeFileExists(*plan, outputs);
+  }
   // Without --tolerance the grid is what will be written, so its files are known before anything is read and a large
   // one is warned about first.
   if (!options.tolerance) {
@@ -612,8 +1125,10 @@ int run(int argc, char** argv) {
   }
   clock.lap("inspect");
 
-  std::vector<float> grid = readTerrain(options, f, clock);
+  FootprintGrid footprint;
+  std::vector<float> grid = readTerrain(options, f, plan && plan->footprint ? &footprint : nullptr, clock);
   f.base = chooseBasePlane(f.lowest, f.highest, options.base, options.zScale, options.scale, options.plinth);
+  if (plan) return meshBlocks(options, outputs, *plan, f, std::move(grid), std::move(footprint), clock);
   Surface surface = makeSurface(options, f, std::move(grid), clock);
   checkSurface(surface.mesh);
   // The surface and the solid, which starts with a copy of it, are both held from here until the PLY is written: at
@@ -641,12 +1156,7 @@ int run(int argc, char** argv) {
   release(solid.vertices);
   release(solid.triangles);
   clock.lap("write STL");
-  printSummary(options, outputs, f);
-  if (options.noBlend) {
-    std::cout << "blender: skipped (--no-blend)\n";
-    return demdl::cli::kExitComplete;
-  }
-  return makeScene(options, outputs, f, clock);
+  return reportAndMakeScene(options, outputs, f, clock);
 }
 
 }  // namespace
