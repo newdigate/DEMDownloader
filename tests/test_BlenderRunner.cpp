@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -39,7 +40,7 @@ using Path = std::filesystem::path;
 // A job in dir. The numbers have no short decimal form, so that an argument that rounds them is caught, and the low end
 // is negative, which an argument parser can take for an option.
 BlenderJob exampleJob(const Path& dir) {
-  return {dir / "model.ply", dir / "model.stl", dir / "model.blend", "model", 74.5 / 3, 76.1, -0.1 / 3, 21.69, 0.02};
+  return {dir / "model.ply", {dir / "model.stl"}, dir / "model.blend", "model", 74.5 / 3, 76.1, -0.1 / 3, 21.69, 0.02};
 }
 
 // Whether this machine has the Blender app where findBlender looks for it, before PATH.
@@ -52,6 +53,13 @@ bool appInstalled() {
 void writeExecutable(const Path& path) {
   writeFile(path, "#!/bin/sh\nexit 0\n");
   std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+}
+
+// Whether name is prefix, six characters that mkstemps chose and suffix: the file is one that no other process was given,
+// and not the template itself, which a call that mistook where the Xs end would leave as the name.
+bool nameMadeFromTemplate(const std::string& name, const std::string& prefix, const std::string& suffix) {
+  return name.size() == prefix.size() + 6 + suffix.size() && name.starts_with(prefix) && name.ends_with(suffix) &&
+         name.substr(prefix.size(), 6) != "XXXXXX";
 }
 
 // Makes dir the working directory until it goes.
@@ -246,7 +254,7 @@ TEST_CASE("runBlender runs Blender in the background on the embedded script with
   CHECK(args[2] == "--python");
   CHECK(args[4] == "--");
   CHECK(args[5] == "--ply=" + job.ply.string());
-  CHECK(args[6] == "--stl=" + job.stl.string());
+  CHECK(args[6] == "--stl=" + job.stls.front().string());
   CHECK(args[7] == "--blend=" + job.blend.string());
   CHECK(args[8] == "--name=" + job.name);
   // Every digit a double needs, so that the script reads back the very numbers.
@@ -259,10 +267,12 @@ TEST_CASE("runBlender runs Blender in the background on the embedded script with
   // The script was a file in the temporary directory while Blender ran, the embedded script whole, and it is gone.
   const Path script = args[3];
   CHECK(script.extension() == ".py");
+  CHECK(nameMadeFromTemplate(script.filename().string(), "dem2mesh-", ".py"));
   CHECK(std::filesystem::equivalent(script.parent_path(), scripts.path));
   CHECK(fileHolds(fake.scriptCopy, std::string(kBlenderScenePy)));
   CHECK_FALSE(std::filesystem::exists(script));
   CHECK(std::filesystem::is_empty(scripts.path));
+  CHECK_FALSE(std::filesystem::exists(fake.listCopy));  // one STL goes as it is, with no list to read
 }
 
 TEST_CASE("runBlender gives back Blender's exit code and output when it fails, and removes the script", "[blender]") {
@@ -323,7 +333,7 @@ TEST_CASE("runBlender gives Blender absolute paths, which it resolves the same w
   const ScopedEnv exit("FAKE_EXIT", std::nullopt);
   BlenderJob job = exampleJob(dir.path);
   job.ply = "out/model.ply";
-  job.stl = "out/model.stl";
+  job.stls = {Path("out/model.stl")};
   job.blend = "out/model.blend";
   REQUIRE(runBlender(fake.executable, job).exitCode == 0);
   const std::vector<std::string> args = fake.recordedArguments();
@@ -334,12 +344,90 @@ TEST_CASE("runBlender gives Blender absolute paths, which it resolves the same w
   CHECK(args[7] == "--blend=" + (here / "out/model.blend").string());
 }
 
+TEST_CASE("runBlender gives several STLs to Blender as a list file of their absolute paths, removed afterwards",
+          "[blender]") {
+  const TempDir dir;
+  const TempDir scripts;  // the temporary directory while it runs, so that the list's file can be seen to go
+  const FakeBlender fake = writeFakeBlender(dir.path);
+  const ScopedEnv tmpdir("TMPDIR", scripts.path.string());
+  const ScopedEnv exit("FAKE_EXIT", std::nullopt);
+  BlenderJob job = exampleJob(dir.path);
+  // The second is relative, and made absolute as the single STL's is.
+  job.stls = {dir.path / "model_r01_c01.stl", Path("out/model_r01_c02.stl"), dir.path / "model_r02_c01.stl"};
+  const Path here = std::filesystem::current_path();
+
+  const BlenderResult result = runBlender(fake.executable, job);
+  INFO("output:\n" << result.output);
+  CHECK(result.exitCode == 0);
+  CHECK(result.output == "fake blender: to stdout\nfake blender: to stderr\n");
+
+  // --stl-list= stands where --stl= stood among the same fourteen arguments.
+  const std::vector<std::string> args = fake.recordedArguments();
+  REQUIRE(args.size() == 14);
+  CHECK(args[5] == "--ply=" + job.ply.string());
+  REQUIRE(args[6].starts_with("--stl-list="));
+  CHECK(args[7] == "--blend=" + job.blend.string());
+  CHECK(args[8] == "--name=" + job.name);
+
+  // The list was a file beside the script while Blender ran: one absolute path to a line, in the job's order.
+  const Path list = args[6].substr(std::string_view("--stl-list=").size());
+  CHECK(list.extension() == ".txt");
+  CHECK(nameMadeFromTemplate(list.filename().string(), "dem2mesh-stls-", ".txt"));
+  CHECK(list.parent_path() == Path(args[3]).parent_path());
+  CHECK(std::filesystem::equivalent(list.parent_path(), scripts.path));
+  CHECK(fileHolds(fake.listCopy, job.stls[0].string() + "\n" + (here / "out/model_r01_c02.stl").string() + "\n" +
+                                     job.stls[2].string() + "\n"));
+  // And it is gone with the script.
+  CHECK_FALSE(std::filesystem::exists(list));
+  CHECK_FALSE(std::filesystem::exists(args[3]));
+  CHECK(std::filesystem::is_empty(scripts.path));
+}
+
+TEST_CASE("runBlender removes the list of STLs however the run ends", "[blender]") {
+  const TempDir dir;
+  const TempDir scripts;
+  const ScopedEnv tmpdir("TMPDIR", scripts.path.string());
+  BlenderJob job = exampleJob(dir.path);
+  job.stls = {dir.path / "model_r01_c01.stl", dir.path / "model_r01_c02.stl"};
+  SECTION("Blender fails") {
+    const FakeBlender fake = writeFakeBlender(dir.path);
+    const ScopedEnv exit("FAKE_EXIT", "3");
+    CHECK(runBlender(fake.executable, job).exitCode == 3);
+    CHECK(std::filesystem::exists(fake.listCopy));  // it had its list
+  }
+  SECTION("a signal ends Blender") {
+    const FakeBlender fake = writeFakeBlender(dir.path);
+    const ScopedEnv signal("FAKE_SIGNAL", "9");
+    CHECK(runBlender(fake.executable, job).exitCode == 128 + 9);
+    CHECK(std::filesystem::exists(fake.listCopy));
+  }
+  SECTION("Blender cannot be started") {
+    CHECK(runBlender(dir.path / "missing", job).exitCode == 127);
+  }
+  CHECK(std::filesystem::is_empty(scripts.path));
+}
+
+TEST_CASE("runBlender starts nothing for a job with no STL to check", "[blender]") {
+  const TempDir dir;
+  const TempDir scripts;
+  const FakeBlender fake = writeFakeBlender(dir.path);
+  const ScopedEnv tmpdir("TMPDIR", scripts.path.string());
+  BlenderJob job = exampleJob(dir.path);
+  job.stls.clear();
+  const BlenderResult result = runBlender(fake.executable, job);
+  CHECK(result.exitCode == 127);
+  CHECK(result.output == "cannot start '" + fake.executable.string() + "': the job names no STL to check\n");
+  CHECK_FALSE(std::filesystem::exists(fake.arguments));  // never started
+  CHECK(std::filesystem::is_empty(scripts.path));
+}
+
 TEST_CASE("the embedded scene script imports the PLY and checks the STL", "[blender]") {
   const std::string script(kBlenderScenePy);
   CHECK_THAT(script, ContainsSubstring("ply_import"));
   CHECK_THAT(script, ContainsSubstring("stl_import"));
   CHECK_THAT(script, ContainsSubstring("save_as_mainfile"));
   CHECK_THAT(script, ContainsSubstring("stl check:"));
+  CHECK_THAT(script, ContainsSubstring("--stl-list"));
 }
 
 TEST_CASE("the installed Blender sets the units from the scale and keeps the terrain in place, and its check fails "
@@ -354,11 +442,11 @@ TEST_CASE("the installed Blender sets the units from the scale and keeps the ter
   const Mesh surface = demdl::mesh::surfaceMesh({10.0f, 10.0f, 10.0f, 10.0f}, 2, 2, 100.0, 50.0, 1.0, 1.0, 0.0);
   const Mesh box = demdl::mesh::solidMesh(surface, 2, 2, -1.0f);
   REQUIRE(box.triangles.size() == 12);
-  const BlenderJob job{dir.path / "box.ply", dir.path / "box.stl", dir.path / "box.blend", "box",
-                       100.0,               50.0,                10.0,                  10.0, 1.0};
+  const BlenderJob job{dir.path / "box.ply", {dir.path / "box.stl"}, dir.path / "box.blend", "box",
+                       100.0,               50.0,                  10.0,                  10.0, 1.0};
   demdl::mesh::writeBinaryPly(surface, job.ply, 100.0, 50.0);
   const auto check = [&blender, &job](const Mesh& mesh, double scale) {
-    demdl::mesh::writeBinaryStl(mesh, job.stl, "dem2mesh test box");
+    demdl::mesh::writeBinaryStl(mesh, job.stls.front(), "dem2mesh test box");
     BlenderJob scaled = job;
     scaled.scale = scale;
     return runBlender(*blender, scaled);
@@ -420,4 +508,65 @@ TEST_CASE("the installed Blender sets the units from the scale and keeps the ter
   for (const auto& entry : std::filesystem::directory_iterator(dir.path)) names.push_back(entry.path().filename().string());
   std::sort(names.begin(), names.end());
   CHECK(names == std::vector<std::string>{"box.blend", "box.ply", "box.stl"});
+}
+
+TEST_CASE("the installed Blender checks each STL of a list in turn, totals them, and stops at the first that fails",
+          "[blender][slow]") {
+  const std::optional<Path> blender = findBlender(std::nullopt);
+  if (!blender) SKIP("Blender not installed");
+  const TempDir dir;
+  // Two closed solids of different sizes, so that the total is a sum and not twice one: a box of twelve triangles, and
+  // the solid of a grid of 3 x 2 heights, sixteen. A third is the box as the case above breaks it: without a triangle
+  // of its base, and with one of its top wound the other way. Each run takes Blender's start-up, six seconds on the
+  // owner's machine, so two runs show it all.
+  const Mesh surface = demdl::mesh::surfaceMesh({10.0f, 10.0f, 10.0f, 10.0f}, 2, 2, 100.0, 50.0, 1.0, 1.0, 0.0);
+  const Mesh box = demdl::mesh::solidMesh(surface, 2, 2, -1.0f);
+  const Mesh wideSurface = demdl::mesh::surfaceMesh(std::vector<float>(6, 10.0f), 3, 2, 100.0, 50.0, 1.0, 1.0, 0.0);
+  const Mesh wide = demdl::mesh::solidMesh(wideSurface, 3, 2, -1.0f);
+  Mesh broken = box;
+  broken.triangles.pop_back();
+  std::swap(broken.triangles[0].b, broken.triangles[0].c);
+  REQUIRE(box.triangles.size() == 12);
+  REQUIRE(wide.triangles.size() == 16);
+  const Path boxStl = dir.path / "box.stl";
+  const Path wideStl = dir.path / "wide.stl";
+  const Path brokenStl = dir.path / "broken.stl";
+  demdl::mesh::writeBinaryStl(box, boxStl, "dem2mesh test box");
+  demdl::mesh::writeBinaryStl(wide, wideStl, "dem2mesh test block");
+  demdl::mesh::writeBinaryStl(broken, brokenStl, "dem2mesh test broken box");
+  const Path ply = dir.path / "scene.ply";
+  demdl::mesh::writeBinaryPly(surface, ply, 100.0, 50.0);
+  const auto check = [&](const std::vector<Path>& stls) {
+    const BlenderJob job{ply, stls, dir.path / "scene.blend", "scene", 100.0, 50.0, 10.0, 10.0, 1.0};
+    return runBlender(*blender, job);
+  };
+  const auto imported = [](const Path& stl) {
+    return "\nblender: imported " + stl.string() + " into an empty scene; mesh.validate() found nothing to mend\n";
+  };
+
+  {
+    const BlenderResult result = check({boxStl, wideStl});
+    INFO("both closed, output:\n" << result.output);
+    CHECK(result.exitCode == 0);
+    // One line for the lot, the files' numbers added up, and each file looked at in its turn.
+    CHECK_THAT(result.output,
+               ContainsSubstring("\nstl check: 2 files, 28 triangles, 0 non-manifold edges, 0 inverted faces\n"));
+    CHECK(occurrences(result.output, "stl check: ") == 1);
+    CHECK_THAT(result.output, ContainsSubstring(imported(boxStl) + "blender: imported " + wideStl.string()));
+    CHECK(std::filesystem::exists(dir.path / "scene.blend"));
+  }
+  {
+    // The second of three is broken, and the third is never looked at.
+    const BlenderResult result = check({boxStl, brokenStl, wideStl});
+    INFO("the second broken, output:\n" << result.output);
+    CHECK(result.exitCode == 1);
+    CHECK_THAT(result.output, ContainsSubstring(imported(boxStl)));
+    // Named by a line of its own, and then its own numbers.
+    CHECK_THAT(result.output,
+               ContainsSubstring("\nstl check: " + brokenStl.string() + " failed\n" +
+                                 "stl check: 11 triangles, 3 non-manifold edges, 1 inverted faces\n"));
+    CHECK(result.output.find(wideStl.string()) == std::string::npos);
+    // The two lines of the broken one are all there are: none for the box that passed, and no total.
+    CHECK(occurrences(result.output, "stl check: ") == 2);
+  }
 }

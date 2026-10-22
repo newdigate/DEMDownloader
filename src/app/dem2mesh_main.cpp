@@ -753,15 +753,14 @@ int blenderFailed(const std::string& message, const std::string& output) {
 }
 
 // Spec 7: once the STL and PLY are written, which stay whatever happens here, Blender builds the scene from the PLY,
-// saves it as the .blend and checks the STL. The owner asked for the .blend, so a Blender that is missing or fails
-// fails the run. Exit 0 alone does not prove that the script ran: Blender exits 0 when it cannot read the script, or
-// after an exception in it. So the run succeeds only when the output holds the script's "stl check:" line, which it
-// prints last, and the .blend is there. An old .blend, there only under --overwrite, is removed first, before Blender
-// is looked for, so that the .blend found afterwards is this Blender's, and a run whose Blender fails or is not found
-// leaves no old scene beside the new STL and PLY.
+// saves it as the .blend and checks the STL, or with --tile every block's STL, one after another in the one session
+// (Part B 5.4). The owner asked for the .blend, so a Blender that is missing or fails fails the run. Exit 0 alone does
+// not prove that the script ran: Blender exits 0 when it cannot read the script, or after an exception in it. So the
+// run succeeds only when the output holds the script's "stl check:" line, which it prints last (for blocks, the one
+// line of their totals), and the .blend is there. An old .blend, there only under --overwrite, is removed first, before
+// Blender is looked for, so that the .blend found afterwards is this Blender's, and a run whose Blender fails or is not
+// found leaves no old scene beside the new STL and PLY.
 int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f, StageClock& clock) {
-  // Until the Blender job takes every block's STL, a tiled run stops here, its files written (the plan's Task 8).
-  if (options.tile) throw std::runtime_error("Blender's check of several blocks comes in Task 8");
   std::error_code removal;
   fs::remove(outputs.blend, removal);  // no error when there is none
   if (removal) throw std::runtime_error("cannot remove " + outputs.blend.string() + ": " + removal.message());
@@ -773,7 +772,7 @@ int makeScene(const MeshOptions& options, const Outputs& outputs, const Facts& f
   // Flushed, as Blender takes seconds, or a minute on a large mesh, and this says what the wait is for.
   std::cout << "blender: " << blender->string() << std::endl;
   const BlenderJob job{outputs.ply,
-                       outputs.stl,
+                       f.stls,
                        outputs.blend,
                        options.outputStem.filename().string(),
                        f.extent.widthM * options.scale,

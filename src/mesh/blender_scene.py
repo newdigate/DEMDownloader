@@ -8,9 +8,16 @@ dem2mesh carries this script inside it, writes it to a temporary file and runs
 where W and H are the window's size and LOW and HIGH the surface's lowest and highest heights, all in model units, and
 S is --scale, model units per metre. The script builds a scene around the terrain surface in the PLY and saves it as
 the .blend, then imports the STL into an empty scene and checks that it is a closed solid facing out: a second opinion
-on dem2mesh's own check (spec 6), from another program's reading of the file. Each step prints one line starting
+on dem2mesh's own check (spec 6), from another program's reading of the file. A run that writes many STLs, the blocks
+of a puzzle (Part B 5.4), gives --stl-list=FILE in place of --stl=PATH: FILE holds their paths, one to a line, and each
+is checked in its turn, in an empty scene of its own, within the one session. Each step prints one line starting
 "blender: ", which dem2mesh shows with --verbose, and the check prints the line starting "stl check: ", which dem2mesh
-always shows.
+always shows: for one STL its triangles, non-manifold edges and inverted faces, and for a list the same numbers added up
+over the files, after their count:
+
+    stl check: 146 files, 12345678 triangles, 0 non-manifold edges, 0 inverted faces
+
+A list stops at the first STL that fails, with the line "stl check: PATH failed" and then that STL's own numbers.
 
 The exit code is 0 only when every step ran and the check found nothing wrong. Blender itself exits 0 after an
 exception in a --python script, having printed it, so every exception is caught at the bottom and made exit 1.
@@ -21,9 +28,11 @@ delimiter; CMake refuses to configure when it does.
 
 import argparse
 import math
+import os
 import sys
 import traceback
 from array import array
+from collections import namedtuple
 
 import bmesh
 import bpy
@@ -58,8 +67,12 @@ def parse_arguments():
     """The arguments after "--", which Blender leaves to the script. A usage error exits 2 with argparse's message."""
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     parser = argparse.ArgumentParser(prog="blender_scene.py", description="dem2mesh's Blender scene and STL check")
-    for name in ("ply", "stl", "blend", "name"):
+    for name in ("ply", "blend", "name"):
         parser.add_argument("--" + name, required=True)
+    # The solid to check: one STL, or a file that lists many.
+    solid = parser.add_mutually_exclusive_group(required=True)
+    solid.add_argument("--stl")
+    solid.add_argument("--stl-list")
     for name in ("width", "height", "zmin", "zmax", "scale"):
         parser.add_argument("--" + name, type=float, required=True)
     args = parser.parse_args(argv)
@@ -67,7 +80,25 @@ def parse_arguments():
         parser.error("every number must be finite")
     if not (args.width > 0 and args.height > 0 and args.scale > 0 and args.zmax >= args.zmin):
         parser.error("the window and the scale must be above 0, and zmax at least zmin")
+    # Read now with the rest of the usage, so that a list that is no good costs no scene.
+    args.stls = None if args.stl_list is None else read_stl_list(parser, args.stl_list)
     return args
+
+
+def read_stl_list(parser, path):
+    """The paths in the list file --stl-list names: one to a line, each taken whole but for its newline, as a path may
+    begin or end with a space. A list that cannot be read, that holds no path, or that has an empty line is a usage
+    error."""
+    try:
+        with open(path, "rb") as listing:
+            lines = listing.read().split(b"\n")
+    except OSError as error:
+        parser.error("cannot read the list of STL files: %s" % error)
+    if lines[-1] == b"":  # what follows the newline that ends the last line
+        lines.pop()
+    if not lines or b"" in lines:
+        parser.error("the list of STL files %s must hold at least one path, and one to a line" % path)
+    return [os.fsdecode(line) for line in lines]
 
 
 def direction(azimuth_deg, elevation_deg):
@@ -269,8 +300,13 @@ def declared_triangles(path):
     return int.from_bytes(count, "little")
 
 
-def check_stl(path):
-    """Step 9, the second opinion on the STL (spec 6). Blender's own reader imports it into an empty scene, merging the
+# What Blender found in one STL: the triangles the file declares, the triangles Blender imported from it, the
+# non-manifold edges and the inverted faces of the mesh, and whether mesh.validate() mended anything.
+StlCheck = namedtuple("StlCheck", "declared triangles non_manifold inverted mended")
+
+
+def measure_stl(path):
+    """The second opinion on an STL (spec 6). Blender's own reader imports it into an empty scene, merging the
     corners that the triangles share. That reader drops a triangle that repeats another or has two corners at one
     point, saying so only in a warning, so the count it imports is held against the count the file declares. Its
     validation is off, so that what mesh.validate() finds to mend is seen here too. Then:
@@ -278,8 +314,7 @@ def check_stl(path):
     - inverted faces are those that Blender's recalculation of outward normals turns round. Each face's normal is kept
       beforehand, 12 bytes a face, and the recalculation is done in place: a copy of the mesh would double the memory,
       several gigabytes on a large grid.
-    Prints the "stl check:" line, after the mismatch's own line when the counts differ, and returns whether the solid
-    passed."""
+    Returns what it found, an StlCheck."""
     declared = declared_triangles(path)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.wm.stl_import(filepath=path, forward_axis='Y', up_axis='Z', use_mesh_validate=False)
@@ -300,11 +335,49 @@ def check_stl(path):
     solid.free()
     say("imported %s into an empty scene; mesh.validate() %s"
         % (path, "mended invalid geometry" if mended else "found nothing to mend"))
-    if declared != triangles:
-        print("stl check: file declares %d triangles, Blender imported %d" % (declared, triangles), flush=True)
-    print("stl check: %d triangles, %d non-manifold edges, %d inverted faces" % (triangles, non_manifold, inverted),
-          flush=True)
-    return declared == triangles and non_manifold == 0 and inverted == 0 and not mended
+    return StlCheck(declared, triangles, non_manifold, inverted, mended)
+
+
+def passed(check):
+    """Whether an STL is the solid it should be: every triangle of the file imported, closed, facing out, and nothing
+    for validation to mend."""
+    return check.declared == check.triangles and check.non_manifold == 0 and check.inverted == 0 and not check.mended
+
+
+def print_stl_check(check):
+    """The "stl check:" lines of one STL: its count's mismatch first when the counts differ, then its numbers."""
+    if check.declared != check.triangles:
+        print("stl check: file declares %d triangles, Blender imported %d" % (check.declared, check.triangles),
+              flush=True)
+    print("stl check: %d triangles, %d non-manifold edges, %d inverted faces"
+          % (check.triangles, check.non_manifold, check.inverted), flush=True)
+
+
+def check_stl(path):
+    """Step 9: the check of one STL, and its "stl check:" lines. Returns whether the solid passed."""
+    check = measure_stl(path)
+    print_stl_check(check)
+    return passed(check)
+
+
+def check_stl_list(paths):
+    """Step 9 for the blocks of a puzzle (Part B 5.4): each STL is checked as check_stl checks one, in its turn and in
+    an empty scene of its own, so that only one is in memory at a time. The first that fails ends the check, with the
+    line "stl check: PATH failed" and then its own lines, and the files after it are not looked at. When all pass, the
+    one "stl check:" line adds up their numbers after their count. Returns whether every solid passed."""
+    say("checking %d STL files, one after another" % len(paths))
+    checks = []
+    for path in paths:
+        check = measure_stl(path)
+        if not passed(check):
+            print("stl check: %s failed" % path, flush=True)
+            print_stl_check(check)
+            return False
+        checks.append(check)
+    print("stl check: %d files, %d triangles, %d non-manifold edges, %d inverted faces"
+          % (len(checks), sum(c.triangles for c in checks), sum(c.non_manifold for c in checks),
+             sum(c.inverted for c in checks)), flush=True)
+    return True
 
 
 def main():
@@ -325,7 +398,8 @@ def main():
     set_render(scene)
     set_units(scene, args.scale)
     save(args.blend)
-    return 0 if check_stl(args.stl) else 1
+    ok = check_stl(args.stl) if args.stls is None else check_stl_list(args.stls)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

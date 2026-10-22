@@ -972,6 +972,7 @@ struct Island {
 
   [[nodiscard]] Path stl() const { return stem.string() + ".stl"; }
   [[nodiscard]] Path ply() const { return stem.string() + ".ply"; }
+  [[nodiscard]] Path blend() const { return stem.string() + ".blend"; }
   [[nodiscard]] Path blockStl(const ExpectedBlock& block) const { return stem.string() + "_" + block.name + ".stl"; }
 
   // --tile for blocks `cells` of the grid's cells wide, and the lattice it makes.
@@ -1010,6 +1011,13 @@ struct Island {
     if (tolerance) args.insert(args.end(), {"--tolerance", *tolerance});
     args.insert(args.end(), extra.begin(), extra.end());
     return runDem2Mesh(args, dir.path);
+  }
+
+  // The same with Blender, as a run goes without --no-blend, at --scale 1 and --tolerance 0.5, then extra.
+  [[nodiscard]] Finished runWithBlender(const std::vector<std::string>& extra) const {
+    std::vector<std::string> args{"-i", input.string(), "-o", stem.string(), "--scale", "1", "--tolerance", "0.5"};
+    args.insert(args.end(), extra.begin(), extra.end());
+    return runDem2Mesh(args, dir.path, kBlenderDeadline);
   }
 
   // The grid dem2mesh meshes: the window read, filled from the nearest data and resampled to its own size.
@@ -1696,18 +1704,127 @@ TEST_CASE("a lattice or a selection that cannot be written is refused before any
   }
 }
 
-TEST_CASE("until Blender checks several blocks, a tiled run with Blender stops after writing them", "[mesh-e2e]") {
-  // The placeholder Task 8 replaces with one Blender session over every block's STL.
+namespace {
+
+// The blocks of the island that a run writes, which are those with land, and what Blender is to be told of them: the
+// list of their STLs, one to a line in lattice order, and the one line it is to check them with, as the stand-in for
+// Blender prints it, from the blocks' triangles added up.
+struct WrittenBlocks {
+  std::vector<const ExpectedBlock*> blocks;
+  std::string list;
+  std::string totals;
+
+  WrittenBlocks(const Island& island, const std::vector<ExpectedBlock>& expected) {
+    std::uint64_t triangles = 0;
+    for (const ExpectedBlock& b : expected) {
+      if (!b.land) continue;
+      blocks.push_back(&b);
+      list += island.blockStl(b).string() + "\n";
+      triangles += b.solidTriangles;
+    }
+    totals = "stl check: " + std::to_string(blocks.size()) + " files, " + std::to_string(triangles) +
+             " triangles, 0 non-manifold edges, 0 inverted faces";
+  }
+};
+
+}  // namespace
+
+TEST_CASE("a tiled run gives Blender every block's STL in one list and repeats its one line of totals",
+          "[mesh-e2e]") {
+  const Island island;
+  const std::vector<ExpectedBlock> expected = island.expected(island.layout(12), true);
+  const WrittenBlocks written(island, expected);
+  REQUIRE(written.blocks.size() > 1);
+  const TempDir bin;
+  const TempDir scripts;  // the temporary directory while dem2mesh runs, so that the list's file can be seen to go
+  const FakeBlender fake = writeFakeBlender(bin.path);
+  const ScopedEnv tmpdir("TMPDIR", scripts.path.string());
+  const ScopedEnv exit("FAKE_EXIT", std::nullopt);
+  // What the stand-in prints for one file. For a list it prints the totals of the files in it instead, as Blender does.
+  const ScopedEnv check("FAKE_STL_CHECK", "stl check: 100 triangles, 0 non-manifold edges, 0 inverted faces");
+
+  const Finished result = island.runWithBlender(
+      {"--blender", fake.executable.string(), "--footprint", "data", "--tile", island.tile(12)});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  CHECK(result.err.empty());
+  // The summary down to the PLY, then Blender's scene and its one line, which is the last of the output.
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + island.ply().string() + "\nblender: " + fake.executable.string() +
+                                  "\nwrote: " + island.blend().string() + "\n" + written.totals + "\n"));
+  CHECK(occurrences(result.out, "stl check: ") == 1);
+
+  // Blender was given the PLY of the whole area and, in the place of one STL, a list.
+  const std::vector<std::string> args = fake.recordedArguments();
+  REQUIRE(args.size() == 14);
+  CHECK(args[5] == "--ply=" + island.ply().string());
+  REQUIRE(args[6].starts_with("--stl-list="));
+  CHECK(args[7] == "--blend=" + island.blend().string());
+  CHECK(args[8] == "--name=island");
+  // The list held every block written, in lattice order, and is gone with the script.
+  CHECK(fileHolds(fake.listCopy, written.list));
+  CHECK(std::filesystem::is_empty(scripts.path));
+  std::vector<std::string> files{island.ply().filename().string(), island.blend().filename().string()};
+  for (const ExpectedBlock* b : written.blocks) files.push_back(island.blockStl(*b).filename().string());
+  std::sort(files.begin(), files.end());
+  CHECK(filesIn(island.outDir) == files);
+}
+
+TEST_CASE("a run with one STL gives Blender that file, tiled or not", "[mesh-e2e]") {
   const Island island;
   const TempDir bin;
   const FakeBlender fake = writeFakeBlender(bin.path);
-  std::vector<std::string> args{"-i",          island.input.string(),   "-o",       island.stem.string(),
-                                "--blender",   fake.executable.string(), "--footprint", "data",
-                                "--tile",      island.tile(12),         "--tolerance", "0.5"};
-  const Finished result = runDem2Mesh(args, island.dir.path);
+  const ScopedEnv exit("FAKE_EXIT", std::nullopt);
+  const std::string line = "stl check: 100 triangles, 0 non-manifold edges, 0 inverted faces";
+  const ScopedEnv check("FAKE_STL_CHECK", line);
+  Path stl;
+  std::vector<std::string> options{"--blender", fake.executable.string(), "--footprint", "data"};
+  SECTION("a footprint without tiles") {
+    stl = island.stl();
+  }
+  SECTION("a lattice of a single block, which is still tiled") {
+    const std::vector<ExpectedBlock> expected = island.expected(island.layout(30), true);
+    REQUIRE(expected.size() == 1);
+    REQUIRE(expected.front().land);
+    stl = island.blockStl(expected.front());
+    options.insert(options.end(), {"--tile", island.tile(30)});
+  }
+  const Finished result = island.runWithBlender(options);
   INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
-  CHECK(result.exitCode() == 1);
-  CHECK(result.err == "error: Blender's check of several blocks comes in Task 8\n");
-  CHECK_THAT(result.out, EndsWith("\nwrote: " + island.ply().string() + "\n"));
-  CHECK_FALSE(std::filesystem::exists(fake.arguments));  // never started
+  REQUIRE(result.exitCode() == 0);
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + island.blend().string() + "\n" + line + "\n"));
+  const std::vector<std::string> args = fake.recordedArguments();
+  REQUIRE(args.size() == 14);
+  CHECK(args[6] == "--stl=" + stl.string());
+  CHECK_FALSE(std::filesystem::exists(fake.listCopy));
+}
+
+TEST_CASE("with Blender installed, every block of a tiled run passes its check in one session",
+          "[mesh-e2e][slow]") {
+  const std::optional<Path> blender = findBlender(std::nullopt);
+  if (!blender) SKIP("Blender not installed");
+  const Island island;
+  const std::vector<ExpectedBlock> expected = island.expected(island.layout(12), true);
+  const WrittenBlocks written(island, expected);
+  REQUIRE(written.blocks.size() > 1);
+
+  const Finished result =
+      island.runWithBlender({"--footprint", "data", "--tile", island.tile(12), "--verbose"});
+  INFO("stdout:\n" << result.out << "stderr:\n" << result.err);
+  REQUIRE(result.exitCode() == 0);
+  CHECK(result.err.empty());
+  CHECK_THAT(result.out, EndsWith("\nwrote: " + island.blend().string() + "\n" + written.totals + "\n"));
+  // Blender's log, shown with --verbose: each block imported once, in its turn, with nothing for validation to mend.
+  for (const ExpectedBlock* b : written.blocks) {
+    CHECK_THAT(result.out, ContainsSubstring("\nblender: imported " + island.blockStl(*b).string() +
+                                             " into an empty scene; mesh.validate() found nothing to mend\n"));
+  }
+  // The one line of the check is there twice, in the log and again at the end, and no block has a line of its own.
+  CHECK(occurrences(result.out, "stl check: ") == 2);
+  // The scene is saved from the whole area's PLY. Blender 3.0 and later compress a .blend with Zstandard.
+  const std::string scene = readFile(island.blend());
+  CHECK((scene.starts_with("BLENDER") || scene.starts_with("\x28\xb5\x2f\xfd")));
+  std::vector<std::string> files{island.ply().filename().string(), island.blend().filename().string()};
+  for (const ExpectedBlock* b : written.blocks) files.push_back(island.blockStl(*b).filename().string());
+  std::sort(files.begin(), files.end());
+  CHECK(filesIn(island.outDir) == files);
 }

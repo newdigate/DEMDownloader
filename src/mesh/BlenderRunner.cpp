@@ -66,32 +66,36 @@ class Descriptor {
   int fd_ = -1;
 };
 
-// The scene script as a file for Blender to run, removed when this goes: on every way out of runBlender.
-class ScriptFile {
+// A file for Blender to read, which runBlender makes in the temporary directory and removes when this goes: on every
+// way out of runBlender.
+class TemporaryFile {
  public:
-  ScriptFile() = default;
-  ~ScriptFile() {
+  TemporaryFile() = default;
+  ~TemporaryFile() {
     if (!path_.empty()) ::unlink(path_.c_str());
   }
-  ScriptFile(const ScriptFile&) = delete;
-  ScriptFile& operator=(const ScriptFile&) = delete;
+  TemporaryFile(const TemporaryFile&) = delete;
+  TemporaryFile& operator=(const TemporaryFile&) = delete;
 
-  // Writes kBlenderScenePy to a new file in the temporary directory. Empty when done, otherwise what went wrong.
-  std::string write() {
+  // Writes text to a new file in the temporary directory, called prefix, six random characters and suffix:
+  // dem2mesh-q1W2e3.py for "dem2mesh-" and ".py". Empty when done, otherwise what went wrong, with `what` naming the
+  // file for the message.
+  std::string write(const std::string& prefix, const std::string& suffix, std::string_view text,
+                    const std::string& what) {
     std::error_code ec;
     const fs::path dir = fs::temp_directory_path(ec);
-    if (ec) return "cannot find a temporary directory for the scene script: " + ec.message();
+    if (ec) return "cannot find a temporary directory for " + what + ": " + ec.message();
     // mkstemps puts six random characters for the Xs and creates the file for this user alone, failing rather than
-    // opening one that is there already, so no other process can put its own script in its place.
-    std::string name = (dir / "dem2mesh-XXXXXX.py").string();
-    const int fd = ::mkstemps(name.data(), 3);
+    // opening one that is there already, so no other process can put its own file in its place.
+    std::string name = (dir / (prefix + "XXXXXX" + suffix)).string();
+    const int fd = ::mkstemps(name.data(), static_cast<int>(suffix.size()));
     if (fd < 0) {
       const int error = errno;
-      return "cannot create the scene script in " + dir.string() + ": " + reason(error);
+      return "cannot create " + what + " in " + dir.string() + ": " + reason(error);
     }
     path_ = name;
     int error = 0;
-    for (std::string_view rest = kBlenderScenePy; !rest.empty() && error == 0;) {
+    for (std::string_view rest = text; !rest.empty() && error == 0;) {
       const ssize_t written = ::write(fd, rest.data(), rest.size());
       if (written >= 0) {
         rest.remove_prefix(static_cast<std::size_t>(written));
@@ -101,7 +105,7 @@ class ScriptFile {
     }
     // The close can be the first to report that the text did not reach the file, so it is checked too.
     if (::close(fd) != 0 && error == 0) error = errno;
-    if (error != 0) return "cannot write the scene script " + path_ + ": " + reason(error);
+    if (error != 0) return "cannot write " + what + " " + path_ + ": " + reason(error);
     return {};
   }
 
@@ -213,8 +217,23 @@ std::optional<std::string> blenderStartProblem(const fs::path& blender) {
 
 BlenderResult runBlender(const fs::path& blender, const BlenderJob& job) {
   const std::string cannotStart = "cannot start " + quoted(blender.string()) + ": ";
-  ScriptFile script;
-  if (const std::string problem = script.write(); !problem.empty()) return {127, cannotStart + problem + "\n"};
+  if (job.stls.empty()) return {127, cannotStart + "the job names no STL to check\n"};
+  TemporaryFile script;
+  if (const std::string problem = script.write("dem2mesh-", ".py", kBlenderScenePy, "the scene script");
+      !problem.empty()) {
+    return {127, cannotStart + problem + "\n"};
+  }
+  // One STL goes to the script as it is. Several go in a file beside it, one absolute path to a line, so that the
+  // command line is as long for a puzzle of ten thousand blocks as for one.
+  TemporaryFile list;
+  if (job.stls.size() > 1) {
+    std::string paths;
+    for (const fs::path& stl : job.stls) paths += absolutePath(stl) + "\n";
+    if (const std::string problem = list.write("dem2mesh-stls-", ".txt", paths, "the list of STL files");
+        !problem.empty()) {
+      return {127, cannotStart + problem + "\n"};
+    }
+  }
 
   // Close-on-exec on both ends: the child is to have the write end as its stdout and stderr only, or the pipe would
   // never see its end while a stray copy stayed open.
@@ -234,13 +253,15 @@ BlenderResult runBlender(const fs::path& blender, const BlenderJob& job) {
     }
   }
 
+  const std::string solid = job.stls.size() == 1 ? "--stl=" + absolutePath(job.stls.front())
+                                                 : "--stl-list=" + absolutePath(list.path());
   const std::vector<std::string> args{"--background",
                                       "--factory-startup",
                                       "--python",
                                       script.path(),
                                       "--",
                                       "--ply=" + absolutePath(job.ply),
-                                      "--stl=" + absolutePath(job.stl),
+                                      solid,
                                       "--blend=" + absolutePath(job.blend),
                                       "--name=" + job.name,
                                       "--width=" + exactNumber(job.widthUnits),

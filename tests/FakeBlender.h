@@ -43,12 +43,13 @@ class ScopedEnv {
   std::optional<std::string> old_;
 };
 
-// The stand-in's executable and what it leaves beside it: the arguments it was given, one per line, and a copy of the
-// file that followed --python, taken while it ran.
+// The stand-in's executable and what it leaves beside it: the arguments it was given, one per line, a copy of the
+// file that followed --python, taken while it ran, and a copy of the list that --stl-list= named, if it was given one.
 struct FakeBlender {
   std::filesystem::path executable;
   std::filesystem::path arguments;
   std::filesystem::path scriptCopy;
+  std::filesystem::path listCopy;
 
   // The arguments of its last run, in order.
   [[nodiscard]] std::vector<std::string> recordedArguments() const {
@@ -72,34 +73,58 @@ inline double numberIn(const std::string& argument, const std::string& option) {
 }
 
 // Writes the stand-in as dir/blender, executable. It records its arguments and copies its script as above, exiting 98
-// when that file cannot be copied; prints "fake blender: to stdout" on stdout, then "fake blender: to stderr" on stderr;
-// and exits with $FAKE_EXIT, 0 when that is unset. With FAKE_SIGNAL set it kills itself with that signal instead. With
-// FAKE_STL_CHECK set it acts out a Blender that did its work: it writes a file beginning "BLENDER" at its --blend=
-// argument, unless FAKE_NO_BLEND is set too, and prints the variable's value as a line. It names cp by its path, so
-// that it runs whatever PATH is.
+// when that file cannot be copied, and copies the list of an --stl-list= argument the same way, exiting 96 when it
+// cannot; prints "fake blender: to stdout" on stdout, then "fake blender: to stderr" on stderr; and exits with
+// $FAKE_EXIT, 0 when that is unset. With FAKE_SIGNAL set it kills itself with that signal instead. With FAKE_STL_CHECK
+// set it acts out a Blender that did its work: it writes a file beginning "BLENDER" at its --blend= argument, unless
+// FAKE_NO_BLEND is set too, and prints one line of check. That is the variable's value for an --stl= argument. For an
+// --stl-list= it is the totals of the files that the list names, as Blender's script gives them, and the variable's
+// value is not used: "stl check: N files, T triangles, 0 non-manifold edges, 0 inverted faces", T being the sum of the
+// triangle counts that the files' headers declare (the four bytes at 80), so that a test can tell which files the list
+// held. A file in it that cannot be read ends the stand-in with exit 95. It names cp and od by their paths, so that it
+// runs whatever PATH is.
 inline FakeBlender writeFakeBlender(const std::filesystem::path& dir) {
-  const FakeBlender fake{dir / "blender", dir / "arguments.txt", dir / "script-copy.py"};
+  const FakeBlender fake{dir / "blender", dir / "arguments.txt", dir / "script-copy.py", dir / "list-copy.txt"};
   // The paths go into the script between single quotes.
   REQUIRE(dir.string().find('\'') == std::string::npos);
   const std::string arguments = "'" + fake.arguments.string() + "'";
   const std::string scriptCopy = "'" + fake.scriptCopy.string() + "'";
+  const std::string listCopy = "'" + fake.listCopy.string() + "'";
   writeFile(fake.executable,
             "#!/bin/sh\n"
             ": > " + arguments + "\n"
             "previous=''\n"
             "blend=''\n"
+            "list=''\n"
             "for arg in \"$@\"; do\n"
             "  printf '%s\\n' \"$arg\" >> " + arguments + "\n"
             "  if [ \"$previous\" = --python ]; then /bin/cp \"$arg\" " + scriptCopy + " || exit 98; fi\n"
-            "  case \"$arg\" in --blend=*) blend=${arg#--blend=} ;; esac\n"
+            "  case \"$arg\" in\n"
+            "    --blend=*) blend=${arg#--blend=} ;;\n"
+            "    --stl-list=*) list=${arg#--stl-list=} ;;\n"
+            "  esac\n"
             "  previous=$arg\n"
             "done\n"
+            "if [ -n \"$list\" ]; then /bin/cp \"$list\" " + listCopy + " || exit 96; fi\n"
             "echo 'fake blender: to stdout'\n"
             "echo 'fake blender: to stderr' >&2\n"
             "if [ -n \"$FAKE_SIGNAL\" ]; then kill -\"$FAKE_SIGNAL\" $$; fi\n"
             "if [ -n \"$FAKE_STL_CHECK\" ]; then\n"
             "  if [ -z \"$FAKE_NO_BLEND\" ]; then printf 'BLENDER-fake' > \"$blend\" || exit 97; fi\n"
-            "  printf '%s\\n' \"$FAKE_STL_CHECK\"\n"
+            "  if [ -n \"$list\" ]; then\n"
+            "    files=0\n"
+            "    triangles=0\n"
+            "    while IFS= read -r stl; do\n"
+            "      bytes=$(/usr/bin/od -An -tu1 -j80 -N4 \"$stl\") || exit 95\n"
+            "      set -- $bytes\n"
+            "      triangles=$((triangles + $1 + 256 * $2 + 65536 * $3 + 16777216 * $4))\n"
+            "      files=$((files + 1))\n"
+            "    done < \"$list\"\n"
+            "    printf 'stl check: %s files, %s triangles, 0 non-manifold edges, 0 inverted faces\\n' \"$files\" "
+            "\"$triangles\"\n"
+            "  else\n"
+            "    printf '%s\\n' \"$FAKE_STL_CHECK\"\n"
+            "  fi\n"
             "fi\n"
             "exit \"${FAKE_EXIT:-0}\"\n");
   using std::filesystem::perms;
