@@ -77,7 +77,10 @@ namespace demdl::mesh {
 // 4. when a vertex of the surface, on an outline or not, is not above planeZ (a NaN one included), a wall having to
 //    reach down from every vertex of an outline to the base;
 // 5. piece by piece, as each is built, when triangulatePolygon refuses its points: an outline that is not
-//    counter-clockwise seen from above (clockwise, or without area), that repeats a point, or that crosses itself.
+//    counter-clockwise seen from above (clockwise, or without area), that repeats a point, or that leaves no ear to
+//    cut. An outline that crosses itself is not looked for: it is refused only when one of those holds, and otherwise
+//    cut into overlapping triangles (PolygonTriangulation.h), so the caller passes a simple one, as BlockSimplifier's
+//    outlines are.
 // Nothing is returned when it throws, whichever check it was.
 //
 // Time and memory: linear in the surface and the outlines, plus triangulatePolygon, quadratic in an outline's vertices

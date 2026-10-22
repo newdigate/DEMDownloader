@@ -19,7 +19,7 @@
 - Shared edges match exactly (spec 5.3): a block side is simplified over runs split wherever the data status of the cells on either side of the line changes, each run with its ends fixed, by the one-dimensional rule in the fixed direction of Part A (rows west to east, columns north to south).
 - One base plane for all blocks, from the whole window's data heights with today's rule (spec 5.3).
 - Blocks are counted in output-grid cells from the window's north-west corner, `round(SIZE / (scale x cellX))` by `round(SIZE / (scale x cellY))`, numbered from the north-west, row then column, from 1; files `STEM_rRR_cCC.stl` with as many digits as the counts need; each block in its own local frame, x and y from the block's south-west corner, z unchanged (spec 5.3).
-- Outputs of spec 5.4: per-block STLs through the atomic writer; one `STEM.ply` and `STEM.blend` of the whole area (shared vertices merged, planar UVs over the window); Blender checks every block in one session and prints one `stl check:` line; the summary's `tiles:`, `block`, `skipped:`, `dropped pieces:`, `stale:` lines; the dry run prints the same with `would write`.
+- Outputs of spec 5.4: per-block STLs through the atomic writer; one `STEM.ply` and `STEM.blend` of the whole area (shared vertices merged, planar UVs over the window); Blender checks every block in one session and prints one `stl check:` line; the summary's `tiles:`, `block`, `skipped:`, `not selected:`, `dropped pieces:`, `corner contacts:` and `stale:` lines, and without `--tile` a `footprint:` line in place of the first four; the dry run prints the same lines, and in place of `wrote:` lists the STLs and the PLY under `would write:` with `--tile`, and without it the STL under `output:` as for one solid.
 - `--footprint window` without `--tile` and without the new flags is byte for byte today's output (spec 6).
 - Every solid written is closed and faces out; the surface check of Part A (`downwardFacingTriangles`) runs on every block (spec 6).
 - Tests stay offline; Blender only in the background; test names must not begin with `-`; never `git add -A`; nothing written into `~/Downloads`; commit messages end with the attribution line of the model doing the work.
@@ -330,6 +330,7 @@ Spec 5.1.
   - `--blocks ROWS:COLS`: `write only these blocks, each part a number or a range from 1, such as 3-5:2-4 or 7:12; the others are listed`;
   - `--min-piece A`: `drop a piece of footprint smaller than A square model units and list it, 0 or more (default 1)`.
 - `validateMeshOptions`, after tolerance: `tile must be finite`, `tile must be positive`; `min-piece must be finite`, `min-piece must be zero or positive`; `--blocks requires --tile`; `--footprint` text other than `window` or `data` is a CLI11 usage error (use `CLI::IsMember`).
+  *Overtaken in the final fix wave: `MeshOptions::minPiece` is `std::optional<double>`, its default applied in main (`kDefaultMinPiece`), so that `validateMeshOptions` can refuse a `--min-piece` given without `--footprint data`, last, with `--min-piece requires --footprint data`; the `--min-piece` help text ends `(default 1); needs --footprint data`, and `--tolerance`'s ends `absent, the full grid is written, or with --tile or --footprint data simplified at 0`.*
 
 - [ ] **Step 1: Write the failing tests** (tag `[meshcli]`): each flag parses; defaults; the four help texts; validation messages; `--footprint sea` is a usage error naming the two values; `--blocks 3-5:2-4` without `--tile` fails validation.
 - [ ] **Step 2: Run** `./build/demdl_tests "[meshcli]"`; expect failures.
@@ -425,7 +426,7 @@ Task 1, `PolygonTriangulation`:
 
 - Add to the random family a square with many lattice points a side and a scaled sparse-vertex variant.
 - No committed test shows `firstProblem` rejecting a bad triangulation.
-- `PolygonTriangulation.h:42-44`, "for such a polygon the set can miss an ear", reads as "simple" where it means self-crossing.
+- `PolygonTriangulation.h:42-44`, "for such a polygon the set can miss an ear", reads as "simple" where it means self-crossing. Done in the final fix wave: "for a polygon that crosses itself".
 - The first ear fill costs about 2x on shapes where the old search found an ear at once (within the stated bound).
 - Outcomes on self-crossing input changed with the ear set (unspecified either way).
 - Ear clipping is quadratic in an outline's vertices (about 3 to 4 ns x n^2 optimised, 1.3 s at 19,320 vertices) and runs twice for a piece, for its seed and for its base: the City's largest outline is 1,700 vertices (r14 c13), about 10 ms, but one of tens of thousands would cost seconds; a spatial index on the vertices is the next step.
@@ -453,12 +454,12 @@ Task 4, `BlockSimplifier`:
 - `BlockSimplifier` is not movable: default the moves (`dem2mesh` constructs it in place).
 - No test pins the four-edge re-test in `legaliseAll` (mutant M6 survives).
 - Two checks run on a moved-from vector.
-- `Simplifier.cpp` is 1063 lines and `test_Simplifier.cpp` 2261: the footprint tests could move to their own file.
+- `Simplifier.cpp` is 1133 lines and `test_Simplifier.cpp` 2389 (after the final fix wave's vertex limit): the footprint tests could move to their own file.
 - `tracked` is not asserted to be at most 4.
 
 Task 5, `FootprintSolid`:
 
-- `FootprintSolid.h:77-78` says a crossing outline is refused; it is refused only when no ear is left, and the caller must pass a simple polygon.
+- `FootprintSolid.h:77-78` says a crossing outline is refused; it is refused only when no ear is left, and the caller must pass a simple polygon. Done in the final fix wave: the header says so.
 - Wrapped messages quote the negated-row frame.
 - `FootprintSolid.cpp` duplicates `SolidMesh.cpp`'s `formatNumber` and plane checks verbatim.
 - The base re-clips the outline the simplifier clipped for its seed: carry the seed's triples in `PieceOutline` if coastal blocks ever dominate (on the City, building, checking and writing the 146 solids took 3.9 s of the 57 s before Blender starts, so they do not).
@@ -481,15 +482,15 @@ Task 6, the flags:
 
 Task 7, blocks in `dem2mesh`:
 
-- No suite case runs at a scale other than 1, so a lost `* options.scale` in the local frame, the `tiles:` units or `cellAreaUnits2` would pass: add one at `--scale 0.5`.
+- No suite case runs at a scale other than 1, so a lost `* options.scale` in the local frame, the `tiles:` units or `cellAreaUnits2` would pass: add one at `--scale 0.5`. Done in the final fix wave: the island tiled at `--scale 0.5 --z-scale 2`, against values worked out by hand from its box.
 - "Refused before anything is read" is asserted only through an empty stdout: add `--verbose` and keep `out.empty()`.
 - The one-block layout is a hand-built aggregate: use designated initialisers or a `wholeGridLayout` helper.
 - First-pass errors carry no block label.
 - The tiled dry run names the PLY twice (`would write:` and `output:`), and a `--footprint data` dry run without `--tile` is uncovered.
 - A test asserts on its own oracle (`test_Dem2MeshEndToEnd.cpp:1628`, where the library's `solidTriangles` is the expectation).
 - `0% land` can print for a tiny kept piece (the City's r02 c06, r05 c02, r12 c13 and r18 c10 do).
-- The grid refusal says "with --tolerance" for a Part B run without it.
-- `dem2mesh_main.cpp` is 1174 lines with pure mesh work (`blockSurface`, `localNumber`, `renumbered`) that belongs in `src/mesh/` with unit tests at a scale other than 1, and its summary and plan builders could move to their own file; `test_Dem2MeshEndToEnd.cpp` is 1830 lines.
+- The grid refusal says "with --tolerance" for a Part B run without it. Done in the final fix wave: without `--tolerance` Part B's modes keep the grid's 25,000,000-vertex cap, refused with "without --tolerance the limit is 25000000: give --tolerance, or use --grid or crop".
+- `dem2mesh_main.cpp` is 1235 lines (after the final fix wave) with pure mesh work (`blockSurface`, `localNumber`, `renumbered`) that belongs in `src/mesh/` with unit tests at a scale other than 1, and its summary and plan builders could move to their own file; `test_Dem2MeshEndToEnd.cpp` is 2042 lines.
 
 Task 8, Blender over every block:
 
@@ -505,6 +506,13 @@ The Part A follow-ups that Part B touched (from the list of `2026-10-21-simplify
 
 - The side cache and the vertex map are still never evicted. Still open, and negligible at 1000-cell blocks: the City run, which keeps 662,226 vertices and 146 blocks' runs, peaked at 2.29 GB in all.
 - `ChunkTin` was split in Task 4 as far as Part B needed: `Tin` is the shared engine (faces, flips, scan, heap, emission), the number of tracked corners a parameter (4 for a chunk, 0 for a piece) and the outline's samples a bitmap; `ChunkTin` keeps the rectangle's seeding and the new `PieceTin` seeds from `triangulatePolygon`. Done; `Tin` itself still keeps topology, scan and heap together.
-- A chunk of 16,384 cells at a near-zero tolerance needs about 30 GB of working state. Still open, and Part B now allows such blocks: a block side may be 16,384 cells, and `--tile` or `--footprint data` without `--tolerance` simplifies at 0. Bound a block's memory before it starts.
+- A chunk of 16,384 cells at a near-zero tolerance needs about 30 GB of working state. Narrowed in the final fix wave: without `--tolerance` the grid is capped at 25,000,000 vertices in Part B's modes too, so a block of 16,384 x 16,384 cells (268,435,456 of them) cannot be asked for at a tolerance of 0. The hazard remains only with an explicit near-zero `--tolerance` on a block of that size, and the simplifier's vertex limit now stops such a block once the surface passes 25,000,000 vertices, when the block's faces, vertices and heap come to some 5 GB by `Simplifier.h`'s figures (about 50 bytes a triangle, 24 a vertex and a few heap entries of 24 bytes a triangle), not 30. Still open: bound a block's working state before it starts, rather than when it is built.
 - `formatNumber` now exists in eight files, not five (Part B added `Footprint.cpp`, `FootprintSolid.cpp` and `Tiles.cpp`), and `FootprintSolid.cpp` repeats `SolidMesh.cpp`'s frame and plane checks. Still open.
 - The spec-citation convention is settled only in the header of `dem2mesh_main.cpp` ("Part B 5.x"); the library headers say "spec 5.x" for the same document.
+
+The whole-branch review's minors deferred to after the merge (one line each, with the review's figures):
+
+- Renumbering a block's part of the surface (`blockSurface`, `localNumber`) sorts and binary-searches, about 40 percent of a million-triangle block's time: 91.5 s of 209 s on r3_c1 at `--grid 6400` as one footprint block, 34 s of 86 s at `--scale 1 --tolerance 0.05`; the City's 1000-cell blocks take 2.6 s. A dense remap, a vector the size of the surface's vertices filled through the block's triangles and reset through its list, is O(T), and comes with the planned move of `blockSurface`, `localNumber` and `renumbered` into `src/mesh/` with unit tests at a scale other than 1.
+- Open design question, Minor 2: `--blocks` is refused over existing files of blocks it can never write (`checkNoLatticeFileExists` refuses the whole lattice's, so `--blocks 3:2` on r3_c1 into a directory holding only `r3c1_r1_c4.stl` fails), and the `--overwrite` it forces replaces the whole-area `STEM.ply` and `STEM.blend` with the selection's (spec 5.4), so re-making one block of a finished puzzle into its stem loses the 100-s run's scene. Both are the spec's own words. Refuse only the selected blocks' files, the PLY and the `.blend`? Write a selection's PLY and `.blend` only when every block is selected, or under names of their own? For now CLAUDE.md says to give a batch its own `-o` stem or directory.
+- The `.blend` of a `--blocks` run frames the whole window: the job passes the window's width and height (`dem2mesh_main.cpp`, `makeScene`), and `blender_scene.py` centres the object's origin and the camera on them, so a one-block selection of the City sits small and off-centre in a frame sized for 258 x 394 units. Pass the selected blocks' extent and offset.
+- `--min-piece` could drop small window blocks, a sliver cut short at the east or south edge, instead of being refused with `--footprint window` (`--min-piece requires --footprint data`).

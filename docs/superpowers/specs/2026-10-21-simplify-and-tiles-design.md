@@ -14,7 +14,7 @@ Part B (section 5) was implemented on 2026-10-22 through
 command on the whole City took 100 s in a Release build, Blender's check of every
 block included, against the ten minutes that section 5.5 targets, and peaked at
 2.29 GB: it wrote 146 blocks, the largest of 4.0 MB, and Blender found no
-non-manifold edge and no inverted face in any of them (section 5.5). Sections 5.2 to
+non-manifold edge and no inverted face in any of them (section 7). Sections 5.2 to
 5.4 below describe the program as built; section 9 lists what was ruled on the way,
 including the places where it differs from the text this document was approved with.
 
@@ -119,7 +119,8 @@ files, less Blender memory, and full-resolution crops that today's cap refuses.
 T is in model units because that is what the printer can resolve: 0.05 on a
 1:50,000 print is 0.05 mm, which is 2.5 m of terrain, and is the value the
 owner's puzzle uses. At `--scale 1` the unit is a metre. The equivalent in metres, T / (zScale x scale), is printed. Without
-`--tolerance` nothing changes.
+`--tolerance` nothing changes (but in Part B's modes, which simplify at 0 without
+it, section 5.3).
 
 ### 4.2 Where it sits in the pipeline
 
@@ -131,12 +132,22 @@ takes a surface with an ordered boundary instead of assuming grid topology.
 The 25,000,000-vertex cap keeps its meaning, the size of what is written, so with
 `--tolerance` it no longer applies to the grid: the grid may be as large as the
 window, and the dry run prints the two float32 buffers' size as the plan's
-`memory:` line, which counts those two buffers only; the fill's work lists and a
-large TIN come on top.
+`memory:` line, which counts those two buffers only (and with `--footprint data`
+the data mask beside them, section 5.3); the fill's work lists and a large TIN
+come on top.
 The 4,000,000-vertex warning likewise moves to the simplified output and is
 printed after simplification. A simplified mesh above 25,000,000 vertices is
-refused once it has been simplified, before the solid is built and with nothing
-written:
+refused before the solid is built and with nothing written. The simplifier is
+given the limit and stops the mesh while making it, so that a tolerance near 0 on
+a large grid cannot build gigabytes of it first: a chunk, or a block of Part B, is
+stopped as soon as the surface before it, plus the vertices it has taken, exceeds
+the limit plus the samples round its edge, a slack for the vertices it shares with
+the chunks before it, so that no mesh that would end within the limit is stopped:
+
+    error: the simplified mesh is more than 25000000 vertices; the limit is 25000000: raise --tolerance, or use --grid or crop
+
+A mesh that ends above the limit by less than that slack is refused once it has
+been simplified, with its count:
 
     error: the simplified mesh is N vertices; the limit is 25000000: raise --tolerance, or use --grid or crop
 
@@ -146,7 +157,10 @@ above that:
 
     error: the output grid is N vertices; with --tolerance the limit is 2147483647: use --grid or crop
 
-(Without `--tolerance` both apply to the grid as today.)
+(Without `--tolerance` the 25,000,000 limit applies to the grid as today, in Part
+B's modes as well, which simplify at 0 without the flag (section 5.3). So does the
+warning on today's path; in Part B's modes it counts the whole-area surface, after
+simplification.)
 
 ### 4.3 What the simplifier guarantees
 
@@ -270,7 +284,7 @@ Part B is its own plan and landed after Part A, which it builds on.
 | `--footprint window\|data` | `window` | `window`: the solid covers the whole window as today; `data`: the solid exists only where the DEM has data (section 5.2) |
 | `--tile SIZE` | off | split the window into square blocks of SIZE model units, each written as its own STL (section 5.3) |
 | `--blocks ROWS:COLS` | all | write only these blocks, each part a number or a range, for instance `3-5:2-4` or `7:12`; the others are listed but not written |
-| `--min-piece A` | 1 | a connected piece of footprint smaller than A square model units is dropped and reported (section 5.2) |
+| `--min-piece A` | 1 | a connected piece of footprint smaller than A square model units is dropped and reported (section 5.2); only with `--footprint data`, and a usage error without it, `--min-piece requires --footprint data` |
 
 The puzzle run is:
 
@@ -375,9 +389,21 @@ the DEM's no-data specifically, so that addition would not change the design.
 - **Tolerance.** Part B's modes run on the block simplifier. `--tile` or
   `--footprint data` without `--tolerance` therefore simplifies at a tolerance of
   0, which keeps every sample that is off the plane of its neighbours, and prints
-  `simplify: tolerance 0 units (0 m), ...`; the warning and the 25,000,000 limit
-  of section 4.2 then count the whole-area surface, and the dry run's `memory:`
-  line counts the window and the grid only, as there.
+  `simplify: tolerance 0 units (0 m), ...`; the 4,000,000 warning of section 4.2
+  then counts the whole-area surface, after simplification. The 25,000,000 limit
+  stays on the grid, as without the flag on today's path, since at 0 nearly every
+  sample is kept, and only an explicit `--tolerance` lifts it (section 9); the
+  refusal names the flag:
+
+      error: the output grid is N vertices; without --tolerance the limit is 25000000: give --tolerance, or use --grid or crop
+
+  With `--tolerance` the grid may reach 2,147,483,647 vertices, as in section 4.2,
+  and the whole-area surface is held to 25,000,000 as a simplified mesh is there.
+  The dry run's `memory:` line counts the window and the grid, as there, and with
+  `--footprint data` also the window's data mask, a byte a sample, which is held
+  beside them while the one is resampled into the other: `memory: window N samples
+  and grid M vertices, 4 bytes each, and the data mask, a byte a sample: about X MB`,
+  about 2.3 GB on the City's puzzle, which peaked at 2.29 GB.
 - **One base plane.** The base plane and plinth are chosen once from the whole
   window's data heights, with today's rule, and every block uses it, so the blocks
   sit flush. (The fill only copies data heights, so the range after it is the
@@ -418,9 +444,12 @@ the DEM's no-data specifically, so that addition would not change the design.
   into a reset scene.
 - **Two passes.** Every selected block that holds land is simplified first, in
   lattice order, into the one surface of the whole area. That surface is then
-  counted, limited and warned about as section 4.2 says, so the 25,000,000
-  refusal and the 4,000,000 warning come before anything is written. Only then is
-  each block's solid built, checked and written, one at a time, and the PLY last.
+  counted, limited and warned about as section 4.2 says, the simplifier stopping
+  it once it has passed the limit, so the refusal of a simplified mesh above
+  25,000,000 vertices and the 4,000,000 warning come before anything is written
+  (without `--tolerance` the 25,000,000 refusal is the grid's, before any pixel is
+  read, section 5.3). Only then is each block's solid built, checked and written,
+  one at a time, and the PLY last.
   A run with no block to write is an error, `no selected block has land to write:
   ...` (`the footprint has nothing to write: ...` without `--tile`), raised
   before anything is written.
@@ -450,9 +479,13 @@ the DEM's no-data specifically, so that addition would not change the design.
 - Without `--overwrite`, any block file of the lattice that exists is refused
   before anything is read, whether or not this run would write it, since which
   blocks hold land is known only after reading. With `--overwrite`, existing block
-  files are replaced; the file of a selected block that no longer has land, after
-  a change of crop, tolerance or `--min-piece`, is left alone and named in a
-  `stale:` line. The files of blocks outside `--blocks` are not named.
+  files are replaced. Every block file of the stem that the run does not write is
+  left alone and named in a `stale:` line, in name order: any regular file in the
+  output directory called `STEM_r<digits>_c<digits>.stl`, the file of a selected
+  block that no longer has land, after a change of crop, tolerance or
+  `--min-piece`, among them, and those of another lattice, whose names or their
+  padding a change of `--tile`, `--grid`, `--scale` or crop changes. The files of
+  blocks of the lattice outside `--blocks` are not named.
 
 ### 5.5 Memory and time for the whole City
 
@@ -481,7 +514,11 @@ bytes; the City was not timed in Debug.
 Inputs, projections, the crop, the fill rule for enclosed holes, resampling, the
 base-plane rule, `--z-scale` and `--scale`, atomic writes, exit codes, the Blender
 search and checks, and every existing test. `--footprint window` without
-`--tolerance` and `--tile` is byte-for-byte today's output.
+`--tolerance` and `--tile` is byte-for-byte today's output, its refusal of a grid
+above 25,000,000 vertices included. With `--tolerance`, every run whose simplified
+mesh is within the 25,000,000-vertex limit writes what it wrote before the limit
+was given to the simplifier; one beyond it is stopped while it is simplified
+(section 4.2).
 
 ## 7. Verification
 
@@ -550,7 +587,9 @@ Beyond the unit tests the plans will pin, the acceptance checks are:
 - The dry run simplifies, so a whole-City dry run costs as much as the run minus
   the writing.
 - With `--tolerance`, the 25,000,000-vertex limit is applied to the simplified
-  mesh once it has been simplified, with its own message (section 4.2).
+  mesh, not the grid, with messages of its own (section 4.2); since the fix wave
+  after Part B's review the simplifier stops a mesh that passes it while making it
+  (below).
 - With `--tolerance`, `summit:` reports the TIN's highest vertex, not the grid's
   (section 4.7).
 - Whole-area PLY and `.blend` in tile mode; Blender checks all blocks in one
@@ -572,8 +611,8 @@ the rulings made on the way.
   window, not per block, so that two blocks see the same cells along the side they
   share (deviation 3).
 - Without `--overwrite`, any existing block file of the lattice is refused before
-  anything is read, whether or not this run would write it; with it, `stale:` names
-  the files that selected blocks without land leave behind (deviation 4).
+  anything is read, whether or not this run would write it; `stale:` names the
+  block files a run leaves behind (deviation 4, and below).
 - The ear clipping that cuts each base also seeds the piece's TIN: one exact
   algorithm for both, and the outline's edges are hull edges that the legalisation
   never flips (deviation 5).
@@ -586,14 +625,79 @@ the rulings made on the way.
 - The 3 x 3 closing treats neighbours outside the grid as in for the erosion, so a
   strip of no-data one cell deep along the window's edge becomes footprint.
 - `--tile` or `--footprint data` without `--tolerance` simplifies at a tolerance of
-  0 and prints `simplify: tolerance 0 units (0 m), ...` (section 5.3).
+  0 and prints `simplify: tolerance 0 units (0 m), ...` (section 5.3). Its grid
+  keeps the 25,000,000-vertex cap of a run without the flag, and only an explicit
+  `--tolerance` lifts it to 2,147,483,647, the refusal naming the flag, `the output
+  grid is N vertices; without --tolerance the limit is 25000000: give --tolerance,
+  or use --grid or crop`, while today's path keeps its own message. At a tolerance
+  of 0 nearly every sample is kept, so the cap on the grid is the cap on what would
+  be built; without it the simplified mesh's refusal would come only after about
+  30 GB of work on the whole City. (Ruled after the whole-branch review; the first
+  build let such a grid reach 2,147,483,647 vertices.)
 - A lattice of more than 10,000 blocks is refused before anything is read, and so is
   a `--blocks` that reaches beyond the lattice. `--blocks` accepts leading zeros
   (`03:05`), since the block names carry them.
-- Every selected block is simplified before any is written, so the 25,000,000
-  refusal and the 4,000,000 warning on the whole-area surface come before anything
-  is written; a run with no block to write is an error (section 5.4).
-- `--footprint data` on a file without no-data gives the window as one piece, with
-  the window's own surface.
-- `stale:` names only the files of selected blocks that now have no land; `not
-  selected:` lists every block outside `--blocks`, with land or without.
+- Every selected block is simplified before any is written, so the refusal of a
+  simplified mesh above 25,000,000 vertices and the 4,000,000 warning on the
+  whole-area surface come before anything is written, the grid's refusal without
+  `--tolerance` before any pixel is read; a run with no block to write is an error
+  (section 5.4).
+- `--footprint data` on a file without no-data gives the window as one piece, whose
+  surface is the window's own when both get the same `--tolerance` and the window
+  is up to 2048 cells a side, where the window path is one chunk too, or when both
+  are tiled (section 5.3); without `--tolerance` the window path writes the full
+  grid and the data path simplifies at 0.
+- `not selected:` lists every block outside `--blocks`, with land or without.
+  (`stale:`, which first named only the files of selected blocks that now have no
+  land, was widened after the whole-branch review: below.)
+- Tiled `--footprint window` blocks keep the rectangle's walls and base (section
+  5.3), where the approved text gave every tiled block the polygon construction: a
+  window block has the four sides that Part A's solid is built on, by the
+  construction the window path has always used, two triangles for the base where
+  ear clipping would cut it over every vertex of the sides, so each block is
+  today's solid of a smaller window.
+- Blender's memory estimate adds up the triangles of every block's solid (sections
+  3 and 5.4), where the approved text worked it out from the whole-area surface:
+  that sum is what the run has counted once the blocks are made, and it errs on the
+  safe side, each block being imported into a scene of its own.
+- The test that pins shared edges compares the two blocks' vertices within 1e-3
+  units in position and exactly in height (section 5.3), where the approved text
+  compared the vertex lists byte for byte: each block's x and y are float32 in its
+  own frame, so undoing the frames brings the window's positions back only to their
+  rounding (within 3e-5 units on r3_c1 at `--scale 0.5`, and to the last bit on the
+  City at `--scale 0.02`), while the heights are never moved.
+- The base plane comes from every data height of the window, a lone sample outside
+  the footprint and the pieces that `--min-piece` drops included (section 5.3),
+  where the approved text took the footprint's heights: the plane then stays the
+  same whatever `--blocks`, `--min-piece` and `--footprint` select, so blocks made
+  in separate batches sit flush.
+
+Decided in the fix wave after the whole-branch review (2026-10-22), besides the cap
+on the grid in Part B's modes (above):
+
+- The simplifier takes a vertex limit, which `dem2mesh` gives as 25,000,000, and
+  stops a mesh while making it (section 4.2): an explicit tiny `--tolerance` on a
+  block of up to 16,384 cells a side, which Part B allows, would otherwise build 16
+  GB or more before the refusal (the r3_c1 tile as one footprint block at `--scale
+  1 --tolerance 0.05` kept 7,034,907 vertices and peaked at 1.65 GB in 86 s, and a
+  block of 16,384 cells has 10.6 times its samples). The slack, the samples round
+  the block's edge, covers the vertices a block shares with the blocks before it,
+  so that no run within the limit is stopped and every such run writes what it
+  wrote; the count after simplification stays as the exact check.
+- `stale:` names every block file of the stem that a run leaves behind, by its
+  pattern, `STEM_r<digits>_c<digits>.stl` of any padding, except those of blocks of
+  the lattice outside `--blocks`, in name order, in the run and the dry run alike
+  (section 5.4): a change of `--tile`, `--grid`, `--scale` or crop changes the
+  blocks' names, and a leftover block of another lattice, uploaded with the rest,
+  is a wrong print. The refusal without `--overwrite` still looks at the lattice's
+  own names.
+- `--min-piece` without `--footprint data` is a usage error, `--min-piece requires
+  --footprint data`, as `--blocks` is without `--tile` (section 5.1): with the
+  window's footprint it would drop nothing, and a flag that silently does nothing
+  misleads. Dropping small window blocks, a sliver cut short at the east or south
+  edge, is a follow-up.
+- With `--footprint data` the dry run's `memory:` line counts the window's data
+  mask too, a byte a sample, which is held beside the window and the grid while the
+  one is resampled into the other (section 5.3): the line says what it counts, and
+  on the City's puzzle the mask takes it from about 2.0 GB to about 2.3 GB, where
+  the run peaked at 2.29 GB.

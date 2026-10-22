@@ -40,8 +40,8 @@ namespace demdl::mesh {
 //
 // What it does not do: look for a polygon that crosses itself. One that does is refused when its area is not positive
 // or when no ear is left to cut, and otherwise is cut into n - 2 triangles that overlap. The ears are kept by rules
-// that hold for simple polygons, so for such a polygon the set can miss an ear that a search would find. The caller
-// passes a simple polygon. A debug build asserts the coordinate bound, as the predicates do.
+// that hold for simple polygons, so for a polygon that crosses itself the set can miss an ear that a search would find.
+// The caller passes a simple polygon. A debug build asserts the coordinate bound, as the predicates do.
 //
 // The cost: telling whether a vertex is an ear takes a look at every vertex that remains, so the ears are found once
 // and kept. They are all tested at the start, the lowest is cut at each step, and only the two neighbours of the vertex
