@@ -146,8 +146,8 @@ the chunks before it, so that no mesh that would end within the limit is stopped
 
     error: the simplified mesh is more than 25000000 vertices; the limit is 25000000: raise --tolerance, or use --grid or crop
 
-A mesh that ends above the limit by less than that slack is refused once it has
-been simplified, with its count:
+A mesh that ends above the limit by less than that slack may be simplified in
+full and is then refused with its count:
 
     error: the simplified mesh is N vertices; the limit is 25000000: raise --tolerance, or use --grid or crop
 
@@ -517,8 +517,8 @@ search and checks, and every existing test. `--footprint window` without
 `--tolerance` and `--tile` is byte-for-byte today's output, its refusal of a grid
 above 25,000,000 vertices included. With `--tolerance`, every run whose simplified
 mesh is within the 25,000,000-vertex limit writes what it wrote before the limit
-was given to the simplifier; one beyond it is stopped while it is simplified
-(section 4.2).
+was given to the simplifier; one beyond it is refused before anything is
+written, while it is simplified or once it has been (section 4.2).
 
 ## 7. Verification
 

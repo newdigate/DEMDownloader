@@ -2,8 +2,8 @@
 // to 7), the surface simplified to within a tolerance when asked (spec 4.1 to 4.7), and the solid cut off where the
 // data ends and split into blocks when asked (Part B 5.1 to 5.5). A section numbered 4.1 to 4.7 is the
 // simplify-and-tiles design's, the only one of the two designs with such sections, and one cited as "Part B 5.x" is
-// that design's too; the other numbers are the dem-to-mesh design's. A deviation or a ruling is the Part B plan's
-// (docs/superpowers/plans/2026-10-22-footprints-and-tiles.md). main is the spec's pipeline as a sequence of named
+// that design's too; the other numbers are the dem-to-mesh design's. A deviation or a ruling is recorded in that
+// design's section 9, cited as "Part B 9". main is the spec's pipeline as a sequence of named
 // steps, each a call into the demmesh library, so that the order can be read here and the work is tested there. The
 // summary goes to stdout; every failure is one line on stderr, "error: <message>", followed by Blender's output when
 // Blender failed, and exit code 1.
@@ -59,7 +59,7 @@ using namespace demdl::mesh;
 // more than kWarnVertices is warned about, with the sizes of its files. Both count the mesh that is written: the output
 // grid, or with --tolerance, and in Part B's modes, the simplified mesh, whose size is known only once the grid has
 // been simplified; the simplifier is given the limit as well, so that it stops a mesh that has passed it while making
-// it (the plan's ruling on the cap). Without --tolerance the output grid is held to the limit in Part B's modes too,
+// it (Part B 9, the cap). Without --tolerance the output grid is held to the limit in Part B's modes too,
 // since simplified at 0 it keeps nearly every sample.
 constexpr std::uint64_t kMostVertices = 25'000'000;
 constexpr std::uint64_t kWarnVertices = 4'000'000;
@@ -67,7 +67,7 @@ constexpr std::uint64_t kWarnVertices = 4'000'000;
 // With --tolerance the output grid is simplified, not written, so it may be as large as the window (spec 4.2): it is
 // refused only above the most an int holds, which still leaves both its sides within an int. At that limit its heights
 // are 8.6 GB of float32. Only the flag lifts the grid's limit to this: Part B's modes simplify without it too, at 0,
-// and keep kMostVertices on the grid (the plan's ruling on the cap).
+// and keep kMostVertices on the grid (Part B 9, the cap).
 constexpr std::uint64_t kMostVerticesToSimplify = std::numeric_limits<int>::max();
 
 // Part B 5.3: a lattice of more blocks than this is refused before anything is read, since a --tile of a few cells
@@ -209,7 +209,7 @@ struct OutputGrid {
 // takes any int and an extreme aspect can ask for more rows than an int holds; refused, before anything is read, above
 // kMostVertices, or when --tolerance was given (toleranceGiven) above kMostVerticesToSimplify, either of which leaves
 // both sides within an int. Part B's modes (inBlocks) simplify at 0 without the flag, which keeps nearly every sample,
-// so their grid has kMostVertices too, and the refusal names the flag that lifts it (the plan's ruling on the cap); the
+// so their grid has kMostVertices too, and the refusal names the flag that lifts it (Part B 9, the cap); the
 // message of today's path stays as it was (spec 6).
 OutputGrid outputGridFor(const std::optional<demdl::cli::GridSize>& grid, const PixelWindow& window,
                          const WindowExtent& extent, bool toleranceGiven, bool inBlocks) {
@@ -351,7 +351,7 @@ void warnOfLargeFiles(const MeshOptions& options, std::string_view mesh, const F
 // held beside a mesh.
 //
 // With footprint, for --footprint data (Part B 5.2), the window's data is taken as the mask before the fill gives every
-// no-data sample a height, so that the fill copies data heights and the range is the data's (the plan's ruling on the
+// no-data sample a height, so that the fill copies data heights and the range is the data's (Part B 9, the
 // base plane); the mask is carried to the grid by the nearest sample, which at full resolution is the mask as it
 // stands; and the grid's cells with data at all four corners are the footprint (footprintCells). The window goes
 // before the cells are made and the mask once they are, each a byte a cell, 254 MB on the City's whole file.
@@ -392,7 +392,7 @@ struct Surface {
 // kMostVertices, with nothing written yet, and warned about above kWarnVertices, as a grid is before anything is read.
 // The simplifier, given kMostVertices, stops a mesh while making it once it has passed the limit, by up to the samples
 // round a block's edge, so this exact count is what refuses one that ends just above it. In Part B's modes the mesh is
-// the whole-area surface, with or without --tolerance (the plan's rulings on the tolerance and the cap).
+// the whole-area surface, with or without --tolerance (Part B 9, the tolerance and the cap).
 void limitSimplifiedMesh(const MeshOptions& options, const Facts& f) {
   if (f.surfaceVertices > kMostVertices) {
     throw std::runtime_error("the simplified mesh is " + std::to_string(f.surfaceVertices) +
@@ -639,7 +639,7 @@ std::string staleLine(const Blocks& blocks) {
 
 // All of the lines on the blocks, in the summary's order: with --tile the lattice, a line for each block written, then
 // the blocks skipped for want of land and those outside --blocks; without it, the footprint; then, when there are
-// any, the pieces dropped, the corner contacts joined inside the blocks written (the plan's ruling on contacts), and
+// any, the pieces dropped, the corner contacts joined inside the blocks written (Part B 9, corner contacts), and
 // the stale files.
 std::vector<std::string> blockLines(const MeshOptions& options, const Facts& f, const BlockPlan& plan,
                                     const Blocks& blocks) {
@@ -1151,8 +1151,8 @@ int run(int argc, char** argv) {
   }
   const BlockSelection selection = blockSelection(options);
   // Part B's modes run on the block simplifier, so without --tolerance they simplify at 0, which keeps every sample off
-  // its neighbours' plane, and their memory: line and warning are the tolerance's (the plan's ruling); but their grid
-  // keeps the cap it has without the flag (the plan's ruling on the cap), so whether it was given is noted first.
+  // its neighbours' plane, and their memory: line and warning are the tolerance's (Part B 9, the tolerance); but their
+  // grid keeps the cap it has without the flag (Part B 9, the cap), so whether it was given is noted first.
   const bool toleranceGiven = options.tolerance.has_value();
   if (meshesInBlocks(options) && !options.tolerance) options.tolerance = 0.0;
   checkInput(options.input);
