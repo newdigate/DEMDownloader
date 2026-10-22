@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <limits>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -50,13 +51,12 @@ bool inClosedTriangle(GridPoint a, GridPoint b, GridPoint c, GridPoint p) noexce
   return orient2d(a, b, p) >= 0 && orient2d(b, c, p) >= 0 && orient2d(c, a, p) >= 0;
 }
 
-// The vertices still in the polygon, as a circular doubly linked list in index order: a vertex's predecessor and
+// The vertices still in the polygon, as a circular doubly linked list in loop order: a vertex's predecessor and
 // successor are the nearest remaining vertices before and after it in the loop, with the last wrapping round to the
 // first. Cutting a vertex off takes it out in a constant number of steps.
 class Remaining {
  public:
-  explicit Remaining(std::span<const GridPoint> loop)
-      : loop_(loop), before_(loop.size()), after_(loop.size()), first_(0) {
+  explicit Remaining(std::span<const GridPoint> loop) : loop_(loop), before_(loop.size()), after_(loop.size()) {
     const std::size_t n = loop.size();
     for (std::size_t v = 0; v < n; ++v) {
       before_[v] = static_cast<std::uint32_t>(v == 0 ? n - 1 : v - 1);
@@ -64,8 +64,6 @@ class Remaining {
     }
   }
 
-  // The remaining vertex of the lowest index.
-  [[nodiscard]] std::uint32_t first() const noexcept { return first_; }
   [[nodiscard]] std::uint32_t after(std::uint32_t v) const noexcept { return after_[v]; }
   [[nodiscard]] std::uint32_t before(std::uint32_t v) const noexcept { return before_[v]; }
 
@@ -90,13 +88,11 @@ class Remaining {
     const std::uint32_t w = after_[v];
     after_[u] = w;
     before_[w] = u;
-    if (v == first_) first_ = w;  // w is the next remaining index up
   }
 
  private:
   std::span<const GridPoint> loop_;
   std::vector<std::uint32_t> before_, after_;
-  std::uint32_t first_;
 };
 
 }  // namespace
@@ -118,20 +114,42 @@ std::vector<std::array<std::uint32_t, 3>> triangulatePolygon(std::span<const Gri
     throw std::invalid_argument("the polygon has no area: twice its signed area is 0");
   }
 
+  // The ears are found once and kept, in a set that puts the lowest index first, and a cut tests again only the two
+  // vertices whose neighbours it changes. For a simple polygon that is all it takes. An ear stays an ear while its two
+  // neighbours stay, as its triangle only loses vertices. And cutting an ear v makes an ear of no vertex but its own
+  // neighbours: any other vertex x keeps its triangle, and x could be freed only if v were the one vertex in it. Then
+  // nothing of the boundary is inside that triangle but the two edges at v, which can leave it only through the side
+  // opposite x. The corner at x is inside the polygon, so the part of the triangle between those edges and that side is
+  // outside it, and the polygon holds a half turn or more at v: v would be reflex or in line, and an ear is neither.
+  // So the set is always the ears there are, and its first member is what a search from the lowest index would find.
+  // (A polygon that crosses itself can break that, and what is cut from it is not specified in any case.)
   Remaining remaining(loop);
+  std::set<std::uint32_t> ears;
+  for (std::uint32_t v = 0; v < loop.size(); ++v) {
+    if (remaining.isEar(v)) ears.insert(ears.end(), v);
+  }
+
   std::vector<std::array<std::uint32_t, 3>> triangles;
   triangles.reserve(loop.size() - 2);
   for (std::size_t left = loop.size(); left >= 3; --left) {
-    std::uint32_t v = remaining.first();
-    while (!remaining.isEar(v)) {
-      v = remaining.after(v);
-      if (v == remaining.first()) {
-        throw std::invalid_argument("no ear can be found among the " + std::to_string(left) +
-                                    " vertices that remain: the polygon crosses itself");
+    if (ears.empty()) {
+      throw std::invalid_argument("no ear can be found among the " + std::to_string(left) +
+                                  " vertices that remain: the polygon crosses itself");
+    }
+    const std::uint32_t v = *ears.begin();
+    ears.erase(ears.begin());
+    const std::uint32_t u = remaining.before(v);
+    const std::uint32_t w = remaining.after(v);
+    triangles.push_back({u, v, w});
+    remaining.cut(v);
+    if (left == 3) break;  // two vertices are left, and nothing more to test
+    for (const std::uint32_t x : {u, w}) {
+      if (remaining.isEar(x)) {
+        ears.insert(x);
+      } else {
+        ears.erase(x);
       }
     }
-    triangles.push_back({remaining.before(v), v, remaining.after(v)});
-    remaining.cut(v);
   }
   return triangles;
 }

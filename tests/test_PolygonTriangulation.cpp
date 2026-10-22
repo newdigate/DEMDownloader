@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <numeric>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -166,6 +167,10 @@ using Cells = std::set<Point>;
 // The four steps from a cell to the cells that share a side with it.
 const std::array<Point, 4> kSteps{{{1, 0}, {0, 1}, {-1, 0}, {0, -1}}};
 
+// The seed of the 500 random polygons, so that the test of the triangles and the test against the reference see the
+// same ones.
+constexpr unsigned kRandomPolygonSeed = 7;
+
 // The cells and every cell they enclose. An empty cell is outside when a walk through empty cells, one side at a time,
 // gets to it from beyond the cells' bounding box; the rest are filled in. The set that results is 4-connected when the
 // cells are, has no hole, and touches itself at no corner: two of its cells that meet diagonally with the two cells
@@ -261,6 +266,68 @@ Cells spiral(int segments) {
     step = {-step.second, step.first};  // a left turn: east to north, north to west, and so on
   }
   return cells;
+}
+
+// A corridor one cell wide that goes to and fro: hairpins + 1 arms of armLength cells on every other row, from x = 0
+// to armLength - 1, joined by a single cell in the row between two arms, at the east end after the first arm, at the
+// west end after the second, and so on. Each arm is a straight run of the outline with a hairpin at each end.
+Cells serpentine(int hairpins, int armLength) {
+  Cells cells;
+  for (int arm = 0; arm <= hairpins; ++arm) {
+    for (int x = 0; x < armLength; ++x) cells.insert({x, 2 * arm});
+  }
+  for (int k = 0; k < hairpins; ++k) cells.insert({k % 2 == 0 ? armLength - 1 : 0, 2 * k + 1});
+  return cells;
+}
+
+// One polygon of the random tests: the outer outline of a random 4-connected set of cells (enclosed cells filled in),
+// with a vertex at every lattice point on it, shifted by (-6, -6) so that coordinates are negative too, and started at
+// a random vertex.
+struct RandomPolygon {
+  Loop loop;
+  std::size_t cells = 0;  // the cells it outlines, enclosed ones included
+  bool filledIn = false;  // whether any cell had to be filled in
+};
+
+RandomPolygon randomPolygon(std::mt19937& rng) {
+  const Cells grown = randomCells(rng);
+  const Cells cells = withEnclosedFilled(grown);
+  Loop loop = outline(cells);
+  // The tracer is held to the cells: a loop of twice their count in area is their outline, run counter-clockwise.
+  REQUIRE(doubledArea(loop) == 2 * static_cast<std::int64_t>(cells.size()));
+  for (GridPoint& p : loop) p = {p.x - 6, p.y - 6};
+  loop = startingAt(loop, rng() % loop.size());
+  return {loop, cells.size(), cells.size() > grown.size()};
+}
+
+// The rule of the header said as plainly as it can be: at every step go through the vertices that are left from the
+// lowest index and cut the first that is an ear, one that turns counter-clockwise strictly and has no other vertex that
+// is left in its triangle or on an edge. It is the search the unit made before it kept its ears in a set: it begins
+// again from the lowest index every step, which takes far longer on a winding outline and leaves little to get wrong.
+// It shares only orient2d with the unit. It returns nothing when it is stuck, which a simple polygon never makes it.
+Triangles referenceTriangulation(const Loop& loop) {
+  std::vector<std::uint32_t> left(loop.size());
+  std::iota(left.begin(), left.end(), std::uint32_t{0});
+  Triangles triangles;
+  while (left.size() >= 3) {
+    bool cutOne = false;
+    for (std::size_t i = 0; i < left.size() && !cutOne; ++i) {
+      const std::uint32_t before = left[(i + left.size() - 1) % left.size()];
+      const std::uint32_t v = left[i];
+      const std::uint32_t after = left[(i + 1) % left.size()];
+      const GridPoint a = loop[before], b = loop[v], c = loop[after];
+      if (orient2d(a, b, c) <= 0) continue;
+      const bool blocked = std::any_of(left.begin(), left.end(), [&](std::uint32_t k) {
+        return k != before && k != v && k != after && onOrInside(a, b, c, loop[k]);
+      });
+      if (blocked) continue;
+      triangles.push_back({before, v, after});
+      left.erase(left.begin() + static_cast<std::ptrdiff_t>(i));
+      cutOne = true;
+    }
+    if (!cutOne) return {};
+  }
+  return triangles;
 }
 
 }  // namespace
@@ -445,21 +512,16 @@ TEST_CASE("polygons across the whole bound are triangulated exactly", "[polygon]
 
 TEST_CASE("500 random rectilinear polygons are triangulated exactly", "[polygon]") {
   // Each polygon is the outer outline of a random 4-connected set of cells, with a vertex at every lattice point on
-  // it (concave outlines with straight runs of every length, which is what the unit is for), shifted by (-6, -6) so
-  // that coordinates are negative too, and started at a random vertex.
-  std::mt19937 rng(7);
+  // it (concave outlines with straight runs of every length, which is what the unit is for), shifted so that
+  // coordinates are negative too and started at a random vertex: see randomPolygon.
+  std::mt19937 rng(kRandomPolygonSeed);
   int concave = 0, filledIn = 0, mostVertices = 0, fewestVertices = 1000;
   for (int i = 0; i < 500; ++i) {
-    const Cells grown = randomCells(rng);
-    const Cells cells = withEnclosedFilled(grown);
-    if (cells.size() > grown.size()) ++filledIn;
-    Loop loop = outline(cells);
-    // The tracer is held to the cells: a loop of twice their count in area is their outline, run counter-clockwise.
-    REQUIRE(doubledArea(loop) == 2 * static_cast<std::int64_t>(cells.size()));
-    for (GridPoint& p : loop) p = {p.x - 6, p.y - 6};
-    loop = startingAt(loop, rng() % loop.size());
+    const RandomPolygon polygon = randomPolygon(rng);
+    const Loop& loop = polygon.loop;
+    if (polygon.filledIn) ++filledIn;
 
-    INFO("polygon " << i << " of " << cells.size() << " cells");
+    INFO("polygon " << i << " of " << polygon.cells << " cells");
     const Triangles triangles = triangulatePolygon(loop);
     checkTriangulation(loop, triangles);
 
@@ -483,8 +545,8 @@ TEST_CASE("500 random rectilinear polygons are triangulated exactly", "[polygon]
 TEST_CASE("outlines of a couple of thousand vertices are triangulated exactly", "[polygon]") {
   // A staircase coast of 500 steps: 1000 cells, 4 x 1000 - 2 x 999 = 2002 lattice points on the outline and none inside
   // it, so every triangle is half a unit (twice its area 1, as for the small staircase) and there are 2000 of them.
-  // The ears that are cut grow into triangles that span hundreds of steps, so the vertices along the far side have to
-  // be ruled out again and again.
+  // The ears that are cut grow into triangles that span hundreds of steps, so many vertices along the far side have to
+  // be ruled out for each.
   Cells steps;
   for (int i = 0; i < 500; ++i) {
     steps.insert({i, i});
@@ -501,13 +563,56 @@ TEST_CASE("outlines of a couple of thousand vertices are triangulated exactly", 
   }
   CHECK(notHalfAUnit == 0);
 
-  // A spiral corridor of 40 arms, 841 cells: 4 x 841 - 2 x 840 = 1684 lattice points, a reflex and a convex corner at
-  // every turn, and a search from the lowest index that passes hundreds of vertices that cannot be ears at every step.
+  // A spiral corridor of 40 arms, 841 cells: 4 x 841 - 2 x 840 = 1684 lattice points, with a reflex and a convex corner
+  // at every turn.
   const Loop winding = outline(spiral(40));
   REQUIRE(winding.size() == 1684);
   const Triangles windingTriangles = triangulatePolygon(winding);
   CHECK(windingTriangles.size() == 1682);
   checkTriangulation(winding, windingTriangles);
+}
+
+TEST_CASE("the triangles are those of a plain search for the lowest-index ear at every step", "[polygon]") {
+  // The unit keeps its ears in a set and tests again only the neighbours of a vertex it cuts; referenceTriangulation
+  // searches from the lowest index at every step. They must agree triple for triple. The random polygons of the test
+  // above are the ordinary cases. The snake and the spiral are the shapes on which the earlier search, which began
+  // again from the lowest index at every step, spent most of its time: it met every convex corner that is blocked and
+  // lies ahead of its first ear again at each step, and how many lie ahead of it depends on where the loop starts. So
+  // each is tried from its beginning and from half way round.
+  SECTION("the 500 random polygons") {
+    std::mt19937 rng(kRandomPolygonSeed);
+    for (int i = 0; i < 500; ++i) {
+      const RandomPolygon polygon = randomPolygon(rng);
+      INFO("polygon " << i << ": " << text(polygon.loop));
+      CHECK(triangulatePolygon(polygon.loop) == referenceTriangulation(polygon.loop));
+    }
+  }
+
+  SECTION("a snake of 40 hairpins") {
+    // 41 arms of 4 cells and 40 joining cells: 41 x 4 + 40 = 204 cells in one run, so 2 x 204 + 2 = 410 lattice points.
+    const Loop snake = outline(serpentine(40, 4));
+    REQUIRE(snake.size() == 410);
+    for (const std::size_t start : {std::size_t{0}, snake.size() / 2}) {
+      INFO("started at vertex " << start);
+      const Loop rotated = startingAt(snake, start);
+      const Triangles triangles = triangulatePolygon(rotated);
+      CHECK(triangles == referenceTriangulation(rotated));
+      checkTriangulation(rotated, triangles);
+    }
+  }
+
+  SECTION("a spiral started half way round") {
+    // 24 arms: 1 + 2 x (2 + 4 + ... + 24) = 313 cells in one run, so 2 x 313 + 2 = 628 lattice points.
+    const Loop spiralLoop = outline(spiral(24));
+    REQUIRE(spiralLoop.size() == 628);
+    for (const std::size_t start : {std::size_t{0}, spiralLoop.size() / 2}) {
+      INFO("started at vertex " << start);
+      const Loop rotated = startingAt(spiralLoop, start);
+      const Triangles triangles = triangulatePolygon(rotated);
+      CHECK(triangles == referenceTriangulation(rotated));
+      checkTriangulation(rotated, triangles);
+    }
+  }
 }
 
 TEST_CASE("the same polygon gives the same triangles every time", "[polygon]") {

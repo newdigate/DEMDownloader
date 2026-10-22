@@ -23,8 +23,9 @@ namespace demdl::mesh {
 // strictly (orient2d of its predecessor, itself and its successor is positive) and no other vertex still in the polygon
 // lies in the closed triangle of the three, inside it or on any of its edges. The triple written for it is (its
 // predecessor, itself, its successor) in the polygon as it then stands, and the triples come in the order the vertices
-// were cut off. Each step looks again from the lowest remaining index, not from where the last cut was made: a search
-// that resumed at the cut vertex's predecessor would give other triangles, valid too but not these.
+// were cut off. What is cut is the lowest-index ear of the polygon as it then stands, not the first ear found from
+// where the last cut was made: a search that resumed at the cut vertex's predecessor would give other triangles, valid
+// too but not these.
 //
 // What follows from the rule:
 // - No triangle has a vertex of the polygon inside it or on an edge. When it was cut, the polygon that was left had
@@ -38,18 +39,17 @@ namespace demdl::mesh {
 //   platform; nothing is rounded.
 //
 // What it does not do: look for a polygon that crosses itself. One that does is refused when its area is not positive
-// or when no ear can be found, and otherwise is cut into n - 2 triangles that overlap; the caller passes a simple
-// polygon. A debug build asserts the coordinate bound, as the predicates do.
+// or when no ear is left to cut, and otherwise is cut into n - 2 triangles that overlap. The ears are kept by rules
+// that hold for simple polygons, so for such a polygon the set can miss an ear that a search would find. The caller
+// passes a simple polygon. A debug build asserts the coordinate bound, as the predicates do.
 //
-// The cost: an ear is known only after a look at every vertex that remains, so a loop of n vertices takes about
-// n^2 / 2 looks (orient2d three at a time at most), more where a long ear is blocked again and again (a staircase coast
-// of n vertices took about n^2), and each step also passes the vertices before its ear in index order that cannot be
-// ears, one turn test apiece. Outlines of 2,000 to 4,000 vertices (a staircase coast, a square with a vertex at every
-// lattice point, a spiral corridor) took 12 to 76 ms with optimisation and 0.15 to 0.9 s in a debug build, and 25,000
-// vertices (a comb of 250 teeth) 1.7 s with optimisation. At worst a step passes many convex vertices that are blocked,
-// each costing a pass over the polygon, which is O(n^2) a step and O(n^3) in all; none of those shapes came near it.
-// Memory is 8 bytes a vertex for the list of the vertices left, 4 for the check for a repeated vertex, and 12 a
-// triangle for the result.
+// The cost: telling whether a vertex is an ear takes a look at every vertex that remains, so the ears are found once
+// and kept. They are all tested at the start, the lowest is cut at each step, and only the two neighbours of the vertex
+// cut are tested again: an ear stays one until a neighbour of it is cut, and cutting an ear makes an ear of no vertex
+// but its two neighbours (for a simple polygon; the reasoning is in the source). So a loop of n vertices takes at most
+// 3 n ear tests, each a look at no more than n vertices: under 2 n^2 looks in all, and about n^2 on the outlines
+// tried, wherever the loop starts. Memory is 8 bytes a vertex for the list of the vertices left, 4 for the check for a
+// repeated vertex, a node of the set (a few dozen bytes) for each ear, and 12 a triangle for the result.
 [[nodiscard]] std::vector<std::array<std::uint32_t, 3>> triangulatePolygon(std::span<const GridPoint> loop);
 
 }  // namespace demdl::mesh
