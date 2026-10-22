@@ -14,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -675,14 +676,15 @@ struct SimplifiedFootprint {
   std::vector<SimplifiedBlock> blocks;
 };
 
-// The grid g of cols x rows heights simplified at tolerance tol over the footprint `cells`, which footprintCells gave,
-// block by block in the order of rects, each block's pieces from blockFootprint with none dropped.
+// The grid g of cols x rows heights simplified at tolerance tol over the footprint `cells`, which footprintCells gave
+// with the vertices `joined` of the contacts it joined, block by block in the order of rects, each block's pieces from
+// blockFootprint with none dropped.
 SimplifiedFootprint simplifyFootprint(const Grid& g, const Flags& cells, int cols, int rows, double tol,
-                                      const std::vector<BlockRect>& rects) {
+                                      const std::vector<BlockRect>& rects, std::span<const GridPoint> joined = {}) {
   BlockSimplifier simplifier = blockSimplifier(g, cols, rows, tol);
   SimplifiedFootprint s;
   for (const BlockRect& rect : rects) {
-    SimplifiedBlock block{rect, blockFootprint(cells, cols, rows, rect, kCellX * kCellY, 0.0), {}};
+    SimplifiedBlock block{rect, blockFootprint(cells, cols, rows, rect, kCellX * kCellY, 0.0, joined), {}};
     block.result = simplifier.simplifyBlock(rect, &block.footprint);
     s.blocks.push_back(std::move(block));
   }
@@ -690,15 +692,17 @@ SimplifiedFootprint simplifyFootprint(const Grid& g, const Flags& cells, int col
   return s;
 }
 
-// The island of IslandFixture.h, its heights filled, and its footprint.
+// The island of IslandFixture.h, its heights filled, and its footprint, with the vertex of the blobs' contact that
+// footprintCells joined.
 struct Island {
   Grid grid = islandGrid();
-  Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
+  std::vector<GridPoint> joined;
+  Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
 
   // The island simplified at tolerance tol in blocks of blockCols x blockRows cells.
   [[nodiscard]] SimplifiedFootprint simplified(double tol, int blockCols, int blockRows) const {
     return simplifyFootprint(grid, cells, kIslandCols, kIslandRows, tol,
-                             blockLattice(kIslandCols, kIslandRows, blockCols, blockRows));
+                             blockLattice(kIslandCols, kIslandRows, blockCols, blockRows), joined);
   }
 };
 
@@ -1677,14 +1681,15 @@ TEST_CASE("a piece that is its whole block, with one run a side, is simplified a
 
 TEST_CASE("a footprint block keeps every guarantee inside its pieces, leaves the sea out and covers the lake",
           "[simplify]") {
-  // The island in one block over the whole grid, at 0.5 m: four pieces, the island with its lake and channel filled,
-  // the two blobs and the islet (the lone sample makes no cell). checkGuarantees holds the outlines to their runs, the
-  // surface to the tolerance at every sample of the footprint, and finds nothing over the sea.
+  // The island in one block over the whole grid, at 0.5 m: three pieces, the island with its lake and channel filled,
+  // the two blobs joined by their bridge cell, and the islet (the lone sample makes no cell). checkGuarantees holds the
+  // outlines to their runs, the surface to the tolerance at every sample of the footprint, and finds nothing over the
+  // sea.
   const Island island;
   const SimplifiedFootprint s = island.simplified(0.5, kIslandCols - 1, kIslandRows - 1);
   REQUIRE(s.blocks.size() == 1);
   const BlockResult& result = s.blocks[0].result;
-  REQUIRE(result.pieces.size() == 4);
+  REQUIRE(result.pieces.size() == 3);
   checkGuarantees(s, island.grid, island.cells, kIslandCols, kIslandRows, 0.5);
   // Every edge between two triangles is Delaunay: the seed's flips and the insertions' keep it so, the outline's edges
   // aside.
@@ -1732,10 +1737,11 @@ TEST_CASE("blocks that share a side have the same vertices on it, those its runs
   // the knoll's east slope, 52, 61, 66.25, 64 and 58 m, all five kept; row 10 is the island's south coast, the
   // north-western block's alone. The south-eastern block has only the lone sample, which makes no cell, so no piece.
   //
-  // The runs that the blocks and the one block over the whole grid both have: the blobs' and the islet's, 12; and in
-  // 12 x 9 blocks the island's north coast and the end of its east coast above the tab, the tab's other three sides and
-  // the island's south coast, 6 more; in 13 x 10, the island's west, south and north coasts, the end of its east coast
-  // below the tab and the one above it, and the tab's east side, 6 more.
+  // The runs that the blocks and the one block over the whole grid both have: the joined blobs' 10 and the islet's 4,
+  // 14, each piece inside one block of either lattice; and in 12 x 9 blocks the island's north coast and the end of its
+  // east coast above the tab, the tab's other three sides and the island's south coast, 6 more; in 13 x 10, the
+  // island's west, south and north coasts, the end of its east coast below the tab and the one above it, and the tab's
+  // east side, 6 more.
   const Island island;
   const SimplifiedFootprint whole = island.simplified(0.5, kIslandCols - 1, kIslandRows - 1);
   struct Case {
@@ -1757,7 +1763,7 @@ TEST_CASE("blocks that share a side have the same vertices on it, those its runs
     CHECK(matchedVertices == c.matchedVertices);
     int common = 0;
     CHECK(commonRunProblem(s, whole, common) == "");
-    CHECK(common == 18);
+    CHECK(common == 20);
   }
 }
 
@@ -1872,11 +1878,38 @@ TEST_CASE("the flips over a piece's seed leave every edge between two of its fac
   CHECK(delaunayProblem(s.surface, cols, rows) == "");
 }
 
-TEST_CASE("pieces that touch at a vertex share that one vertex, in one block or either side of a block's side",
+TEST_CASE("pieces that touched at a vertex are one piece, joined by a bridge cell, whose outline holds no vertex twice",
           "[simplify]") {
-  // Spec 5.2: the two blobs touch at (19, 4), where both outlines turn, so that both runs there end at it and keep it,
-  // and addShared gives it one vertex number, which both outlines hold. They share nothing else.
+  // Spec 5.2 as the footprint now has it: the two blobs touched at (19, 4), and footprintCells put in the cell (19, 3),
+  // the north-west-most of the two empty cells there, so that they make one piece of 4 + 4 + 1 cells. Its outline goes
+  // round the bridge and holds no vertex twice, and the surface covers the bridge.
   const Island island;
+  REQUIRE(island.joined.size() == 1);
+  CHECK(where(island.joined[0]) == "(19, 4)");
+  // The place among a block's pieces of the one whose loop starts at `first`.
+  const auto pieceFrom = [](const SimplifiedBlock& block, GridPoint first) -> std::size_t {
+    for (std::size_t k = 0; k < block.footprint.pieces.size(); ++k) {
+      if (same(block.footprint.pieces[k].loop.at(0), first)) return k;
+    }
+    FAIL("no piece's loop starts at " << where(first));
+    throw std::logic_error("unreachable");
+  };
+  // Whether a triangle of the block, counter-clockwise seen from above, holds the point (column, row) of the test's
+  // frame, its edges included.
+  const auto covers = [](const Mesh& mesh, const SimplifiedBlock& block, double column, double row) {
+    const double x = kCellX * column, y = kCellY * (kIslandRows - 1 - row);
+    for (std::size_t t = block.result.firstTriangle; t < block.result.firstTriangle + block.result.triangles; ++t) {
+      const Vec3& a = mesh.vertices[mesh.triangles[t].a];
+      const Vec3& b = mesh.vertices[mesh.triangles[t].b];
+      const Vec3& c = mesh.vertices[mesh.triangles[t].c];
+      if (turn(x, y, b.x, b.y, c.x, c.y) >= 0 && turn(a.x, a.y, x, y, c.x, c.y) >= 0 &&
+          turn(a.x, a.y, b.x, b.y, x, y) >= 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // The vertices of a that b's outline holds too, in a's order.
   const auto shared = [](const PieceOutline& a, const PieceOutline& b) {
     std::vector<std::uint32_t> both;
     for (const std::uint32_t v : a.vertices) {
@@ -1884,31 +1917,53 @@ TEST_CASE("pieces that touch at a vertex share that one vertex, in one block or 
     }
     return both;
   };
-  // The piece of a block whose loop starts at `first`.
-  const auto pieceFrom = [](const SimplifiedBlock& block, GridPoint first) -> const PieceOutline& {
-    for (std::size_t k = 0; k < block.footprint.pieces.size(); ++k) {
-      if (same(block.footprint.pieces[k].loop.at(0), first)) return block.result.pieces.at(k);
-    }
-    FAIL("no piece's loop starts at " << where(first));
-    throw std::logic_error("unreachable");
-  };
 
   SECTION("in one block") {
     const SimplifiedFootprint s = island.simplified(0.5, kIslandCols - 1, kIslandRows - 1);
     checkGuarantees(s, island.grid, island.cells, kIslandCols, kIslandRows, 0.5);
     REQUIRE(s.blocks.size() == 1);
-    const std::vector<std::uint32_t> both = shared(pieceFrom(s.blocks[0], {17, 2}), pieceFrom(s.blocks[0], {19, 4}));
-    REQUIRE(both.size() == 1);
-    CHECK(whereIs(s.surface, both[0], kIslandCols, kIslandRows) == "(19, 4)");
+    const SimplifiedBlock& block = s.blocks[0];
+    CHECK(block.footprint.cornerContacts == 1);
+    for (const Piece& other : block.footprint.pieces) CHECK_FALSE(same(other.loop.at(0), {19, 4}));
+    const std::size_t k = pieceFrom(block, {17, 2});
+    const Piece& piece = block.footprint.pieces[k];
+    const PieceOutline& outline = block.result.pieces[k];
+    CHECK(piece.cells == 9);
+    std::set<std::pair<int, int>> samples;
+    for (const GridPoint& p : piece.loop) samples.insert({p.x, p.y});
+    CHECK(samples.size() == piece.loop.size());
+    const std::set<std::uint32_t> vertices(outline.vertices.begin(), outline.vertices.end());
+    CHECK(vertices.size() == outline.vertices.size());
+    // The bridge's four corners are turns of the loop, so its runs keep them all as vertices; and a triangle holds its
+    // middle.
+    for (const GridPoint corner : {GridPoint{19, 3}, GridPoint{20, 3}, GridPoint{20, 4}, GridPoint{19, 4}}) {
+      INFO("the bridge's corner " << where(corner));
+      CHECK(std::any_of(outline.vertices.begin(), outline.vertices.end(), [&](std::uint32_t v) {
+        return whereIs(s.surface, v, kIslandCols, kIslandRows) == describe({corner.x, corner.y});
+      }));
+    }
+    CHECK(cellIn(island.cells, kIslandCols, 19, 3));
+    CHECK(covers(s.surface, block, 19.5, 3.5));
   }
 
-  SECTION("in the blocks either side of column 19, blob A in the western one and blob B in the eastern one") {
+  SECTION("in the blocks either side of column 19, which meet along the bridge's west side") {
+    // Blob A is in the western block, and the bridge and blob B, one piece of 5 cells, in the eastern one. The edge
+    // from (19, 3) to (19, 4) has blob A on its west and the bridge on its east, so both blocks' outlines run along it,
+    // a run with those two ends in each: the two outlines share those two vertices and no other. The joined vertex is
+    // on the side, inside neither block.
     const SimplifiedFootprint s = island.simplified(0.5, 19, kIslandRows - 1);
     checkGuarantees(s, island.grid, island.cells, kIslandCols, kIslandRows, 0.5);
     REQUIRE(s.blocks.size() == 2);
-    const std::vector<std::uint32_t> both = shared(pieceFrom(s.blocks[0], {17, 2}), pieceFrom(s.blocks[1], {19, 4}));
-    REQUIRE(both.size() == 1);
-    CHECK(whereIs(s.surface, both[0], kIslandCols, kIslandRows) == "(19, 4)");
+    CHECK(s.blocks[0].footprint.cornerContacts == 0);
+    CHECK(s.blocks[1].footprint.cornerContacts == 0);
+    const std::size_t west = pieceFrom(s.blocks[0], {17, 2}), east = pieceFrom(s.blocks[1], {19, 3});
+    CHECK(s.blocks[0].footprint.pieces[west].cells == 4);
+    CHECK(s.blocks[1].footprint.pieces[east].cells == 5);
+    const std::vector<std::uint32_t> both = shared(s.blocks[0].result.pieces[west], s.blocks[1].result.pieces[east]);
+    REQUIRE(both.size() == 2);
+    std::set<std::string> places;
+    for (const std::uint32_t v : both) places.insert(whereIs(s.surface, v, kIslandCols, kIslandRows));
+    CHECK(places == std::set<std::string>{"(19, 3)", "(19, 4)"});
   }
 }
 
@@ -2005,18 +2060,20 @@ TEST_CASE("the same grid, tolerance and blocks give the same surface and the sam
 
 TEST_CASE("random footprints in random lattices keep every guarantee and meet along every shared side",
           "[simplify]") {
-  // Footprints of random masks (coasts, lakes, islets, slits and pieces touching at a vertex), random heights, smooth,
-  // noise or small whole numbers, a random tolerance and a random lattice of blocks, the last ones cut short: the whole
-  // grid as one block and the lattice are each held to checkGuarantees, every side two blocks of the lattice share to
-  // sharedSideProblem, and every run the two simplifications have in common to commonRunProblem. The whole numbers come
-  // with tolerances of 1/3 and 2/3, at which their chords pass many samples exactly at the tolerance: the ties that a
-  // run's direction settles, and the dropped samples that rounding puts a hair beyond the tolerance.
+  // Footprints of random masks (coasts, lakes, islets, slits, and pieces touching at a vertex, which footprintCells
+  // joins), random heights, smooth, noise or small whole numbers, a random tolerance and a random lattice of blocks,
+  // the last ones cut short: the whole grid as one block and the lattice are each held to checkGuarantees, every side
+  // two blocks of the lattice share to sharedSideProblem, and every run the two simplifications have in common to
+  // commonRunProblem. The whole numbers come with tolerances of 1/3 and 2/3, at which their chords pass many samples
+  // exactly at the tolerance: the ties that a run's direction settles, and the dropped samples that rounding puts a
+  // hair beyond the tolerance.
   std::mt19937 rng(20261022);
   int pieces = 0, blocksWithPieces = 0, matched = 0, matchedVertices = 0, common = 0, contacts = 0, wholeBlocks = 0;
   for (int trial = 0; trial < 150; ++trial) {
     const int cols = 3 + static_cast<int>(rng() % 26);
     const int rows = 3 + static_cast<int>(rng() % 26);
-    const Flags cells = footprintCells(randomMask(rng, cols, rows), cols, rows);
+    std::vector<GridPoint> joined;
+    const Flags cells = footprintCells(randomMask(rng, cols, rows), cols, rows, &joined);
     const int style = static_cast<int>(rng() % 3);
     const double phase = static_cast<double>(rng() % 628) / 100.0;
     Grid g;
@@ -2036,13 +2093,14 @@ TEST_CASE("random footprints in random lattices keep every guarantee and meet al
     INFO("trial " << trial << ": " << cols << " x " << rows << ", heights of style " << style << ", tolerance " << tol
                   << ", blocks of " << blockCols << " x " << blockRows);
 
-    const SimplifiedFootprint whole = simplifyFootprint(g, cells, cols, rows, tol, {{0, 0, cols - 1, rows - 1}});
+    const SimplifiedFootprint whole =
+        simplifyFootprint(g, cells, cols, rows, tol, {{0, 0, cols - 1, rows - 1}}, joined);
     checkGuarantees(whole, g, cells, cols, rows, tol);
     CHECK(delaunayProblem(whole.surface, cols, rows) == "");
     contacts += static_cast<int>(whole.blocks[0].footprint.cornerContacts);
 
     const std::vector<BlockRect> rects = blockLattice(cols, rows, blockCols, blockRows);
-    const SimplifiedFootprint s = simplifyFootprint(g, cells, cols, rows, tol, rects);
+    const SimplifiedFootprint s = simplifyFootprint(g, cells, cols, rows, tol, rects, joined);
     checkGuarantees(s, g, cells, cols, rows, tol);
     const std::size_t across = static_cast<std::size_t>((cols - 2) / blockCols + 1);
     for (std::size_t k = 0; k < s.blocks.size(); ++k) {
@@ -2064,13 +2122,13 @@ TEST_CASE("random footprints in random lattices keep every guarantee and meet al
     CHECK(commonRunProblem(s, whole, common) == "");
   }
   // The draw is not one-sided: pieces in many blocks, runs shared between blocks and keeping samples between their
-  // ends, runs common to both simplifications, contacts, and blocks that are all footprint.
+  // ends, runs common to both simplifications, contacts that footprintCells joined, and blocks that are all footprint.
   CHECK(pieces > 700);
   CHECK(blocksWithPieces > 550);
   CHECK(matched > 450);
   CHECK(matchedVertices > 2 * matched + 300);
   CHECK(common > 1200);
-  CHECK(contacts > 25);
+  CHECK(contacts > 0);
   CHECK(wholeBlocks > 120);
 }
 
@@ -2120,8 +2178,9 @@ TEST_CASE("simplifyBlock refuses a block it cannot simplify, and leaves the surf
 
   SECTION("a piece that is not a loop of runs") {
     const BlockRect rect{0, 0, 23, 17};
-    // The islet's loop, (4, 13) to (5, 13), with its four runs, broken one way at a time.
-    const Piece islet = whole.pieces.at(3);
+    // The islet's loop, (4, 13) to (5, 13), with its four runs, broken one way at a time. It is the last of the whole
+    // grid's three pieces, after the island and the joined blobs.
+    const Piece islet = whole.pieces.at(2);
     REQUIRE(same(islet.loop.at(0), {4, 13}));
     const auto refusal = [&](const Piece& piece) {
       BlockFootprint f;

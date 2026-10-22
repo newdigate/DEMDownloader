@@ -33,8 +33,8 @@ using demdl::mesh::resampleMaskNearest;
 // footprint and '.' for the rest. The cell (c, r) is the square whose corners are the samples (c, r), (c + 1, r),
 // (c, r + 1) and (c + 1, r + 1). Expected cells, loops and runs are worked out from the header's rules beside each
 // case. The random cases hold the unit to a plain restatement of those rules (referenceFourCorners, referenceClosing,
-// referenceEnclosedFilled, componentsIn, expectedRunStarts) and to what an outline is (outlineProblem), never to a
-// reading of the code under test.
+// referenceEnclosedFilled, referenceJoined, componentsIn, expectedRunStarts) and to what an outline is
+// (outlineProblem), never to a reading of the code under test.
 
 namespace {
 
@@ -49,18 +49,19 @@ using Rows = std::vector<std::string>;    // a picture
 using Loop = std::vector<GridPoint>;
 using Cell = std::pair<int, int>;         // (column, row)
 using Indices = std::vector<std::uint32_t>;
+using Joints = std::vector<GridPoint>;      // the vertices of the corner contacts footprintCells joined
 
 // The four cells that share a side with a cell, as steps.
 const std::vector<Cell> kSides{{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
 
-// footprintCells of the island: kIslandCols - 1 by kIslandRows - 1 cells, '#' in the footprint. Worked out in the
-// case that checks it.
+// footprintCells of the island: kIslandCols - 1 by kIslandRows - 1 cells, '#' in the footprint, the blobs joined by
+// the cell (19, 3). Worked out in the case that checks it.
 Rows islandFootprint() {
   return {
       ".......................",  //  0
       ".......................",  //  1
       "....########.....##....",  //  2
-      "....########.....##....",  //  3
+      "....########.....###...",  //  3
       "....##########.....##..",  //  4
       "....##########.....##..",  //  5
       "....##########.........",  //  6
@@ -197,6 +198,65 @@ Plane referenceEnclosedFilled(const Plane& cells) {
     for (int x = 0; x < width; ++x) filled[y][x] = !joinedToEdge[y][x];
   }
   return filled;
+}
+
+// The join of the corner contacts. A vertex with four cells round it is a contact when they are a diagonal pair in and
+// the other pair out, and it is joined by putting in the north-west-most of its two empty cells, the one in the smaller
+// row and of equal rows the one in the smaller column. Every contact of a round is joined at once, as the cells stood
+// before the round, and rounds go on until one finds none. vertices lists the joined vertices as (column, row), round
+// by round and in each round row by row from the north-west; rounds counts the rounds that joined any.
+struct Joined {
+  Plane cells;
+  Joints vertices;
+  int rounds = 0;
+};
+
+Joined referenceJoined(Plane cells) {
+  const int height = static_cast<int>(cells.size()), width = static_cast<int>(cells[0].size());
+  Joined joined;
+  for (;;) {
+    std::vector<std::pair<GridPoint, Cell>> found;  // a contact and the cell that joins it
+    for (int vy = 1; vy < height; ++vy) {
+      for (int vx = 1; vx < width; ++vx) {
+        const Cell nw{vx - 1, vy - 1}, ne{vx, vy - 1}, sw{vx - 1, vy}, se{vx, vy};
+        const auto in = [&](const Cell& c) { return static_cast<bool>(cells[c.second][c.first]); };
+        Cell first, second;  // the two empty cells
+        if (in(nw) && in(se) && !in(ne) && !in(sw)) {
+          first = ne;
+          second = sw;
+        } else if (in(ne) && in(sw) && !in(nw) && !in(se)) {
+          first = nw;
+          second = se;
+        } else {
+          continue;
+        }
+        const bool firstIsNorthWest =
+            first.second != second.second ? first.second < second.second : first.first < second.first;
+        found.push_back({GridPoint{vx, vy}, firstIsNorthWest ? first : second});
+      }
+    }
+    if (found.empty()) break;
+    ++joined.rounds;
+    for (const auto& [vertex, bridge] : found) {
+      cells[bridge.second][bridge.first] = true;
+      joined.vertices.push_back(vertex);
+    }
+  }
+  joined.cells = std::move(cells);
+  return joined;
+}
+
+// The vertices of a grid of cells whose four cells are a diagonal pair in and the other pair out, row by row.
+Joints contactsIn(const Flags& cells, int cols, int rows) {
+  Joints contacts;
+  for (int vy = 1; vy + 1 < rows; ++vy) {
+    for (int vx = 1; vx + 1 < cols; ++vx) {
+      const bool nw = cellIn(cells, cols, vx - 1, vy - 1), ne = cellIn(cells, cols, vx, vy - 1);
+      const bool sw = cellIn(cells, cols, vx - 1, vy), se = cellIn(cells, cols, vx, vy);
+      if ((nw && se && !ne && !sw) || (ne && sw && !nw && !se)) contacts.push_back({vx, vy});
+    }
+  }
+  return contacts;
 }
 
 // A plane as flags, row by row.
@@ -351,10 +411,11 @@ std::string outlineProblem(const Piece& piece, const Component& component, const
 
 // Says what is wrong with f as blockFootprint's result for rect, or returns "" when nothing is: the kept pieces and the
 // dropped ones are the components the test finds, split by area at minPiece and each in order of size, ties by the
-// first cell; each is outlined as outlineProblem wants; the cells add up; and the corner contacts are the vertices
-// strictly inside the block whose four cells are two kept pieces on one diagonal and not kept on the other.
+// first cell; each is outlined as outlineProblem wants; the cells add up; and the corner contacts are the vertices of
+// `joined`, the contacts footprintCells joined, that lie strictly inside the block, its four cells round them all in
+// the block's range.
 std::string blockProblem(const BlockFootprint& f, const Flags& cells, int cols, int rows, const BlockRect& rect,
-                         double cellArea, double minPiece) {
+                         double cellArea, double minPiece, const Joints& joined = {}) {
   std::vector<Component> components = componentsIn(cells, cols, rect);
   // Largest first; equal sizes keep the order of their first cells, which is the order the walk found them in.
   std::stable_sort(components.begin(), components.end(),
@@ -379,24 +440,10 @@ std::string blockProblem(const BlockFootprint& f, const Flags& cells, int cols, 
   }
   if (f.cells != keptCells) return "cells is " + std::to_string(f.cells) + ", not " + std::to_string(keptCells);
 
-  std::map<Cell, bool> keptAt;  // every footprint cell of the block: whether its piece is kept
-  for (const Component* c : kept) {
-    for (const Cell& cell : c->cells) keptAt[cell] = true;
-  }
-  for (const Component* c : dropped) {
-    for (const Cell& cell : c->cells) keptAt[cell] = false;
-  }
-  const auto isKept = [&](int x, int y) {
-    const auto it = keptAt.find({x, y});
-    return it != keptAt.end() && it->second;
+  const auto inside = [&](const GridPoint& v) {
+    return v.x > rect.firstColumn && v.x < rect.lastColumn && v.y > rect.firstRow && v.y < rect.lastRow;
   };
-  std::uint64_t contacts = 0;
-  for (int y = rect.firstRow + 1; y < rect.lastRow; ++y) {
-    for (int x = rect.firstColumn + 1; x < rect.lastColumn; ++x) {
-      const bool nw = isKept(x - 1, y - 1), ne = isKept(x, y - 1), sw = isKept(x - 1, y), se = isKept(x, y);
-      if ((nw && se && !ne && !sw) || (ne && sw && !nw && !se)) ++contacts;
-    }
-  }
+  const auto contacts = static_cast<std::uint64_t>(std::count_if(joined.begin(), joined.end(), inside));
   if (f.cornerContacts != contacts) {
     return std::to_string(f.cornerContacts) + " corner contacts, not " + std::to_string(contacts);
   }
@@ -570,7 +617,8 @@ TEST_CASE("resampleMaskNearest takes each output vertex from the nearest source 
   }
 }
 
-TEST_CASE("the island's footprint: the lake and the channel are in, the sea and the lone sample out", "[footprint]") {
+TEST_CASE("the island's footprint: the lake and the channel are in, the blobs joined, the sea and the lone sample out",
+          "[footprint]") {
   // Cells with all four corners in the data first: the island's 9 x 9 samples give 8 x 8 cells, columns 4 to 11 and
   // rows 2 to 9, and the tab's samples with those of column 12 give the cells of columns 12 and 13, rows 4 to 7. A
   // no-data sample is a corner of the four cells around it, so the lake's four samples leave out the 3 x 3 cells of
@@ -590,9 +638,18 @@ TEST_CASE("the island's footprint: the lake and the channel are in, the sea and 
   // corners has data, so it makes no cell. The closing joins neither the blobs, which meet at the vertex (19, 4) only
   // (the cell (19, 3) between them has the cell (20, 2) in its square, with nothing in its own square), nor anything
   // across the gaps of three cells.
-  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
+  //
+  // Last, the join: the vertex (19, 4) has blob A's cell (18, 3) to its north-west and blob B's (19, 4) to its
+  // south-east, and the cells (19, 3) and (18, 4) on the other diagonal out. Of those two the north-west-most, the one
+  // in the smaller row, is (19, 3), which goes in: the blobs and it are one piece of 4 + 4 + 1 cells. No other vertex
+  // has a diagonal pair alone.
+  Joints joined;
+  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
   REQUIRE(cells.size() == static_cast<std::size_t>((kIslandCols - 1) * (kIslandRows - 1)));
   CHECK(pictureOf(cells, kIslandCols - 1) == islandFootprint());
+  CHECK(text(joined) == "(19, 4)");
+  // The other form gives the same cells.
+  CHECK(footprintCells(islandMask(), kIslandCols, kIslandRows) == cells);
 
   // The same, cell by cell, for the claims of the case's name.
   CHECK(cellIn(cells, kIslandCols, 7, 5));   // the lake's middle cell, enclosed and filled
@@ -610,7 +667,9 @@ TEST_CASE("the island's footprint: the lake and the channel are in, the sea and 
     for (int x = 0; x <= 10; ++x) islet += cellIn(cells, kIslandCols, x, y) ? 1 : 0;
   }
   CHECK(islet == 4);
-  CHECK(std::count(cells.begin(), cells.end(), 1) == 72 + 4 + 4 + 4);
+  CHECK(cellIn(cells, kIslandCols, 19, 3));        // the bridge between the blobs
+  CHECK_FALSE(cellIn(cells, kIslandCols, 18, 4));  // the contact's other empty cell
+  CHECK(std::count(cells.begin(), cells.end(), 1) == 72 + 4 + 4 + 4 + 1);
 }
 
 TEST_CASE("a channel one sample wide is closed and a wider one stays open", "[footprint]") {
@@ -668,11 +727,85 @@ TEST_CASE("the closing treats the world beyond the grid as data", "[footprint]")
   CHECK(footprintCells(valuesOf({"#...#####", "#########", "#########"}), 9, 3) == Flags(8 * 2, 1));
 }
 
+TEST_CASE("a corner contact is joined by putting in the north-west-most of its two empty cells", "[footprint]") {
+  SECTION("in cells on the north-west to south-east diagonal, the empty cell north-east of the vertex") {
+    // The island's blobs: at the vertex (19, 4) the cells (18, 3) and (19, 4) are in, and (19, 3), north-east of the
+    // vertex, and (18, 4), south-west of it, out. (19, 3) is in the smaller row.
+    Joints joined;
+    const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
+    CHECK(text(joined) == "(19, 4)");
+    CHECK(cellIn(cells, kIslandCols, 19, 3));
+    CHECK_FALSE(cellIn(cells, kIslandCols, 18, 4));
+  }
+
+  SECTION("in cells on the north-east to south-west diagonal, the empty cell north-west of the vertex") {
+    // Two squares of 3 x 3 samples, columns 6 to 8 and rows 2 to 4, and columns 4 to 6 and rows 4 to 6, which share the
+    // sample (6, 4): as cells, two squares of 2 x 2 meeting at that vertex, with the cells (6, 3) and (5, 4) in and
+    // (5, 3), north-west of the vertex, and (6, 4), south-east of it, out. (5, 3) is in the smaller row; the squares
+    // and it are one piece of 9 cells.
+    const Rows mask{"...........", "...........", "......###..", "......###..", "....#####..",
+                    "....###....", "....###....", "...........", "..........."};
+    Joints joined;
+    const Flags cells = footprintCells(valuesOf(mask), 11, 9, &joined);
+    CHECK(text(joined) == "(6, 4)");
+    CHECK(pictureOf(cells, 10) == Rows{"..........", "..........", "......##..", ".....###..", "....##....",
+                                       "....##....", "..........", ".........."});
+    CHECK(cellIn(cells, 11, 5, 3));
+    CHECK_FALSE(cellIn(cells, 11, 6, 4));
+
+    const BlockRect whole{0, 0, 10, 8};
+    const BlockFootprint f = blockFootprint(cells, 11, 9, whole, 1.0, 0.0, joined);
+    const std::string problem = blockProblem(f, cells, 11, 9, whole, 1.0, 0.0, joined);
+    INFO("problem: " << problem);
+    CHECK(problem.empty());
+    REQUIRE(f.pieces.size() == 1);
+    CHECK(f.pieces[0].cells == 9);
+    CHECK(f.cornerContacts == 1);
+  }
+}
+
+TEST_CASE("three blobs in a diagonal chain are joined into one piece with two bridge cells", "[footprint]") {
+  // Three squares of 3 x 3 samples, each sharing its south-east corner sample with the next one's north-west corner:
+  // columns and rows 2 to 4, 4 to 6 and 6 to 8. As cells, three squares of 2 x 2 that touch at the vertices (4, 4)
+  // and (6, 6). Both contacts are there from the start, and each is joined by the empty cell north-east of it, (4, 3)
+  // and (6, 5), in the order of their vertices: one piece of 4 + 4 + 4 + 2 cells. Neither join makes a new contact,
+  // the bridges' other neighbours staying out; after the closing and the fill no join can (see the random masks), so
+  // a chain is joined link by link in one sweep rather than one join calling for the next.
+  const Rows mask{"...........", "...........", "..###......", "..###......", "..#####....", "....###....",
+                  "....#####..", "......###..", "......###..", "...........", "..........."};
+  Joints joined;
+  const Flags cells = footprintCells(valuesOf(mask), 11, 11, &joined);
+  CHECK(text(joined) == "(4, 4) (6, 6)");
+  CHECK(pictureOf(cells, 10) == Rows{"..........", "..........", "..##......", "..###.....", "....##....",
+                                     "....###...", "......##..", "......##..", "..........", ".........."});
+
+  const BlockRect whole{0, 0, 10, 10};
+  const BlockFootprint f = blockFootprint(cells, 11, 11, whole, 1.0, 0.0, joined);
+  const std::string problem = blockProblem(f, cells, 11, 11, whole, 1.0, 0.0, joined);
+  INFO("problem: " << problem);
+  CHECK(problem.empty());
+  REQUIRE(f.pieces.size() == 1);
+  CHECK(f.pieces[0].cells == 14);
+  CHECK(f.cornerContacts == 2);
+  // One simple walk round the three squares and both bridges, 24 samples, none twice.
+  CHECK(text(f.pieces[0].loop) ==
+        "(2, 2) (2, 3) (2, 4) (3, 4) (4, 4) (4, 5) (4, 6) (5, 6) (6, 6) (6, 7) (6, 8) (7, 8) (8, 8) (8, 7) (8, 6) "
+        "(7, 6) (7, 5) (6, 5) (6, 4) (5, 4) (5, 3) (4, 3) (4, 2) (3, 2)");
+}
+
 TEST_CASE("footprintCells follows its rules on random masks", "[footprint]") {
-  // The unit closes in place along the rows and then down the columns and finds the sea by waves; the reference steps
-  // look at every 3 x 3 square on grids of their own and walk depth first. They must agree cell for cell.
+  // The unit closes in place along the rows and then down the columns, finds the sea by waves and joins the corner
+  // contacts in one sweep; the reference steps look at every 3 x 3 square on grids of their own, walk depth first and
+  // join round by round. They must agree cell for cell and joined vertex for joined vertex, in order, and leave no
+  // vertex with a diagonal pair alone.
+  //
+  // After the closing and the fill, the join never needs a second round: the empty cell a contact puts in is a bottom
+  // corner of a 3 x 3 square of out cells that the closing left (a cell is out after it only inside such a square),
+  // the cells beside it in that square stay out, and so it makes no new contact and cuts no region of the sea off the
+  // grid's edge. laterRounds counts the masks where the reference needed one all the same.
   std::mt19937 rng(kRandomSeed);
-  int changedByClosing = 0, changedByFill = 0, empty = 0, full = 0;
+  int changedByClosing = 0, changedByFill = 0, changedByJoin = 0, laterRounds = 0, empty = 0, full = 0;
+  std::size_t joints = 0;
   for (int trial = 0; trial < 400; ++trial) {
     const int cols = 2 + static_cast<int>(rng() % 39), rows = 2 + static_cast<int>(rng() % 39);
     const Flags mask = randomMask(rng, cols, rows);
@@ -680,19 +813,32 @@ TEST_CASE("footprintCells follows its rules on random masks", "[footprint]") {
     const Plane fourCorners = referenceFourCorners(mask, cols, rows);
     const Plane closed = referenceClosing(fourCorners);
     const Plane filled = referenceEnclosedFilled(closed);
-    const Flags cells = footprintCells(mask, cols, rows);
-    CHECK(pictureOf(cells, cols - 1) == pictureOf(flagsOf(filled), cols - 1));
+    const Joined expected = referenceJoined(filled);
+    Joints joined;
+    const Flags cells = footprintCells(mask, cols, rows, &joined);
+    CHECK(pictureOf(cells, cols - 1) == pictureOf(flagsOf(expected.cells), cols - 1));
+    CHECK(text(joined) == text(expected.vertices));
+    CHECK(text(contactsIn(cells, cols, rows)) == "");
+    // The joins make no hole: the fill would change nothing more.
+    CHECK(referenceEnclosedFilled(expected.cells) == expected.cells);
 
     // How often each step made a difference, so that the sample is seen not to be one-sided.
     if (closed != fourCorners) ++changedByClosing;
     if (filled != closed) ++changedByFill;
+    if (!joined.empty()) ++changedByJoin;
+    if (expected.rounds > 1) ++laterRounds;
+    joints += joined.size();
     if (std::count(cells.begin(), cells.end(), 1) == 0) ++empty;
     if (std::count(cells.begin(), cells.end(), 0) == 0) ++full;
   }
   CHECK(changedByClosing > 130);
   CHECK(changedByFill > 20);
+  CHECK(changedByJoin > 50);
+  CHECK(laterRounds == 0);
   CHECK(empty > 10);
   CHECK(full > 7);
+  INFO("joined " << joints << " contacts in " << changedByJoin << " masks");
+  CHECK(joints > 80);
 }
 
 TEST_CASE("footprintCells refuses a grid it cannot have cells for", "[footprint]") {
@@ -705,23 +851,23 @@ TEST_CASE("footprintCells refuses a grid it cannot have cells for", "[footprint]
 }
 
 TEST_CASE("the island's pieces over the whole grid, their outlines and their runs", "[footprint]") {
-  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
+  Joints joined;
+  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
   const BlockRect whole{0, 0, kIslandCols - 1, kIslandRows - 1};
   // Cells of a quarter of a square unit, so the islet's 4 cells are 1 square unit; nothing is dropped below 0.
-  const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, 0.0);
-  const std::string problem = blockProblem(f, cells, kIslandCols, kIslandRows, whole, 0.25, 0.0);
+  const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, 0.0, joined);
+  const std::string problem = blockProblem(f, cells, kIslandCols, kIslandRows, whole, 0.25, 0.0, joined);
   INFO("problem: " << problem);
   CHECK(problem.empty());
 
-  // The island with its lake and channel, 8 x 8 + 2 x 4 = 72 cells, then the three of 4 cells by their north-west-most
-  // cells: blob A's (17, 2) on row 2, blob B's (19, 4) on row 4, the islet's (4, 13) on row 13.
-  REQUIRE(f.pieces.size() == 4);
+  // The island with its lake and channel, 8 x 8 + 2 x 4 = 72 cells; the blobs joined by the cell (19, 3), 4 + 4 + 1 =
+  // 9 cells; and the islet's 4.
+  REQUIRE(f.pieces.size() == 3);
   CHECK(f.dropped.empty());
-  CHECK(f.cells == 84);
+  CHECK(f.cells == 85);
   CHECK(f.pieces[0].cells == 72);
-  CHECK(f.pieces[1].cells == 4);
+  CHECK(f.pieces[1].cells == 9);
   CHECK(f.pieces[2].cells == 4);
-  CHECK(f.pieces[3].cells == 4);
 
   // The island's loop starts at the north-west corner of its first cell, (4, 2), and goes south down its west coast,
   // the lake and channel being filled: counter-clockwise seen from above, with the island on its left. Every sample on
@@ -734,19 +880,23 @@ TEST_CASE("the island's pieces over the whole grid, their outlines and their run
   CHECK(f.pieces[0].runStarts == Indices{0, 8, 16, 18, 20, 24, 26, 28});
   CHECK(text(runStartSamples(f.pieces[0])) == "(4, 2) (4, 10) (12, 10) (12, 8) (14, 8) (14, 4) (12, 4) (12, 2)");
 
-  // The blobs, each a square of 2 x 2 cells: eight samples and four runs. Both loops hold the vertex (19, 4) where
-  // they touch, blob A's fifth sample and blob B's first: blob A's walk, coming east along its south side to (19, 4),
-  // turns north up its own east side rather than going on along blob B's west side.
-  CHECK(text(f.pieces[1].loop) == "(17, 2) (17, 3) (17, 4) (18, 4) (19, 4) (19, 3) (19, 2) (18, 2)");
-  CHECK(f.pieces[1].runStarts == Indices{0, 2, 4, 6});
-  CHECK(text(f.pieces[2].loop) == "(19, 4) (19, 5) (19, 6) (20, 6) (21, 6) (21, 5) (21, 4) (20, 4)");
+  // The joined blobs: one 4-connected piece, blob A's square, the bridge east of its south-east cell and blob B's
+  // square south of the bridge, and one simple walk round it, 8 + 8 + 4 - 2 - 2 = 16 samples, every one of them once.
+  // At (19, 4), where the blobs met, the walk coming east along blob A's south side has the bridge ahead on its left
+  // and blob B ahead on its right, and turns south down blob B's west side. It comes back up blob B's east side, west
+  // to (20, 4), up the bridge's east side and west along its north side to (19, 3), and goes on north up blob A's east
+  // side. It turns at ten samples.
+  CHECK(text(f.pieces[1].loop) ==
+        "(17, 2) (17, 3) (17, 4) (18, 4) (19, 4) (19, 5) (19, 6) (20, 6) (21, 6) (21, 5) (21, 4) (20, 4) (20, 3) "
+        "(19, 3) (19, 2) (18, 2)");
+  CHECK(f.pieces[1].runStarts == Indices{0, 2, 4, 6, 8, 10, 11, 12, 13, 14});
+  CHECK(text(f.pieces[2].loop) == "(4, 13) (4, 14) (4, 15) (5, 15) (6, 15) (6, 14) (6, 13) (5, 13)");
   CHECK(f.pieces[2].runStarts == Indices{0, 2, 4, 6});
-  CHECK(text(f.pieces[3].loop) == "(4, 13) (4, 14) (4, 15) (5, 15) (6, 15) (6, 14) (6, 13) (5, 13)");
-  CHECK(f.pieces[3].runStarts == Indices{0, 2, 4, 6});
 
-  // The vertex (19, 4) has blob A's cell (18, 3) to its north-west and blob B's (19, 4) to its south-east, and the
-  // cells (19, 3) and (18, 4) on the other diagonal are not in the footprint.
+  // The one contact footprintCells joined, (19, 4), is strictly inside the grid's one block.
   CHECK(f.cornerContacts == 1);
+  // Without the joined vertices, nothing is counted: the block cannot see a contact that is no longer there.
+  CHECK(blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, 0.0).cornerContacts == 0);
 
   // Each loop, seen from above with y north, turns counter-clockwise: its shoelace area is positive, twice its cells.
   for (const Piece& piece : f.pieces) {
@@ -759,50 +909,66 @@ TEST_CASE("the island's pieces over the whole grid, their outlines and their run
   }
 }
 
-TEST_CASE("pieces smaller than the least area are dropped, and a contact counts only between kept pieces",
-          "[footprint]") {
-  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
+TEST_CASE("pieces smaller than the least area are dropped and listed, in the order of kept ones", "[footprint]") {
+  Joints joined;
+  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
   const BlockRect whole{0, 0, kIslandCols - 1, kIslandRows - 1};
 
   SECTION("an area equal to the islet's keeps it: below means below") {
-    const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, 1.0);
-    CHECK(f.pieces.size() == 4);
+    const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, 1.0, joined);
+    CHECK(f.pieces.size() == 3);
     CHECK(f.dropped.empty());
     CHECK(f.cornerContacts == 1);
   }
 
-  SECTION("just above the islet's area drops it, and the blobs of the same area with it") {
+  SECTION("just above the islet's area drops it alone, the joined blobs being 9 cells") {
     const double least = std::nextafter(1.0, 2.0);
-    const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, least);
-    const std::string problem = blockProblem(f, cells, kIslandCols, kIslandRows, whole, 0.25, least);
+    const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, least, joined);
+    const std::string problem = blockProblem(f, cells, kIslandCols, kIslandRows, whole, 0.25, least, joined);
+    INFO("problem: " << problem);
+    CHECK(problem.empty());
+    REQUIRE(f.pieces.size() == 2);
+    CHECK(f.pieces[0].cells == 72);
+    CHECK(f.pieces[1].cells == 9);
+    REQUIRE(f.dropped.size() == 1);
+    CHECK(f.dropped[0].cells == 4);
+    // Dropped pieces are outlined all the same, so that they can be listed.
+    CHECK(text(f.dropped[0].loop) == "(4, 13) (4, 14) (4, 15) (5, 15) (6, 15) (6, 14) (6, 13) (5, 13)");
+    // Only the kept pieces' cells count.
+    CHECK(f.cells == 72 + 9);
+    CHECK(f.cornerContacts == 1);
+  }
+
+  SECTION("just above the joined blobs' area drops them too, largest first, and their contact still counts") {
+    const double least = std::nextafter(2.25, 3.0);
+    const BlockFootprint f = blockFootprint(cells, kIslandCols, kIslandRows, whole, 0.25, least, joined);
+    const std::string problem = blockProblem(f, cells, kIslandCols, kIslandRows, whole, 0.25, least, joined);
     INFO("problem: " << problem);
     CHECK(problem.empty());
     REQUIRE(f.pieces.size() == 1);
     CHECK(f.pieces[0].cells == 72);
     // The dropped pieces in the same order as kept ones: by area, then by their north-west-most cells.
-    REQUIRE(f.dropped.size() == 3);
+    REQUIRE(f.dropped.size() == 2);
     CHECK(same(f.dropped[0].loop.at(0), {17, 2}));
-    CHECK(same(f.dropped[1].loop.at(0), {19, 4}));
-    CHECK(same(f.dropped[2].loop.at(0), {4, 13}));
-    CHECK(f.dropped[2].cells == 4);
-    // Dropped pieces are outlined all the same, so that they can be listed.
-    CHECK(text(f.dropped[2].loop) == "(4, 13) (4, 14) (4, 15) (5, 15) (6, 15) (6, 14) (6, 13) (5, 13)");
-    // Only the kept island's cells count, and the blobs, dropped, touch no kept piece.
+    CHECK(f.dropped[0].cells == 9);
+    CHECK(same(f.dropped[1].loop.at(0), {4, 13}));
     CHECK(f.cells == 72);
-    CHECK(f.cornerContacts == 0);
+    // The count is of the contacts joined inside the block, whatever becomes of the piece that holds them.
+    CHECK(f.cornerContacts == 1);
   }
 }
 
 TEST_CASE("a block side splits the runs where the cells across it change, as the block beyond splits them",
           "[footprint]") {
-  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
+  Joints joined;
+  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
   // The west half, columns 0 to 12, and the east half, columns 12 to 23 of the vertices: they share column 12.
   const BlockRect west{0, 0, 12, kIslandRows - 1};
   const BlockRect east{12, 0, kIslandCols - 1, kIslandRows - 1};
-  const BlockFootprint w = blockFootprint(cells, kIslandCols, kIslandRows, west, 1.0, 0.0);
-  const BlockFootprint e = blockFootprint(cells, kIslandCols, kIslandRows, east, 1.0, 0.0);
-  const std::string westProblem = blockProblem(w, cells, kIslandCols, kIslandRows, west, 1.0, 0.0);
-  const std::string eastProblem = blockProblem(e, cells, kIslandCols, kIslandRows, east, 1.0, 0.0);
+  const BlockFootprint w = blockFootprint(cells, kIslandCols, kIslandRows, west, 1.0, 0.0, joined);
+  const BlockFootprint e = blockFootprint(cells, kIslandCols, kIslandRows, east, 1.0, 0.0, joined);
+  const std::string westProblem = blockProblem(w, cells, kIslandCols, kIslandRows, west, 1.0, 0.0, joined);
+  const std::string eastProblem = blockProblem(e, cells, kIslandCols, kIslandRows, east, 1.0, 0.0, joined);
   INFO("west: " << westProblem);
   INFO("east: " << eastProblem);
   CHECK(westProblem.empty());
@@ -820,16 +986,17 @@ TEST_CASE("a block side splits the runs where the cells across it change, as the
   CHECK(text(runStartSamples(island)) == "(4, 2) (4, 10) (12, 10) (12, 8) (12, 4) (12, 2)");
   CHECK(island.runStarts == Indices{0, 8, 16, 18, 22, 24});
 
-  // The east half holds the tab, 2 x 4 cells, and the blobs. The tab's west side is the same column 12, walked south
-  // from (12, 4) to (12, 8) beside the island's cells, which are in all the way: one run, between the same two samples
-  // as the west half's middle run on that line.
-  REQUIRE(e.pieces.size() == 3);
-  const Piece& tab = e.pieces[0];
+  // The east half holds the joined blobs, 9 cells, and the tab, 2 x 4 cells. The tab's west side is the same column
+  // 12, walked south from (12, 4) to (12, 8) beside the island's cells, which are in all the way: one run, between the
+  // same two samples as the west half's middle run on that line.
+  REQUIRE(e.pieces.size() == 2);
+  CHECK(e.pieces[0].cells == 9);
+  const Piece& tab = e.pieces[1];
   CHECK(tab.cells == 8);
   CHECK(text(tab.loop) ==
         "(12, 4) (12, 5) (12, 6) (12, 7) (12, 8) (13, 8) (14, 8) (14, 7) (14, 6) (14, 5) (14, 4) (13, 4)");
   CHECK(text(runStartSamples(tab)) == "(12, 4) (12, 8) (14, 8) (14, 4)");
-  // The blobs' contact is inside the east half.
+  // The blobs' joined contact, (19, 4), is inside the east half and not in the west one.
   CHECK(e.cornerContacts == 1);
   CHECK(w.cornerContacts == 0);
 
@@ -879,48 +1046,65 @@ TEST_CASE("an outline along the grid's edge has runs that end at its turns only"
   CHECK(text(runStartSamples(h.pieces[0])) == "(1, 2) (1, 4) (6, 4) (6, 2) (5, 2) (2, 2)");
 }
 
-TEST_CASE("a corner contact on a block side is counted by neither block", "[footprint]") {
-  // Blocks that meet down column 19, through the vertex (19, 4) where the blobs touch: blob A is in the west block and
-  // blob B in the east one, so each block sees one cell of the diagonal and neither counts the contact.
-  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
+TEST_CASE("a joined contact on a block side is counted by neither block, and the two meet along the bridge",
+          "[footprint]") {
+  // Blocks that meet down column 19, through the vertex (19, 4) where the blobs touched. Blob A, cells (17, 2) to
+  // (18, 3), is in the west block, and the bridge (19, 3) and blob B, cells (19, 4) to (20, 5), make one piece of 5
+  // cells in the east one. The joined vertex lies on the side they share, so neither block has it strictly inside and
+  // neither counts it.
+  Joints joined;
+  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
+  REQUIRE(text(joined) == "(19, 4)");
   const BlockRect west{12, 0, 19, kIslandRows - 1};
   const BlockRect east{19, 0, kIslandCols - 1, kIslandRows - 1};
-  const BlockFootprint w = blockFootprint(cells, kIslandCols, kIslandRows, west, 1.0, 0.0);
-  const BlockFootprint e = blockFootprint(cells, kIslandCols, kIslandRows, east, 1.0, 0.0);
-  const std::string westProblem = blockProblem(w, cells, kIslandCols, kIslandRows, west, 1.0, 0.0);
-  const std::string eastProblem = blockProblem(e, cells, kIslandCols, kIslandRows, east, 1.0, 0.0);
+  const BlockFootprint w = blockFootprint(cells, kIslandCols, kIslandRows, west, 1.0, 0.0, joined);
+  const BlockFootprint e = blockFootprint(cells, kIslandCols, kIslandRows, east, 1.0, 0.0, joined);
+  const std::string westProblem = blockProblem(w, cells, kIslandCols, kIslandRows, west, 1.0, 0.0, joined);
+  const std::string eastProblem = blockProblem(e, cells, kIslandCols, kIslandRows, east, 1.0, 0.0, joined);
   INFO("west: " << westProblem);
   INFO("east: " << eastProblem);
   CHECK(westProblem.empty());
   CHECK(eastProblem.empty());
   REQUIRE(w.pieces.size() == 2);  // the tab and blob A
-  REQUIRE(e.pieces.size() == 1);  // blob B
+  REQUIRE(e.pieces.size() == 1);  // the bridge and blob B
+  CHECK(w.pieces[1].cells == 4);
+  CHECK(e.pieces[0].cells == 5);
   CHECK(w.cornerContacts == 0);
   CHECK(e.cornerContacts == 0);
-  // Both blocks' loops hold the vertex, as a turn.
-  CHECK(text(runStartSamples(w.pieces[1])) == "(17, 2) (17, 4) (19, 4) (19, 2)");
-  CHECK(text(runStartSamples(e.pieces[0])) == "(19, 4) (19, 6) (21, 6) (21, 4)");
+
+  // The edge from (19, 3) to (19, 4) has blob A's cell (18, 3) on its west and the bridge on its east: both blocks
+  // walk it, the west one north up blob A's east side and the east one south down the bridge's west side, and both
+  // start runs at its two ends. In the west block (19, 4) is a turn and (19, 3) a split, where the bridge across the
+  // side ends; in the east block (19, 3) is a turn and (19, 4) a split, where blob A across the side ends.
+  CHECK(text(runStartSamples(w.pieces[1])) == "(17, 2) (17, 4) (19, 4) (19, 3) (19, 2)");
+  CHECK(text(e.pieces[0].loop) == "(19, 3) (19, 4) (19, 5) (19, 6) (20, 6) (21, 6) (21, 5) (21, 4) (20, 4) (20, 3)");
+  CHECK(text(runStartSamples(e.pieces[0])) == "(19, 3) (19, 4) (19, 6) (21, 6) (21, 4) (20, 4) (20, 3)");
+  const std::string sharedProblem = sharedSideProblem(w, e, {19, 0}, {19, kIslandRows - 1}, cells, kIslandCols);
+  INFO("shared side: " << sharedProblem);
+  CHECK(sharedProblem.empty());
 }
 
 TEST_CASE("random footprints cut into blocks are outlined by the rules and agree along shared sides", "[footprint]") {
-  // Random masks, their footprints, and a lattice of blocks over each with a random size, the last blocks each way
-  // cut short. Every block is held to blockProblem, and every side two blocks share to sharedSideProblem.
+  // Random masks, their footprints with the vertices of the contacts joined, and a lattice of blocks over each with a
+  // random size, the last blocks each way cut short. Every block is held to blockProblem, and every side two blocks
+  // share to sharedSideProblem.
   std::mt19937 rng(kRandomSeed + 1);
   int blocksWithPieces = 0, dropped = 0, contacts = 0, wholeGridContacts = 0, splits = 0, sharedStretches = 0;
   for (int trial = 0; trial < 300; ++trial) {
     const int cols = 3 + static_cast<int>(rng() % 30), rows = 3 + static_cast<int>(rng() % 30);
     const Flags mask = randomMask(rng, cols, rows);
-    const Flags cells = footprintCells(mask, cols, rows);
+    Joints joined;
+    const Flags cells = footprintCells(mask, cols, rows, &joined);
     const int blockCols = 1 + static_cast<int>(rng() % static_cast<unsigned>(cols - 1));
     const int blockRows = 1 + static_cast<int>(rng() % static_cast<unsigned>(rows - 1));
     const double least = static_cast<double>(rng() % 8);  // cells of 1 square unit: pieces under 0 to 7 cells drop
     const auto blocks = lattice(cols, rows, blockCols, blockRows);
 
-    // The whole grid as one block, nothing dropped: every corner contact is inside it and counts.
+    // The whole grid as one block, nothing dropped: every joined contact is inside it and counts.
     {
       const BlockRect whole{0, 0, cols - 1, rows - 1};
-      const BlockFootprint f = blockFootprint(cells, cols, rows, whole, 1.0, 0.0);
-      const std::string problem = blockProblem(f, cells, cols, rows, whole, 1.0, 0.0);
+      const BlockFootprint f = blockFootprint(cells, cols, rows, whole, 1.0, 0.0, joined);
+      const std::string problem = blockProblem(f, cells, cols, rows, whole, 1.0, 0.0, joined);
       INFO("trial " << trial << ", " << cols << " x " << rows << ", the whole grid: " << problem);
       CHECK(problem.empty());
       wholeGridContacts += static_cast<int>(f.cornerContacts);
@@ -931,9 +1115,9 @@ TEST_CASE("random footprints cut into blocks are outlined by the rules and agree
       results.emplace_back();
       for (const BlockRect& rect : row) {
         INFO("trial " << trial << ", " << cols << " x " << rows << ", block of " << text(rect));
-        results.back().push_back(blockFootprint(cells, cols, rows, rect, 1.0, least));
+        results.back().push_back(blockFootprint(cells, cols, rows, rect, 1.0, least, joined));
         const BlockFootprint& f = results.back().back();
-        const std::string problem = blockProblem(f, cells, cols, rows, rect, 1.0, least);
+        const std::string problem = blockProblem(f, cells, cols, rows, rect, 1.0, least, joined);
         INFO("problem: " << problem);
         CHECK(problem.empty());
         if (!f.pieces.empty()) ++blocksWithPieces;
@@ -975,8 +1159,8 @@ TEST_CASE("random footprints cut into blocks are outlined by the rules and agree
       }
     }
   }
-  // The sample is not one-sided: pieces, drops, corner contacts, runs split on block sides and stretches that two
-  // blocks share all turn up, many times.
+  // The sample is not one-sided: pieces, drops, joined contacts inside blocks, runs split on block sides and
+  // stretches that two blocks share all turn up, many times.
   CHECK(blocksWithPieces > 600);
   CHECK(dropped > 400);
   CHECK(contacts > 10);
@@ -986,12 +1170,14 @@ TEST_CASE("random footprints cut into blocks are outlined by the rules and agree
 }
 
 TEST_CASE("the same footprint gives the same pieces every time", "[footprint]") {
-  const Flags first = footprintCells(islandMask(), kIslandCols, kIslandRows);
-  const Flags second = footprintCells(islandMask(), kIslandCols, kIslandRows);
+  Joints firstJoined, secondJoined;
+  const Flags first = footprintCells(islandMask(), kIslandCols, kIslandRows, &firstJoined);
+  const Flags second = footprintCells(islandMask(), kIslandCols, kIslandRows, &secondJoined);
   CHECK(first == second);
+  CHECK(text(firstJoined) == text(secondJoined));
   const BlockRect west{0, 0, 12, kIslandRows - 1};
-  const BlockFootprint a = blockFootprint(first, kIslandCols, kIslandRows, west, 0.25, 0.5);
-  const BlockFootprint b = blockFootprint(first, kIslandCols, kIslandRows, west, 0.25, 0.5);
+  const BlockFootprint a = blockFootprint(first, kIslandCols, kIslandRows, west, 0.25, 0.5, firstJoined);
+  const BlockFootprint b = blockFootprint(first, kIslandCols, kIslandRows, west, 0.25, 0.5, firstJoined);
   REQUIRE(a.pieces.size() == b.pieces.size());
   for (std::size_t i = 0; i < a.pieces.size(); ++i) {
     CHECK(text(a.pieces[i].loop) == text(b.pieces[i].loop));
@@ -1050,11 +1236,13 @@ TEST_CASE("blockFootprint refuses a block it cannot outline", "[footprint]") {
 
 TEST_CASE("on any cells, blockFootprint outlines every piece or refuses the first that one loop cannot outline",
           "[footprint]") {
-  // Cells drawn at random, not footprintCells' result, so that pieces with holes and pieces that meet themselves at a
-  // vertex turn up. A piece has a hole when some cell beyond it cannot be reached from beyond its bounding box by steps
-  // through cells beyond it, a side at a time; it meets itself at a vertex when it has the two cells of one diagonal
-  // there and neither of the other two. The unit must refuse the block, naming the first such piece in the order of
-  // their first cells, exactly when there is one, and otherwise give what blockProblem wants.
+  // Cells drawn at random, not footprintCells' result, so that pieces with holes, pieces that meet themselves at a
+  // vertex and pieces that touch one another at one turn up. A piece has a hole when some cell beyond it cannot be
+  // reached from beyond its bounding box by steps through cells beyond it, a side at a time; it meets itself at a
+  // vertex when it has the two cells of one diagonal there and neither of the other two. The unit must refuse the
+  // block, naming the first such piece in the order of their first cells, exactly when there is one, and otherwise give
+  // what blockProblem wants: two pieces that touch are outlined each on its own, and no contact is counted, none having
+  // been joined.
   std::mt19937 rng(kRandomSeed + 2);
   int refused = 0, outlined = 0;
   for (int trial = 0; trial < 400; ++trial) {

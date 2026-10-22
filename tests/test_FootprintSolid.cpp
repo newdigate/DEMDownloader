@@ -8,12 +8,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <random>
-#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -362,6 +361,16 @@ std::string solidProblem(const Mesh& surface, const std::vector<PieceOutline>& p
   return facesProblem(surface, pieces, solid);
 }
 
+// The solid through an STL and back: written by writeBinaryStl and read by readBinaryStl, which merges the corners
+// that stand at one position into one vertex, as STL readers do (Blender's importer, which check_stl in
+// blender_scene.py uses, among them). A solid comes back closed only when no two of its vertices that triangles use
+// stand at one place.
+Mesh throughStl(const Mesh& solid) {
+  const TempDir dir;
+  writeBinaryStl(solid, dir.path / "solid.stl", "footsolid test");
+  return readBinaryStl(dir.path / "solid.stl");
+}
+
 // --- Surfaces from BlockSimplifier --------------------------------------------------------------------------------
 
 // A block as it was simplified, with its footprint and the pieces' outlines, and its own surface: every vertex of the
@@ -387,15 +396,15 @@ std::vector<BlockRect> blockLattice(int cols, int rows, int blockCols, int block
 }
 
 // The grid g (filled, as the simplifier is given it) simplified at tolerance tol block by block over the footprint
-// `cells`, in the order of rects, each block's pieces from blockFootprint with none dropped. Cells are cellX x cellY
-// model units.
+// `cells`, which footprintCells gave with the vertices `joined` of the contacts it joined, in the order of rects, each
+// block's pieces from blockFootprint with none dropped. Cells are cellX x cellY model units.
 std::vector<SolidBlock> simplifiedBlocks(const Grid& g, const Flags& cells, int cols, int rows, double tol,
                                          const std::vector<BlockRect>& rects, double cellX = kCellX,
-                                         double cellY = kCellY) {
+                                         double cellY = kCellY, std::span<const GridPoint> joined = {}) {
   BlockSimplifier simplifier(g, cols, rows, tol, cellX * (cols - 1), cellY * (rows - 1), 1, 1, kLevel);
   std::vector<SolidBlock> blocks;
   for (const BlockRect& rect : rects) {
-    SolidBlock block{rect, blockFootprint(cells, cols, rows, rect, cellX * cellY, 0.0), {}, {}};
+    SolidBlock block{rect, blockFootprint(cells, cols, rows, rect, cellX * cellY, 0.0, joined), {}, {}};
     block.result = simplifier.simplifyBlock(rect, &block.footprint);
     blocks.push_back(std::move(block));
   }
@@ -411,14 +420,15 @@ std::vector<SolidBlock> simplifiedBlocks(const Grid& g, const Flags& cells, int 
 // The island simplified in the blocks of rects, at kTolerance.
 std::vector<SolidBlock> islandBlocks(const std::vector<BlockRect>& rects) {
   const Grid grid = islandGrid();
-  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows);
-  return simplifiedBlocks(grid, cells, kIslandCols, kIslandRows, kTolerance, rects);
+  std::vector<GridPoint> joined;
+  const Flags cells = footprintCells(islandMask(), kIslandCols, kIslandRows, &joined);
+  return simplifiedBlocks(grid, cells, kIslandCols, kIslandRows, kTolerance, rects, kCellX, kCellY, joined);
 }
 
 // Blocks round one piece of the island each: the sea beyond the piece is a sample or more wide on every side, and the
 // block holds no other piece.
 constexpr BlockRect kIslandRect{3, 1, 16, 12};  // columns 4 to 14 and rows 2 to 10: the island with its lake and tab
-constexpr BlockRect kBlobsRect{16, 1, 22, 7};   // the two blobs, which touch at the sample (19, 4)
+constexpr BlockRect kBlobsRect{16, 1, 22, 7};   // the two blobs, which touched at (19, 4), and their bridge (19, 3)
 constexpr BlockRect kIsletRect{3, 12, 7, 16};   // columns 4 to 6 and rows 13 to 15
 constexpr BlockRect kWholeRect{0, 0, kIslandCols - 1, kIslandRows - 1};
 
@@ -599,84 +609,75 @@ TEST_CASE("the island with its lake and tab closes, its outline bending both way
   CHECK(solid.vertices.size() == island.surface.vertices.size() + outline.vertices.size());
   CHECK(solid.triangles.size() == island.surface.triangles.size() + 3 * outline.vertices.size() - 2);
   CHECK(solidProblem(island.surface, island.result.pieces, solid, kPlane) == "");
+
+  // Through an STL and back it is the same closed solid: no two of its vertices stand at one place.
+  const Mesh merged = throughStl(solid);
+  const MeshCheck check = checkSolid(merged);
+  CHECK(merged.vertices.size() == solid.vertices.size());
+  CHECK(check.nonManifoldEdges == 0);
+  CHECK(check.ok());
 }
 
-TEST_CASE("two blobs that touch at a vertex make two shells that share that one vertex", "[footsolid]") {
-  // Spec 5.2: the blobs of 2 x 2 cells touch at the sample (19, 4), where both outlines turn and so both keep it, and
-  // the simplifier gives it one vertex number. Each shell has copies of its own, so the shells meet at that one top
-  // vertex and share no edge, and every edge has its two triangles. (They stand on the same upright line under it all
-  // the same: see the test after the next.)
+TEST_CASE("two blobs that touched at a vertex are one piece, joined by a bridge cell, and close into one shell, "
+          "through an STL and back too",
+          "[footsolid]") {
+  // Spec 5.2 as the footprint now has it: the blobs of 2 x 2 cells touched at the sample (19, 4), and footprintCells
+  // put in the cell (19, 3) there, so that they are one piece of 9 cells with one outline, which closes into one shell.
+  // No two of its vertices stand at one place, so it comes back from an STL as it went: an STL reader that merges the
+  // corners at one position merges none.
   const std::vector<SolidBlock> blocks = islandBlocks({kBlobsRect});
   const SolidBlock& blobs = blocks.at(0);
-  REQUIRE(blobs.result.pieces.size() == 2);
-  REQUIRE(blobs.footprint.cornerContacts == 1);
-  const PieceOutline &first = blobs.result.pieces[0], &second = blobs.result.pieces[1];
-  std::vector<std::uint32_t> common;
-  for (const std::uint32_t v : first.vertices) {
-    if (std::find(second.vertices.begin(), second.vertices.end(), v) != second.vertices.end()) common.push_back(v);
-  }
-  REQUIRE(common.size() == 1);
-  const Vec3& contact = blobs.surface.vertices[common[0]];
-  CHECK(contact.x == static_cast<float>(kCellX * 19));
-  CHECK(contact.y == static_cast<float>(kCellY * (kIslandRows - 1 - 4)));
+  REQUIRE(blobs.result.pieces.size() == 1);
+  CHECK(blobs.footprint.pieces.at(0).cells == 9);
+  CHECK(blobs.footprint.cornerContacts == 1);
 
   const Mesh solid = solidFromPieces(blobs.surface, blobs.result.pieces, kPlane);
   CHECK(solidProblem(blobs.surface, blobs.result.pieces, solid, kPlane) == "");
-  const MeshCheck check = checkSolid(solid);
-  CHECK(check.ok());
-  CHECK(check.nonManifoldEdges == 0);
+  CHECK(shellsOf(solid).count == 1);
 
-  // Two shells, and of all the vertices their triangles use exactly one is in both: the contact. The two copies under
-  // it are two vertices, at the same place.
-  const Shells shells = shellsOf(solid);
-  REQUIRE(shells.count == 2);
-  std::array<std::set<std::uint32_t>, 2> used;
-  for (std::size_t t = 0; t < solid.triangles.size(); ++t) {
-    for (const std::uint32_t v : {solid.triangles[t].a, solid.triangles[t].b, solid.triangles[t].c}) {
-      used[shells.of[t]].insert(v);
-    }
-  }
-  std::vector<std::uint32_t> both;
-  std::set_intersection(used[0].begin(), used[0].end(), used[1].begin(), used[1].end(), std::back_inserter(both));
-  REQUIRE(both.size() == 1);
-  CHECK(both[0] == common[0]);
-  const std::size_t surfaceVertices = blobs.surface.vertices.size();
-  const auto copyOf = [&](const PieceOutline& piece, std::size_t firstCopy) {
-    const auto k = static_cast<std::size_t>(std::find(piece.vertices.begin(), piece.vertices.end(), common[0]) -
-                                            piece.vertices.begin());
-    return solid.vertices[firstCopy + k];
-  };
-  const Vec3 under = copyOf(first, surfaceVertices), other = copyOf(second, surfaceVertices + first.vertices.size());
-  CHECK((under.x == contact.x && under.y == contact.y && under.z == kPlane));
-  CHECK((other.x == contact.x && other.y == contact.y && other.z == kPlane));
+  const Mesh merged = throughStl(solid);
+  const MeshCheck check = checkSolid(merged);
+  CHECK(check.triangles == solid.triangles.size());
+  CHECK(merged.vertices.size() == solid.vertices.size());
+  CHECK(check.nonManifoldEdges == 0);
+  CHECK(check.ok());
 }
 
-TEST_CASE("the shells of pieces that touch stand on one upright line: a reader that merges corners sees an edge of "
-          "four faces there",
+TEST_CASE("outlines that touch at a vertex make two shells, which a reader that merges corners finds an edge of four "
+          "faces under the contact",
           "[footsolid]") {
-  // Spec 5.2 says contacts pass the edge check and Blender's. They pass checkSolid on the solid in memory (the test
-  // before), where each shell has copies of its own. But an STL has no shared vertices, and its readers merge the
+  // footprintCells joins pieces that touch at a vertex (Footprint.h), so no block's outlines do; this case shows why.
+  // Outlines that touch anyway, here two squares of one cell made by hand that share the vertex (1, 1), make two
+  // shells that meet at that one top vertex, each with a bottom copy of its own under it: in memory every edge has its
+  // two triangles, and checkSolid finds no bad edge. But an STL has no shared vertices, and its readers merge the
   // corners that stand at one position (readBinaryStl does, and so does Blender's importer, as check_stl in
   // blender_scene.py says): the two copies under the contact become one vertex, and the upright side that both shells
-  // have under the contact, the side of the wall quads of the edges that meet there, becomes one edge in four
-  // triangles. Whatever the numbering, the geometry is two prisms touching along a line, and no cutting of the walls
-  // can change it.
-  const std::vector<SolidBlock> blocks = islandBlocks({kBlobsRect});
-  const SolidBlock& blobs = blocks.at(0);
-  REQUIRE(blobs.result.pieces.size() == 2);
-  const Mesh solid = solidFromPieces(blobs.surface, blobs.result.pieces, kPlane);
-  REQUIRE(checkSolid(solid).nonManifoldEdges == 0);
-  std::vector<std::uint32_t> common;
-  for (const std::uint32_t v : blobs.result.pieces[0].vertices) {
-    const auto& other = blobs.result.pieces[1].vertices;
-    if (std::find(other.begin(), other.end(), v) != other.end()) common.push_back(v);
+  // have under it, the side of the wall quads of the edges that meet there, becomes one edge in four triangles.
+  // Whatever the numbering, the geometry is two prisms touching along a line.
+  //
+  //   0 -- 3              (column, row)    0 (0,0)  1 (0,1)  2 (1,1)  3 (1,0)     square A, the cell (0, 0)
+  //   |  A |                               2 (1,1)  4 (1,2)  5 (2,2)  6 (2,1)     square B, the cell (1, 1)
+  //   1 -- 2 -- 6
+  //        |  B |         The cells are kCellX by kCellY model units, the vertices 10 to 16 high, the plane at 0.
+  //        4 -- 5
+  const std::array<GridPoint, 7> points = {{{0, 0}, {0, 1}, {1, 1}, {1, 0}, {1, 2}, {2, 2}, {2, 1}}};
+  Mesh surface;
+  for (std::uint32_t v = 0; v < points.size(); ++v) {
+    surface.vertices.push_back({static_cast<float>(kCellX * points[v].x),
+                                static_cast<float>(kCellY * (2 - points[v].y)), static_cast<float>(10 + v)});
   }
-  REQUIRE(common.size() == 1);
-  const Vec3 contact = blobs.surface.vertices[common[0]];
+  // Each square cut along its north-west to south-east diagonal: (nw, sw, se) and (nw, se, ne).
+  surface.triangles = {{0, 1, 2}, {0, 2, 3}, {2, 4, 5}, {2, 5, 6}};
+  REQUIRE(downwardFacingTriangles(surface) == 0);
+  const std::vector<PieceOutline> pieces{{{0, 1, 2, 3}, {points[0], points[1], points[2], points[3]}},
+                                         {{2, 4, 5, 6}, {points[2], points[4], points[5], points[6]}}};
+  const Mesh solid = solidFromPieces(surface, pieces, 0.0f);
+  CHECK(solidProblem(surface, pieces, solid, 0.0f) == "");
+  REQUIRE(checkSolid(solid).nonManifoldEdges == 0);
+  REQUIRE(shellsOf(solid).count == 2);
+  const Vec3 contact = surface.vertices[2];
 
-  const TempDir dir;
-  writeBinaryStl(solid, dir.path / "blobs.stl", "two blobs");
-  const Mesh merged = readBinaryStl(dir.path / "blobs.stl");
+  const Mesh merged = throughStl(solid);
   const MeshCheck check = checkSolid(merged);
   CHECK(check.triangles == solid.triangles.size());
   CHECK(merged.vertices.size() == solid.vertices.size() - 1);  // the two copies under the contact are one now
@@ -690,7 +691,7 @@ TEST_CASE("the shells of pieces that touch stand on one upright line: a reader t
     }
     return merged.vertices.size();
   };
-  const std::size_t top = indexAt(contact), bottom = indexAt({contact.x, contact.y, kPlane});
+  const std::size_t top = indexAt(contact), bottom = indexAt({contact.x, contact.y, 0.0f});
   REQUIRE(top < merged.vertices.size());
   REQUIRE(bottom < merged.vertices.size());
   std::size_t faces = 0;
@@ -702,15 +703,23 @@ TEST_CASE("the shells of pieces that touch stand on one upright line: a reader t
   CHECK(faces == 4);
 }
 
-TEST_CASE("the island's four pieces in one block make four closed shells", "[footsolid]") {
-  // The whole grid as one block: the island with the tab, the blobs and the islet (the lone sample makes no cell). The
-  // numbering of the bottoms goes piece by piece in the order of the pieces.
+TEST_CASE("the island's three pieces in one block make three closed shells, through an STL and back too",
+          "[footsolid]") {
+  // The whole grid as one block: the island with the tab, the joined blobs and the islet (the lone sample makes no
+  // cell). The numbering of the bottoms goes piece by piece in the order of the pieces. No two pieces touch, so the
+  // solid comes back from an STL as it went.
   const std::vector<SolidBlock> blocks = islandBlocks({kWholeRect});
   const SolidBlock& all = blocks.at(0);
-  REQUIRE(all.result.pieces.size() == 4);
+  REQUIRE(all.result.pieces.size() == 3);
   const Mesh solid = solidFromPieces(all.surface, all.result.pieces, kPlane);
   CHECK(solidProblem(all.surface, all.result.pieces, solid, kPlane) == "");
   CHECK(checkSolid(solid).ok());
+
+  const Mesh merged = throughStl(solid);
+  const MeshCheck check = checkSolid(merged);
+  CHECK(merged.vertices.size() == solid.vertices.size());
+  CHECK(check.nonManifoldEdges == 0);
+  CHECK(check.ok());
 }
 
 TEST_CASE("blocks of a lattice, the last ones cut short, close piece by piece", "[footsolid]") {
@@ -748,9 +757,9 @@ TEST_CASE("blocks of a lattice, the last ones cut short, close piece by piece", 
 
 TEST_CASE("random footprints in random lattices close in every block", "[footsolid]") {
   // Masks of rectangles of data with rectangles of no-data cut out, pairs of rectangles that share a corner sample, and
-  // noise, so that coasts, lakes, islets, slits and pieces touching at a vertex all turn up; smooth, noisy or
-  // whole-number heights; cells of other sizes than the island's; a random tolerance and lattice. Every block with
-  // pieces is held to solidProblem.
+  // noise, so that coasts, lakes, islets, slits and pieces touching at a vertex (which footprintCells joins) all turn
+  // up; smooth, noisy or whole-number heights; cells of other sizes than the island's; a random tolerance and lattice.
+  // Every block with pieces is held to solidProblem, and its solid, through an STL and back, to checkSolid.
   std::mt19937 rng(20261022);
   // Every draw is made from the engine's output by hand and into a variable of its own, since the standard fixes the
   // engine's output but neither a distribution's nor the order a call's arguments are worked out in.
@@ -784,7 +793,8 @@ TEST_CASE("random footprints in random lattices close in every block", "[footsol
       const int percent = 40 + draw(58);
       for (std::uint8_t& v : mask) v = draw(100) < percent ? 1 : 0;
     }
-    const Flags cells = footprintCells(mask, cols, rows);
+    std::vector<GridPoint> joined;
+    const Flags cells = footprintCells(mask, cols, rows, &joined);
 
     const int heightStyle = draw(3);
     const double phase = static_cast<double>(draw(628)) / 100.0;
@@ -807,7 +817,8 @@ TEST_CASE("random footprints in random lattices close in every block", "[footsol
                   << " x " << blockRows);
 
     const std::vector<SolidBlock> blocks =
-        simplifiedBlocks(g, cells, cols, rows, tolerance, blockLattice(cols, rows, blockCols, blockRows), cellX, cellY);
+        simplifiedBlocks(g, cells, cols, rows, tolerance, blockLattice(cols, rows, blockCols, blockRows), cellX, cellY,
+                         joined);
     for (const SolidBlock& block : blocks) {
       if (block.result.pieces.empty()) continue;
       INFO("the block of columns " << block.rect.firstColumn << " to " << block.rect.lastColumn << " and rows "
@@ -817,13 +828,17 @@ TEST_CASE("random footprints in random lattices close in every block", "[footsol
       const Mesh solid = solidFromPieces(block.surface, block.result.pieces, -20.0f);
       const std::string problem = solidProblem(block.surface, block.result.pieces, solid, -20.0f);
       CHECK(problem == "");
+      // No two of the block's pieces touch, so the solid comes back from an STL still closed.
+      const MeshCheck merged = checkSolid(throughStl(solid));
+      CHECK(merged.nonManifoldEdges == 0);
+      CHECK(merged.ok());
       ++blocksWithPieces;
       pieces += block.result.pieces.size();
       contacts += block.footprint.cornerContacts;
       vertices += solid.vertices.size();
     }
   }
-  // The draw is not one-sided: pieces in many blocks, and corner contacts among them.
+  // The draw is not one-sided: pieces in many blocks, and corner contacts that footprintCells joined among them.
   CHECK(blocksWithPieces > 450);
   CHECK(pieces > 500);
   CHECK(contacts > 10);

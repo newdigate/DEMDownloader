@@ -109,7 +109,8 @@ struct BlockResult {
 // block piece by piece, each piece's outline vertices before its inside's. A vertex on a block's side, which the block
 // beside it may have too, or on a piece's outline, which a piece that touches it at a vertex may have too, goes into
 // the surface once, with the first block or piece to reach it: so blocks that share a side meet on the very same
-// vertices along it, and two pieces that touch at a vertex share that one (spec 5.2).
+// vertices along it, and two pieces that touch at a vertex share that one (which footprintCells' pieces never do, as it
+// joins them).
 //
 // The runs (spec 5.3): a run is the straight stretch of a piece's loop from one run start to the next. It is simplified
 // by simplifyProfile from west to east along a row and from north to south along a column, whichever way the loop walks

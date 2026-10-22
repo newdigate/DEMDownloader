@@ -50,13 +50,15 @@ namespace demdl::mesh {
 // The shell encloses the prisms under its part of the surface: the sum over its surface triangles of their mean height
 // over the plane times their area seen from above.
 //
-// Two pieces that touch at a vertex hold the same vertex of the surface in their outlines (spec 5.2). Each has copies
-// of its own, so in this mesh the two shells meet at that one top vertex and nowhere else, and still every edge has its
-// two triangles: checkSolid finds no bad edge and the volumes add up. The geometry is another matter. Both shells have
-// walls standing on the upright line under the contact, so the two prisms touch along a line, not at a point; an STL
-// has no shared vertices, and a reader that merges the corners at one position (readBinaryStl, and the importer that
-// blender_scene.py's check_stl uses) joins the two copies under the contact and finds that line to be one edge of four
-// faces, a non-manifold edge for each contact. No numbering or cutting of the walls changes that.
+// No two pieces of a block touch: footprintCells joins two pieces that would meet at a vertex, by putting in one of
+// the two empty cells there (Footprint.h), so that every block's shells stay apart. Outlines that did touch, holding
+// the same vertex of the surface, would make two shells that meet at that one top vertex, each with a copy of its own
+// under it, and in this mesh every edge would still have its two triangles: checkSolid would find no bad edge and the
+// volumes would add up. The geometry is another matter. Both shells would have walls standing on the upright line
+// under the contact, so the two prisms would touch along a line, not at a point; an STL has no shared vertices, and a
+// reader that merges the corners at one position (readBinaryStl, and the importer that blender_scene.py's check_stl
+// uses) joins the two copies under the contact and finds that line to be one edge of four faces, a non-manifold edge
+// for each contact. No numbering or cutting of the walls changes that, which is why the footprint joins such pieces.
 //
 // The surface is any sheet of triangles whose only free edges are the pieces' outlines, each one's edge a -> b borne by
 // a triangle that runs a -> b, as BlockSimplifier makes it. Its triangles are not looked at, as solidFromSurface does

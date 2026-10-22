@@ -26,7 +26,9 @@ inline constexpr int kIslandRows = 18;
 // - An islet of 3 x 3 samples, columns 4 to 6 and rows 13 to 15.
 // - A single data sample alone, at column 18 and row 13.
 // - Two blobs of 3 x 3 samples, columns 17 to 19 and rows 2 to 4, and columns 19 to 21 and rows 4 to 6, which share the
-//   sample at column 19 and row 4: as cells, two blobs of 2 x 2 that touch at that one vertex.
+//   sample at column 19 and row 4: as cells, two blobs of 2 x 2 that touch at that one vertex. footprintCells joins
+//   them there by putting in the cell (19, 3), the north-west-most of the vertex's two empty cells, so that they make
+//   one piece of 9 cells and footprintCells reports (19, 4) as a joined contact.
 // Every feature is at least two no-data samples from the grid's edge and from every other feature. A gap of two
 // samples is three cells, and the closing joins nothing across a gap of three.
 inline std::vector<std::string> islandMaskRows() {

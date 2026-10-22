@@ -116,6 +116,66 @@ void fillEnclosed(std::vector<std::uint8_t>& cells, std::size_t width, std::size
   for (std::uint8_t& v : cells) v = v == kSea ? 0 : 1;
 }
 
+// The number of the cell that joins the corner contact at the vertex (x, y) of a grid of width x height cells, a vertex
+// with four cells round it (0 < x < width and 0 < y < height), or kNoContact when it is none. It is one when its cells
+// are a diagonal pair in and the other pair out, and the cell that joins it is the north-west-most of the two that are
+// out: for the pair north-west and south-east, the one north-east of the vertex, and for the pair north-east and
+// south-west, the one north-west of it, in both cases the empty cell in the row above.
+constexpr std::size_t kNoContact = std::numeric_limits<std::size_t>::max();
+
+std::size_t joiningCell(const std::vector<std::uint8_t>& cells, std::size_t width, std::size_t x, std::size_t y) {
+  const std::size_t nw = (y - 1) * width + (x - 1), ne = nw + 1, sw = nw + width, se = sw + 1;
+  if (cells[nw] != 0 && cells[se] != 0 && cells[ne] == 0 && cells[sw] == 0) return ne;
+  if (cells[ne] != 0 && cells[sw] != 0 && cells[nw] == 0 && cells[se] == 0) return nw;
+  return kNoContact;
+}
+
+// Joins every corner contact of the cells by putting in its joining cell, as the header says, and appends each one's
+// vertex to *joined when joined is not null. The first round looks at every vertex with four cells round it; every
+// contact found is joined, all of them as the cells stood before the round; then the next round looks again at the
+// corners of the cells just put in, the only vertices whose cells changed, and so on until a round finds none. After
+// the closing and the fill the first round always leaves none, for the reason the header gives, so the second finds
+// nothing and costs a look at four vertices a contact.
+void joinCornerContacts(std::vector<std::uint8_t>& cells, std::size_t width, std::size_t height,
+                        std::vector<GridPoint>* joined) {
+  struct Contact {
+    std::size_t x, y, cell;
+  };
+  std::vector<Contact> found;
+  // The first round, over every vertex: the cells are 0 or 1 by now, so a diagonal pair alone is the north-west cell
+  // equal to the south-east one, the north-east equal to the south-west, and the two pairs different.
+  for (std::size_t y = 1; y < height; ++y) {
+    const std::uint8_t* north = cells.data() + (y - 1) * width;
+    const std::uint8_t* south = north + width;
+    for (std::size_t x = 1; x < width; ++x) {
+      if (north[x - 1] == south[x] && north[x] == south[x - 1] && north[x - 1] != north[x]) {
+        found.push_back({x, y, (y - 1) * width + (north[x - 1] != 0 ? x : x - 1)});
+      }
+    }
+  }
+  std::vector<std::pair<std::size_t, std::size_t>> corners;  // (row, column) of a vertex to look at again
+  while (!found.empty()) {
+    corners.clear();
+    for (const Contact& c : found) {
+      cells[c.cell] = 1;
+      if (joined != nullptr) joined->push_back({static_cast<std::int32_t>(c.x), static_cast<std::int32_t>(c.y)});
+      const std::size_t cx = c.cell % width, cy = c.cell / width;
+      for (const std::size_t vy : {cy, cy + 1}) {
+        for (const std::size_t vx : {cx, cx + 1}) {
+          if (vx >= 1 && vx < width && vy >= 1 && vy < height) corners.push_back({vy, vx});
+        }
+      }
+    }
+    std::sort(corners.begin(), corners.end());
+    corners.erase(std::unique(corners.begin(), corners.end()), corners.end());
+    found.clear();
+    for (const auto& [y, x] : corners) {
+      const std::size_t cell = joiningCell(cells, width, x, y);
+      if (cell != kNoContact) found.push_back({x, y, cell});
+    }
+  }
+}
+
 // --- blockFootprint --------------------------------------------------------------------------------------------------
 
 // The footprint's cells as a block sees them: in() is true for a cell of the footprint inside the block's cell range
@@ -257,6 +317,11 @@ std::vector<std::uint8_t> resampleMaskNearest(const std::vector<std::uint8_t>& m
 }
 
 std::vector<std::uint8_t> footprintCells(const std::vector<std::uint8_t>& mask, int cols, int rows) {
+  return footprintCells(mask, cols, rows, nullptr);
+}
+
+std::vector<std::uint8_t> footprintCells(const std::vector<std::uint8_t>& mask, int cols, int rows,
+                                         std::vector<GridPoint>* joined) {
   if (cols < 2 || rows < 2) {
     throw std::invalid_argument("the grid must be at least 2 x 2 vertices, not " + gridSize(cols, rows));
   }
@@ -279,11 +344,12 @@ std::vector<std::uint8_t> footprintCells(const std::vector<std::uint8_t>& mask, 
   squarePass<true>(cells, width, height);
   squarePass<false>(cells, width, height);
   fillEnclosed(cells, width, height);
+  joinCornerContacts(cells, width, height, joined);
   return cells;
 }
 
 BlockFootprint blockFootprint(const std::vector<std::uint8_t>& cells, int cols, int rows, BlockRect rect,
-                              double cellAreaUnits2, double minPieceUnits2) {
+                              double cellAreaUnits2, double minPieceUnits2, std::span<const GridPoint> joined) {
   if (cols < 2 || rows < 2) {
     throw std::invalid_argument("the grid must be at least 2 x 2 vertices, not " + gridSize(cols, rows));
   }
@@ -381,22 +447,17 @@ BlockFootprint blockFootprint(const std::vector<std::uint8_t>& cells, int cols, 
   std::stable_sort(found.begin(), found.end(),
                    [](const Outlined& a, const Outlined& b) { return a.piece.cells > b.piece.cells; });
   BlockFootprint result;
-  std::vector<GridPoint> keptContacts;
   for (Outlined& o : found) {
     if (static_cast<double>(o.piece.cells) * cellAreaUnits2 < minPieceUnits2) {
       result.dropped.push_back(std::move(o.piece));
       continue;
     }
     result.cells += o.piece.cells;
-    keptContacts.insert(keptContacts.end(), o.contacts.begin(), o.contacts.end());
     result.pieces.push_back(std::move(o.piece));
   }
-  // A contact between two kept pieces is met by the walks round both, and no vertex by more than two: its four cells
-  // hold the two diagonal cells of the two pieces and nothing else.
-  std::sort(keptContacts.begin(), keptContacts.end(), rowMajorLess);
-  for (std::size_t i = 1; i < keptContacts.size(); ++i) {
-    if (same(keptContacts[i], keptContacts[i - 1])) ++result.cornerContacts;
-  }
+  result.cornerContacts = static_cast<std::uint64_t>(std::count_if(joined.begin(), joined.end(), [&](GridPoint v) {
+    return v.x > rect.firstColumn && v.x < rect.lastColumn && v.y > rect.firstRow && v.y < rect.lastRow;
+  }));
   return result;
 }
 
