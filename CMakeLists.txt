@@ -121,6 +121,7 @@ add_library(demmesh STATIC
   src/mesh/Footprint.cpp
   src/mesh/ProfileSimplifier.cpp
   src/mesh/Simplifier.cpp
+  src/mesh/Tiles.cpp
   src/mesh/BasePlane.cpp
   src/mesh/SolidMesh.cpp
   src/mesh/AtomicFileWriter.cpp
@@ -185,6 +186,7 @@ if(DL_ELEVATION_TESTS)
     tests/test_Footprint.cpp
     tests/test_ProfileSimplifier.cpp
     tests/test_Simplifier.cpp
+    tests/test_Tiles.cpp
     tests/test_BasePlane.cpp
     tests/test_SolidMesh.cpp
     tests/test_MeshWriters.cpp
